@@ -8,6 +8,16 @@ const APP_URL = `http://${HOST}:${PORT}`;
 
 let serverProcess = null;
 
+function ignoreBrokenPipe(stream) {
+  stream.on("error", (error) => {
+    if (error && error.code === "EPIPE") return;
+    throw error;
+  });
+}
+
+ignoreBrokenPipe(process.stdout);
+ignoreBrokenPipe(process.stderr);
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1440,

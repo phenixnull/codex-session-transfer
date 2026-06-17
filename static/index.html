@@ -4,12 +4,13 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Codex Session Transfer</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
     <main class="shell">
-      <header class="topbar">
-        <div>
+      <header class="app-header">
+        <div class="brand-block">
           <h1>Codex Session Transfer</h1>
           <p id="dbPath" class="path-line"></p>
         </div>
@@ -40,7 +41,7 @@
             <select id="sourceProvider"></select>
           </label>
           <label class="field target-field">
-            Target provider / preset
+            Target provider
             <select id="targetProviderSelect"></select>
             <input id="targetProviderCustom" class="custom-target" placeholder="Custom provider id">
           </label>
@@ -75,7 +76,7 @@
       <section class="workspace">
         <div class="table-wrap source-list">
           <div class="table-head">
-            <h2>Source Sessions</h2>
+            <h2>Source</h2>
             <span id="sourceListCount" class="count-chip">0 shown</span>
           </div>
           <table>
@@ -83,10 +84,10 @@
               <tr>
                 <th class="select-col"><input id="selectAll" type="checkbox"></th>
                 <th>Session</th>
-                <th>Source</th>
-                <th>CWD</th>
+                <th>Origin</th>
+                <th>Folder</th>
                 <th>State</th>
-                <th>Children</th>
+                <th>Kids</th>
               </tr>
             </thead>
             <tbody id="sourceThreadsBody"></tbody>
@@ -95,17 +96,17 @@
 
         <div class="table-wrap target-list">
           <div class="table-head">
-            <h2>Live Target Sessions</h2>
+            <h2>Target</h2>
             <span id="targetListCount" class="count-chip">0 shown</span>
           </div>
           <table>
             <thead>
               <tr>
                 <th>Session</th>
-                <th>Source</th>
-                <th>CWD</th>
+                <th>Origin</th>
+                <th>Folder</th>
                 <th>State</th>
-                <th>Children</th>
+                <th>Kids</th>
               </tr>
             </thead>
             <tbody id="targetThreadsBody"></tbody>
@@ -114,7 +115,7 @@
 
         <aside class="preview-pane">
           <div class="pane-head">
-            <h2>Copy Preview</h2>
+            <h2>Preview</h2>
           </div>
           <div id="previewMessages" class="messages"></div>
           <div id="previewItems" class="preview-items"></div>

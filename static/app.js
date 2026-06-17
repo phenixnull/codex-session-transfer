@@ -103,18 +103,36 @@ async function loadTargetThreads() {
 
 function ensureProviderSelection() {
   const sourceSelect = $("sourceProvider");
-  if (!sourceSelect.value && state.sessionProviders.length > 0) {
-    sourceSelect.value = state.sessionProviders[0].model_provider;
-  }
+  const sourceProvider = preferredSourceProvider(sourceSelect.value);
+  if (sourceProvider) sourceSelect.value = sourceProvider;
 
   const targetSelect = $("targetProviderSelect");
-  if (!targetSelect.value && state.targetProviders.length > 0) {
-    const target =
-      state.targetProviders.find((item) => item.current) ||
-      state.targetProviders.find((item) => item.value !== sourceSelect.value) ||
-      state.targetProviders[0];
-    targetSelect.value = target.value;
-  }
+  const targetProvider = preferredTargetProvider(targetSelect.value, sourceProvider || sourceSelect.value);
+  if (targetProvider) targetSelect.value = targetProvider;
+}
+
+function preferredSourceProvider(currentValue) {
+  const current = state.sessionProviders.find((provider) => provider.model_provider === currentValue);
+  if (current && current.active > 0) return current.model_provider;
+
+  const activeProvider = state.sessionProviders.find((provider) => provider.active > 0);
+  if (activeProvider) return activeProvider.model_provider;
+
+  return current?.model_provider || state.sessionProviders[0]?.model_provider || "";
+}
+
+function preferredTargetProvider(currentValue, sourceValue) {
+  const options = state.targetProviders;
+  const current = options.find((provider) => provider.value === currentValue);
+  if (current && current.value !== sourceValue) return current.value;
+
+  const liveTarget = options.find((provider) => provider.current && provider.value !== sourceValue);
+  if (liveTarget) return liveTarget.value;
+
+  const nonSourceTarget = options.find((provider) => provider.value !== sourceValue);
+  if (nonSourceTarget) return nonSourceTarget.value;
+
+  return current?.value || options.find((provider) => provider.current)?.value || options[0]?.value || "";
 }
 
 function renderAllShell() {
@@ -216,10 +234,12 @@ function renderProviders() {
     const option = document.createElement("option");
     option.value = provider.model_provider;
     option.textContent = `${provider.model_provider} (${provider.total})`;
+    option.title = providerTooltip(provider);
     select.append(option);
 
     const card = document.createElement("div");
     card.className = "provider-tile";
+    card.title = providerTooltip(provider);
     const providerStats = state.stats?.by_provider?.[provider.model_provider];
     card.innerHTML = `
       <strong>${escapeHtml(provider.model_provider)}</strong>
@@ -229,9 +249,19 @@ function renderProviders() {
     `;
     grid.append(card);
   }
-  if (current && state.sessionProviders.some((provider) => provider.model_provider === current)) {
-    select.value = current;
-  }
+  const preferred = preferredSourceProvider(current);
+  if (preferred) select.value = preferred;
+}
+
+function providerTooltip(provider) {
+  const details = [];
+  if (provider.model_provider) details.push(`Provider: ${provider.model_provider}`);
+  details.push(`Active: ${provider.active ?? 0}`);
+  details.push(`Archived: ${provider.archived ?? 0}`);
+  details.push(`Total: ${provider.total ?? 0}`);
+  const providerStats = state.stats?.by_provider?.[provider.model_provider];
+  if (providerStats) details.push(`Projects: ${providerStats.projects ?? 0}`);
+  return details.join(" | ");
 }
 
 function renderTargetProviders() {
@@ -240,17 +270,12 @@ function renderTargetProviders() {
   select.replaceChildren();
 
   for (const provider of state.targetProviders) {
-    select.append(new Option(targetProviderLabel(provider), provider.value));
+    const option = new Option(targetProviderLabel(provider), provider.value);
+    option.title = targetProviderTooltip(provider);
+    select.append(option);
   }
   select.append(new Option("Custom provider id...", CUSTOM_TARGET));
-
-  const options = Array.from(select.options);
-  const currentStillExists = current && options.some((option) => option.value === current);
-  const liveTarget = state.targetProviders.find((provider) => provider.current);
-  const nonSourceTarget = state.targetProviders.find((provider) => provider.value !== $("sourceProvider").value);
-  const preferred = currentStillExists
-    ? current
-    : liveTarget?.value || nonSourceTarget?.value || options[0]?.value || "";
+  const preferred = preferredTargetProvider(current, $("sourceProvider").value);
   if (preferred) {
     select.value = preferred;
   }
@@ -258,22 +283,24 @@ function renderTargetProviders() {
 }
 
 function targetProviderLabel(provider) {
-  const prefix = provider.current ? "LIVE current: " : "";
+  const bits = [provider.label || provider.value];
+  if (provider.current) bits.push("live");
+  if (provider.session_total) bits.push(`${provider.session_total}`);
+  return bits.join(" · ");
+}
+
+function targetProviderTooltip(provider) {
   const details = [];
-  const suffix = [];
-  if (provider.model) details.push(provider.model);
-  if (provider.base_url) details.push(provider.base_url);
-  if (provider.wire_api) details.push(provider.wire_api);
-  if (provider.current) suffix.push("current live");
-  if (provider.matches_current_base_url) suffix.push("same base URL");
-  if (provider.sources?.includes("codex_plus_preset")) suffix.push("Codex++ preset");
-  if (provider.sources?.includes("codex_plus_override")) suffix.push("Codex++ override");
-  if (provider.sources?.includes("session_db")) suffix.push("session DB");
-  if (provider.session_total) suffix.push(`${provider.session_total} sessions`);
-  const base = `${prefix}${provider.label || provider.value} -> ${provider.value}`;
-  const detailText = details.length ? ` (${details.join(", ")})` : "";
-  const suffixText = suffix.length ? ` [${suffix.join(", ")}]` : "";
-  return `${base}${detailText}${suffixText}`;
+  if (provider.value) details.push(`Provider: ${provider.value}`);
+  if (provider.model) details.push(`Model: ${provider.model}`);
+  if (provider.base_url) details.push(`Base URL: ${provider.base_url}`);
+  if (provider.wire_api) details.push(`Wire API: ${provider.wire_api}`);
+  if (provider.current) details.push("Current live config");
+  if (provider.matches_current_base_url) details.push("Same base URL as current config");
+  if (provider.sources?.includes("codex_plus_preset")) details.push("From Codex++ preset");
+  if (provider.sources?.includes("codex_plus_override")) details.push("From Codex++ override");
+  if (provider.sources?.includes("session_db")) details.push("Present in session DB");
+  return details.join(" | ");
 }
 
 function renderLiveTargetPanel() {
@@ -357,6 +384,8 @@ function renderSourceThreads() {
   for (const thread of state.sourceThreads) {
     const row = threadRow(thread);
     const selectCell = document.createElement("td");
+    selectCell.className = "select-cell";
+    selectCell.dataset.label = "Select";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = state.selected.has(thread.id);
@@ -390,9 +419,12 @@ function threadRow(thread, options = {}) {
   if (options.target && state.lastCopiedTargetIds.has(thread.id)) row.classList.add("new-row");
 
   const sessionCell = document.createElement("td");
+  sessionCell.className = "session-cell";
+  sessionCell.dataset.label = "Session";
   const title = document.createElement("strong");
   title.className = "session-title";
   title.textContent = thread.display_title || thread.title || "(untitled)";
+  title.title = thread.display_title || thread.title || thread.id;
   if (thread.thread_name && thread.thread_name !== thread.title) {
     const renamed = document.createElement("span");
     renamed.className = "renamed-note";
@@ -407,14 +439,19 @@ function threadRow(thread, options = {}) {
   }
   const preview = document.createElement("p");
   preview.textContent = thread.preview || thread.id;
+  preview.title = thread.preview || thread.id;
   sessionCell.append(title, preview);
 
   row.append(
     sessionCell,
-    textCell(thread.source),
-    textCell(shortPath(thread.cwd)),
+    textCell(thread.source, { className: "origin-cell", title: thread.source, label: "Origin" }),
+    textCell(shortPath(thread.cwd), { className: "folder-cell", title: thread.cwd, label: "Folder" }),
     stateCell(thread),
-    textCell(String(thread.child_count || 0)),
+    textCell(String(thread.child_count || 0), {
+      className: "count-cell",
+      title: `${thread.child_count || 0} children`,
+      label: "Kids",
+    }),
   );
   return row;
 }
@@ -424,14 +461,19 @@ function renderListCount(id, count) {
   if (node) node.textContent = `${count} shown`;
 }
 
-function textCell(value) {
+function textCell(value, options = {}) {
   const cell = document.createElement("td");
+  if (options.className) cell.className = options.className;
+  if (options.label) cell.dataset.label = options.label;
   cell.textContent = value || "";
+  if (options.title) cell.title = options.title;
   return cell;
 }
 
 function stateCell(thread) {
   const cell = document.createElement("td");
+  cell.className = "state-cell";
+  cell.dataset.label = "State";
   const flags = [];
   if (thread.archived) flags.push("Archived");
   if (!thread.rollout_exists) flags.push("Missing rollout");
@@ -680,7 +722,10 @@ function bindEvents() {
   });
   $("sourceProvider").addEventListener("change", () => {
     state.selected.clear();
-    loadSourceThreads();
+    renderTargetProviders();
+    renderLiveTargetPanel();
+    invalidatePreview();
+    loadThreadLists();
   });
   $("targetProviderSelect").addEventListener("change", () => {
     updateCustomTargetVisibility();

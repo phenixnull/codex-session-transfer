@@ -11,6 +11,8 @@ server.out.log
 server.err.log
 
 output/
+repos/
+tmp/
 dist/
 build/
 coverage/
