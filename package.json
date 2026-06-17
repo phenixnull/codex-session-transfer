@@ -1,0 +1,15 @@
+{
+  "name": "codex-session-transfer",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local Codex provider session transfer workbench.",
+  "main": "electron/main.js",
+  "scripts": {
+    "server": "python server.py --host 127.0.0.1 --port 8765",
+    "electron": "electron .",
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^39.2.7"
+  }
+}

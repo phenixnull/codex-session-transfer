@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex Session Transfer</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Codex Session Transfer</h1>
+          <p id="dbPath" class="path-line"></p>
+        </div>
+        <div class="top-actions">
+          <button id="killBlockingButton" class="danger-button" type="button" disabled>Kill blockers</button>
+          <button id="repairNamesButton" type="button">Repair names</button>
+          <button id="refreshButton" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="status-band">
+        <div class="section-head">
+          <h2>Status</h2>
+        </div>
+        <div id="statusStrip" class="status-strip"></div>
+        <div id="statsGrid" class="stats-grid"></div>
+        <div id="providerGrid" class="provider-grid"></div>
+      </section>
+
+      <section class="control-panel">
+        <div class="section-head">
+          <h2>Transfer</h2>
+          <span id="selectedCount" class="count-chip">0 selected</span>
+        </div>
+        <div class="toolbar">
+          <label class="field source-field">
+            Source session provider
+            <select id="sourceProvider"></select>
+          </label>
+          <label class="field target-field">
+            Target provider / preset
+            <select id="targetProviderSelect"></select>
+            <input id="targetProviderCustom" class="custom-target" placeholder="Custom provider id">
+          </label>
+          <div id="liveTargetPanel" class="live-target-panel"></div>
+          <label class="field search-field">
+            Search
+            <input id="searchInput" placeholder="Title, preview, message, id">
+          </label>
+          <label class="field source-filter-field">
+            Source
+            <select id="sourceFilter">
+              <option value="">All</option>
+            </select>
+          </label>
+          <label class="field project-field">
+            Project / folder
+            <select id="projectFilter"></select>
+          </label>
+          <div class="toggle-row">
+            <label class="check">
+              <input id="includeArchived" type="checkbox">
+              Archived
+            </label>
+            <label class="check">
+              <input id="includeDescendants" type="checkbox">
+              Copy tree
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <div class="table-wrap source-list">
+          <div class="table-head">
+            <h2>Source Sessions</h2>
+            <span id="sourceListCount" class="count-chip">0 shown</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th class="select-col"><input id="selectAll" type="checkbox"></th>
+                <th>Session</th>
+                <th>Source</th>
+                <th>CWD</th>
+                <th>State</th>
+                <th>Children</th>
+              </tr>
+            </thead>
+            <tbody id="sourceThreadsBody"></tbody>
+          </table>
+        </div>
+
+        <div class="table-wrap target-list">
+          <div class="table-head">
+            <h2>Live Target Sessions</h2>
+            <span id="targetListCount" class="count-chip">0 shown</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Session</th>
+                <th>Source</th>
+                <th>CWD</th>
+                <th>State</th>
+                <th>Children</th>
+              </tr>
+            </thead>
+            <tbody id="targetThreadsBody"></tbody>
+          </table>
+        </div>
+
+        <aside class="preview-pane">
+          <div class="pane-head">
+            <h2>Copy Preview</h2>
+          </div>
+          <div id="previewMessages" class="messages"></div>
+          <div id="previewItems" class="preview-items"></div>
+          <div class="copy-actions">
+            <button id="previewButton" type="button">Preview</button>
+            <button id="copyButton" type="button" disabled>Copy</button>
+          </div>
+          <p id="copyDisabledReason" class="copy-hint"></p>
+          <p id="copyResult" class="result"></p>
+        </aside>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
