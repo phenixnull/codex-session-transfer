@@ -47,6 +47,7 @@ html {
   min-width: 0;
   height: 100%;
   background: var(--background);
+  color-scheme: dark;
 }
 
 body {
@@ -142,8 +143,20 @@ select {
   border-radius: var(--radius-control);
   background: color-mix(in oklch, var(--input) 82%, black);
   color: var(--foreground-strong);
+  color-scheme: dark;
   padding: 7px 10px;
   transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+
+select option,
+select optgroup {
+  background-color: var(--card-raised);
+  color: var(--foreground-strong);
+}
+
+select option:checked {
+  background-color: color-mix(in oklch, var(--primary) 26%, var(--muted));
+  color: var(--foreground-strong);
 }
 
 input::placeholder {
