@@ -286,7 +286,7 @@ function targetProviderLabel(provider) {
   const bits = [provider.label || provider.value];
   if (provider.current) bits.push("live");
   if (provider.session_total) bits.push(`${provider.session_total}`);
-  return bits.join(" · ");
+  return bits.join(" / ");
 }
 
 function targetProviderTooltip(provider) {

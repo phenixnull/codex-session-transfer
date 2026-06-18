@@ -22,11 +22,18 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
     height: 920,
-    minWidth: 1100,
+    minWidth: 980,
     minHeight: 760,
     title: "Codex Session Transfer",
-    backgroundColor: "#f5f5f7",
-    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
+    backgroundColor: "#171520",
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : process.platform === "win32" ? "hidden" : "default",
+    titleBarOverlay: process.platform === "win32"
+      ? {
+          color: "#171520",
+          symbolColor: "#d7d9ff",
+          height: 44,
+        }
+      : undefined,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       nodeIntegration: false,

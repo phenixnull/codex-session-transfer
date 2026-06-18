@@ -8,123 +8,214 @@
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
-    <main class="shell">
-      <header class="app-header">
-        <div class="brand-block">
-          <h1>Codex Session Transfer</h1>
-          <p id="dbPath" class="path-line"></p>
+    <main class="app-shell" data-app-shell>
+      <header class="titlebar">
+        <div class="titlebar-left">
+          <span class="shell-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" role="img">
+              <path d="M5 7.8 12 4l7 3.8v8.4L12 20l-7-3.8z"></path>
+              <path d="M12 4v16M5 7.8l7 4 7-4M5 16.2l7-4.4 7 4.4"></path>
+            </svg>
+          </span>
+          <div class="title-copy">
+            <h1>Codex Session Transfer</h1>
+            <p id="dbPath" class="path-line"></p>
+          </div>
         </div>
         <div class="top-actions">
-          <button id="killBlockingButton" class="danger-button" type="button" disabled>Kill blockers</button>
-          <button id="repairNamesButton" type="button">Repair names</button>
-          <button id="refreshButton" type="button">Refresh</button>
+          <button id="killBlockingButton" class="danger-button" type="button" disabled>
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 7v5l3 2"></path>
+              <path d="M4.9 19.1a10 10 0 1 1 14.2 0"></path>
+              <path d="M7 21h10"></path>
+            </svg>
+            <span>Kill blockers</span>
+          </button>
+          <button id="repairNamesButton" type="button">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M14.7 6.3a4 4 0 0 0-5 5L4 17v3h3l5.7-5.7a4 4 0 0 0 5-5l-2.4 2.4-2.9-2.9z"></path>
+            </svg>
+            <span>Repair names</span>
+          </button>
+          <button id="refreshButton" type="button">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 12a8 8 0 1 1-2.3-5.7"></path>
+              <path d="M20 4v5h-5"></path>
+            </svg>
+            <span>Refresh</span>
+          </button>
         </div>
       </header>
 
-      <section class="status-band">
-        <div class="section-head">
-          <h2>Status</h2>
-        </div>
-        <div id="statusStrip" class="status-strip"></div>
-        <div id="statsGrid" class="stats-grid"></div>
-        <div id="providerGrid" class="provider-grid"></div>
-      </section>
+      <section class="content-row" data-app-content-row>
+        <aside class="panel-frame sidebar-frame" data-platform-card-frame="sidebar">
+          <div class="panel-surface sidebar-surface" data-platform-sidebar>
+            <div class="sidebar-brand">
+              <div class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M4 6.5h7.5v11H4z"></path>
+                  <path d="M12.5 6.5H20v11h-7.5z"></path>
+                  <path d="M8 10h3.5M8 13h3.5M15 10h2.5M15 13h2.5"></path>
+                </svg>
+              </div>
+              <div>
+                <strong>Transfer Workbench</strong>
+                <span>Provider-aware session copy</span>
+              </div>
+            </div>
 
-      <section class="control-panel">
-        <div class="section-head">
-          <h2>Transfer</h2>
-          <span id="selectedCount" class="count-chip">0 selected</span>
-        </div>
-        <div class="toolbar">
-          <label class="field source-field">
-            Source session provider
-            <select id="sourceProvider"></select>
-          </label>
-          <label class="field target-field">
-            Target provider
-            <select id="targetProviderSelect"></select>
-            <input id="targetProviderCustom" class="custom-target" placeholder="Custom provider id">
-          </label>
-          <div id="liveTargetPanel" class="live-target-panel"></div>
-          <label class="field search-field">
-            Search
-            <input id="searchInput" placeholder="Title, preview, message, id">
-          </label>
-          <label class="field source-filter-field">
-            Source
-            <select id="sourceFilter">
-              <option value="">All</option>
-            </select>
-          </label>
-          <label class="field project-field">
-            Project / folder
-            <select id="projectFilter"></select>
-          </label>
-          <div class="toggle-row">
-            <label class="check">
-              <input id="includeArchived" type="checkbox">
-              Archived
-            </label>
-            <label class="check">
-              <input id="includeDescendants" type="checkbox">
-              Copy tree
-            </label>
-          </div>
-        </div>
-      </section>
+            <div class="sidebar-section">
+              <div class="section-head">
+                <h2>Status</h2>
+              </div>
+              <div id="statusStrip" class="status-strip"></div>
+            </div>
 
-      <section class="workspace">
-        <div class="table-wrap source-list">
-          <div class="table-head">
-            <h2>Source</h2>
-            <span id="sourceListCount" class="count-chip">0 shown</span>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th class="select-col"><input id="selectAll" type="checkbox"></th>
-                <th>Session</th>
-                <th>Origin</th>
-                <th>Folder</th>
-                <th>State</th>
-                <th>Kids</th>
-              </tr>
-            </thead>
-            <tbody id="sourceThreadsBody"></tbody>
-          </table>
-        </div>
+            <div class="sidebar-section">
+              <div class="section-head">
+                <h2>Inventory</h2>
+              </div>
+              <div id="statsGrid" class="stats-grid"></div>
+            </div>
 
-        <div class="table-wrap target-list">
-          <div class="table-head">
-            <h2>Target</h2>
-            <span id="targetListCount" class="count-chip">0 shown</span>
+            <div class="sidebar-section providers-section">
+              <div class="section-head">
+                <h2>Session Providers</h2>
+              </div>
+              <div id="providerGrid" class="provider-grid"></div>
+            </div>
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Session</th>
-                <th>Origin</th>
-                <th>Folder</th>
-                <th>State</th>
-                <th>Kids</th>
-              </tr>
-            </thead>
-            <tbody id="targetThreadsBody"></tbody>
-          </table>
-        </div>
+        </aside>
 
-        <aside class="preview-pane">
-          <div class="pane-head">
-            <h2>Preview</h2>
+        <div class="resize-gutter" aria-hidden="true"></div>
+
+        <section class="panel-frame main-frame" data-platform-card-frame="main">
+          <div class="panel-surface main-surface" data-platform-main-content>
+            <section class="control-panel">
+              <div class="workbench-head">
+                <div>
+                  <h2>Source Sessions</h2>
+                  <p>Filter, inspect, preview, then copy sessions into the active provider.</p>
+                </div>
+                <span id="selectedCount" class="count-chip">0 selected</span>
+              </div>
+
+              <div class="toolbar">
+                <label class="field source-field">
+                  Source session provider
+                  <select id="sourceProvider"></select>
+                </label>
+                <label class="field target-field">
+                  Target provider
+                  <select id="targetProviderSelect"></select>
+                  <input id="targetProviderCustom" class="custom-target" placeholder="Custom provider id">
+                </label>
+                <div id="liveTargetPanel" class="live-target-panel"></div>
+                <label class="field search-field">
+                  Search
+                  <input id="searchInput" placeholder="Title, preview, message, id">
+                </label>
+                <label class="field source-filter-field">
+                  Source
+                  <select id="sourceFilter">
+                    <option value="">All</option>
+                  </select>
+                </label>
+                <label class="field project-field">
+                  Project / folder
+                  <select id="projectFilter"></select>
+                </label>
+                <div class="toggle-row">
+                  <label class="check">
+                    <input id="includeArchived" type="checkbox">
+                    <span>Archived</span>
+                  </label>
+                  <label class="check">
+                    <input id="includeDescendants" type="checkbox">
+                    <span>Copy tree</span>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <div class="table-wrap source-list">
+              <div class="table-head">
+                <h2>Source</h2>
+                <span id="sourceListCount" class="count-chip">0 shown</span>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th class="select-col"><input id="selectAll" type="checkbox" aria-label="Select all source sessions"></th>
+                    <th>Session</th>
+                    <th>Origin</th>
+                    <th>Folder</th>
+                    <th>State</th>
+                    <th>Kids</th>
+                  </tr>
+                </thead>
+                <tbody id="sourceThreadsBody"></tbody>
+              </table>
+            </div>
           </div>
-          <div id="previewMessages" class="messages"></div>
-          <div id="previewItems" class="preview-items"></div>
-          <div class="copy-actions">
-            <button id="previewButton" type="button">Preview</button>
-            <button id="copyButton" type="button" disabled>Copy</button>
+        </section>
+
+        <div class="resize-gutter" aria-hidden="true"></div>
+
+        <aside class="right-rail">
+          <div class="panel-frame rail-frame target-frame" data-platform-card-frame="workspace">
+            <div class="panel-surface rail-surface target-surface" data-workspace-sidebar>
+              <div class="table-wrap target-list">
+                <div class="table-head">
+                  <h2>Target</h2>
+                  <span id="targetListCount" class="count-chip">0 shown</span>
+                </div>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Session</th>
+                      <th>Origin</th>
+                      <th>Folder</th>
+                      <th>State</th>
+                      <th>Kids</th>
+                    </tr>
+                  </thead>
+                  <tbody id="targetThreadsBody"></tbody>
+                </table>
+              </div>
+            </div>
           </div>
-          <p id="copyDisabledReason" class="copy-hint"></p>
-          <p id="copyResult" class="result"></p>
+
+          <div class="panel-frame rail-frame preview-frame" data-platform-card-frame="assistant">
+            <aside class="panel-surface preview-pane" data-platform-assistant>
+              <div class="pane-head">
+                <div>
+                  <h2>Preview</h2>
+                  <p>Dry-run plan and copy status</p>
+                </div>
+              </div>
+              <div id="previewMessages" class="messages"></div>
+              <div id="previewItems" class="preview-items"></div>
+              <div class="copy-actions">
+                <button id="previewButton" type="button">
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
+                    <path d="M12 9.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"></path>
+                  </svg>
+                  <span>Preview</span>
+                </button>
+                <button id="copyButton" type="button" disabled>
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M8 8h10v10H8z"></path>
+                    <path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path>
+                  </svg>
+                  <span>Copy</span>
+                </button>
+              </div>
+              <p id="copyDisabledReason" class="copy-hint"></p>
+              <p id="copyResult" class="result"></p>
+            </aside>
+          </div>
         </aside>
       </section>
     </main>
