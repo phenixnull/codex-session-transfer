@@ -523,11 +523,14 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
 
 .count-chip {
   display: inline-flex;
+  position: relative;
+  z-index: 1;
   align-items: center;
   min-height: 24px;
   border: 1px solid var(--border-subtle);
   border-radius: 999px;
-  background: color-mix(in oklch, var(--muted) 56%, transparent);
+  background: color-mix(in oklch, var(--muted) 84%, var(--card));
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--card) 92%, black);
   color: var(--muted-foreground);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -723,6 +726,8 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
 
 .table-head-actions {
   display: inline-flex;
+  position: relative;
+  z-index: 2;
   align-items: center;
   justify-content: flex-end;
   gap: 7px;
@@ -731,12 +736,15 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
 
 .select-all-control {
   display: inline-flex;
+  position: relative;
+  z-index: 1;
   align-items: center;
   gap: 6px;
   min-height: 24px;
   border: 1px solid var(--border-subtle);
   border-radius: 999px;
-  background: color-mix(in oklch, var(--muted) 44%, transparent);
+  background: color-mix(in oklch, var(--muted) 82%, var(--card));
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--card) 92%, black);
   color: var(--muted-foreground);
   cursor: pointer;
   font-size: 11px;
