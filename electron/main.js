@@ -25,12 +25,12 @@ function createWindow() {
     minWidth: 980,
     minHeight: 760,
     title: "Codex Session Transfer",
-    backgroundColor: "#171520",
+    backgroundColor: "#1c1917",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : process.platform === "win32" ? "hidden" : "default",
     titleBarOverlay: process.platform === "win32"
       ? {
-          color: "#171520",
-          symbolColor: "#d7d9ff",
+          color: "#1c1917",
+          symbolColor: "#fafaf9",
           height: 44,
         }
       : undefined,
