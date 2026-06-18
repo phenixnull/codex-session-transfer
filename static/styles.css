@@ -346,6 +346,44 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
   flex-direction: column;
 }
 
+.session-rail.session-collapsed {
+  width: 44px;
+  flex-basis: 44px;
+}
+
+.session-expand-tab {
+  display: none;
+}
+
+.session-rail.session-collapsed .session-expand-tab {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border-radius: var(--radius-card);
+  background: color-mix(in oklch, var(--card) 86%, black);
+  box-shadow: var(--shadow);
+  color: var(--foreground-strong);
+  padding: 10px 0;
+}
+
+.session-expand-tab .button-icon {
+  margin-right: 0;
+}
+
+.session-expand-tab span {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+
+.session-rail.session-collapsed .session-render-frame {
+  display: none;
+}
+
 .rail-frame {
   min-height: 0;
 }
@@ -447,6 +485,27 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
   justify-content: space-between;
   gap: 10px;
   min-width: 0;
+}
+
+.pane-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+}
+
+.icon-button {
+  display: inline-flex;
+  width: 30px;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.icon-button .button-icon {
+  margin-right: 0;
 }
 
 .pane-head p,
@@ -1128,6 +1187,33 @@ td p {
   gap: 10px;
   overflow: auto;
   padding-right: 2px;
+}
+
+.session-render-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 0;
+}
+
+.session-render-footer:empty {
+  display: none;
+}
+
+.session-render-footer span {
+  color: var(--faint-foreground);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.load-more-button {
+  display: inline-flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
 }
 
 .session-empty {

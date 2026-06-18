@@ -203,17 +203,31 @@
 
         <div class="resize-gutter" aria-hidden="true"></div>
 
-        <aside class="session-rail">
+        <aside id="sessionRail" class="session-rail">
+          <button id="sessionRenderExpandButton" class="session-expand-tab" type="button" aria-label="Show session preview">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9 18l6-6-6-6"></path>
+            </svg>
+            <span>Session</span>
+          </button>
           <div class="panel-frame rail-frame session-render-frame" data-platform-card-frame="session">
             <section class="panel-surface session-render-pane" data-platform-session-render>
               <div class="pane-head session-render-head">
                 <div>
                   <h2 id="sessionRenderTitle">Session</h2>
                 </div>
-                <span id="sessionRenderSide" class="count-chip">Select a row</span>
+                <div class="pane-actions">
+                  <span id="sessionRenderSide" class="count-chip">Select a row</span>
+                  <button id="sessionRenderToggleButton" class="icon-button" type="button" aria-label="Hide session preview" title="Hide session preview">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M15 18l-6-6 6-6"></path>
+                    </svg>
+                  </button>
+                </div>
               </div>
               <div id="sessionRenderMeta" class="session-render-meta"></div>
               <div id="sessionRenderMessages" class="session-render-messages"></div>
+              <div id="sessionRenderFooter" class="session-render-footer"></div>
             </section>
           </div>
         </aside>

@@ -422,6 +422,43 @@ class SessionTransferTests(unittest.TestCase):
         self.assertNotIn("ghp_", rendered_text)
         self.assertIn("[redacted]", rendered_text)
 
+    def test_thread_detail_paginates_renderable_items(self) -> None:
+        thread_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        rollout_path = write_rollout(
+            self.codex_home,
+            thread_id,
+            "ProviderA",
+            entries=[
+                {
+                    "timestamp": "2026-06-13T10:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": f"message {index:03d}"}],
+                    },
+                }
+                for index in range(125)
+            ],
+        )
+        insert_thread(
+            self.db_path,
+            thread_id=thread_id,
+            rollout_path=rollout_path,
+            provider="ProviderA",
+            title="Paged",
+        )
+
+        detail = self.transfer.thread_detail(thread_id, item_offset=20, item_limit=10)
+
+        self.assertEqual(detail["item_offset"], 20)
+        self.assertEqual(detail["item_limit"], 10)
+        self.assertEqual(detail["item_total"], 125)
+        self.assertTrue(detail["has_more"])
+        self.assertEqual(len(detail["items"]), 10)
+        self.assertEqual(detail["items"][0]["text"], "message 020")
+        self.assertEqual(detail["items"][-1]["text"], "message 029")
+
     def test_preview_rejects_detached_child_thread(self) -> None:
         parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         child_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

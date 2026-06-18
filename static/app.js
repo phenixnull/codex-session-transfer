@@ -10,12 +10,15 @@ const state = {
   activeSession: null,
   activeThreadDetail: null,
   activeThreadLoading: false,
+  activeThreadLoadingMore: false,
+  sessionRenderCollapsed: false,
   preview: null,
   copyResult: "",
 };
 
 const $ = (id) => document.getElementById(id);
 const CUSTOM_TARGET = "__custom__";
+const SESSION_RENDER_PAGE_SIZE = 80;
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -474,22 +477,53 @@ function threadRow(thread, options = {}) {
 }
 
 async function selectThreadForRender(thread, side) {
-  state.activeSession = { id: thread.id, side };
-  state.activeThreadDetail = null;
-  state.activeThreadLoading = true;
+  const sameThread = state.activeSession?.id === thread.id;
+  state.activeSession = { id: thread.id, side, thread };
+  if (!sameThread) state.activeThreadDetail = null;
+  state.activeThreadLoading = false;
+  state.activeThreadLoadingMore = false;
   renderSourceThreads();
   renderTargetThreads();
   renderSessionDetail();
+  if (state.sessionRenderCollapsed || (sameThread && state.activeThreadDetail)) return;
+  await loadThreadDetailPage({ append: false });
+}
+
+async function loadThreadDetailPage({ append = false } = {}) {
+  if (!state.activeSession || state.sessionRenderCollapsed) return;
+  const activeId = state.activeSession.id;
+  const offset = append ? state.activeThreadDetail?.items?.length || 0 : 0;
+  if (append) state.activeThreadLoadingMore = true;
+  else state.activeThreadLoading = true;
+  renderSessionDetail();
   try {
-    const detail = await api(`/api/thread-detail?id=${encodeURIComponent(thread.id)}`);
-    if (!state.activeSession || state.activeSession.id !== thread.id) return;
-    state.activeThreadDetail = detail;
+    const detail = await api(
+      `/api/thread-detail?id=${encodeURIComponent(activeId)}&offset=${offset}&limit=${SESSION_RENDER_PAGE_SIZE}`
+    );
+    if (!state.activeSession || state.activeSession.id !== activeId) return;
+    if (append && state.activeThreadDetail) {
+      state.activeThreadDetail = {
+        ...detail,
+        items: [...(state.activeThreadDetail.items || []), ...(detail.items || [])],
+        item_offset: 0,
+      };
+    } else {
+      state.activeThreadDetail = detail;
+    }
   } catch (error) {
-    if (!state.activeSession || state.activeSession.id !== thread.id) return;
-    state.activeThreadDetail = { ok: false, errors: [error.message], items: [], thread };
+    if (!state.activeSession || state.activeSession.id !== activeId) return;
+    state.activeThreadDetail = {
+      ok: false,
+      errors: [error.message],
+      items: [],
+      thread: state.activeSession.thread,
+      item_total: 0,
+      has_more: false,
+    };
   } finally {
-    if (state.activeSession && state.activeSession.id === thread.id) {
+    if (state.activeSession && state.activeSession.id === activeId) {
       state.activeThreadLoading = false;
+      state.activeThreadLoadingMore = false;
       renderSessionDetail();
     }
   }
@@ -502,23 +536,34 @@ function reconcileActiveSession() {
   }
   const sourceHasActive = state.sourceThreads.some((thread) => thread.id === state.activeSession.id);
   const targetHasActive = state.targetThreads.some((thread) => thread.id === state.activeSession.id);
+  const activeThread =
+    state.sourceThreads.find((thread) => thread.id === state.activeSession.id) ||
+    state.targetThreads.find((thread) => thread.id === state.activeSession.id);
   if (!sourceHasActive && !targetHasActive) {
     state.activeSession = null;
     state.activeThreadDetail = null;
     state.activeThreadLoading = false;
+    state.activeThreadLoadingMore = false;
+  } else if (activeThread) {
+    state.activeSession.thread = activeThread;
   }
   renderSessionDetail();
 }
 
 function renderSessionDetail() {
+  renderSessionChrome();
   const title = $("sessionRenderTitle");
   const side = $("sessionRenderSide");
   const meta = $("sessionRenderMeta");
   const messages = $("sessionRenderMessages");
-  if (!title || !side || !meta || !messages) return;
+  const footer = $("sessionRenderFooter");
+  if (!title || !side || !meta || !messages || !footer) return;
 
   meta.replaceChildren();
   messages.replaceChildren();
+  footer.replaceChildren();
+
+  if (state.sessionRenderCollapsed) return;
 
   if (!state.activeSession) {
     title.textContent = "Session";
@@ -536,11 +581,14 @@ function renderSessionDetail() {
 
   const detail = state.activeThreadDetail;
   const thread = detail?.thread || {};
-  title.textContent = thread.display_title || thread.title || state.activeSession.id;
+  title.textContent =
+    thread.display_title || thread.title || state.activeSession.thread?.display_title || state.activeSession.id;
+  const shown = detail?.items?.length || 0;
+  const total = detail?.item_total ?? shown;
   meta.append(
-    sessionMetaField("Provider", thread.model_provider || detail?.meta?.model_provider),
-    sessionMetaField("Model", thread.model),
-    sessionMetaField("Project", shortPath(thread.cwd || detail?.meta?.cwd || "")),
+    sessionMetaField("Provider", thread.model_provider || detail?.meta?.model_provider || state.activeSession.thread?.model_provider),
+    sessionMetaField("Model", thread.model || state.activeSession.thread?.model),
+    sessionMetaField("Shown", total ? `${shown}/${total}` : "(none)"),
     sessionMetaField("Rollout", detail?.rollout?.exists ? `${detail.rollout.line_count || 0} lines` : "Missing"),
   );
 
@@ -554,6 +602,50 @@ function renderSessionDetail() {
 
   for (const item of detail.items) {
     messages.append(sessionRenderItem(item));
+  }
+  renderSessionFooter(footer, detail);
+}
+
+function renderSessionChrome() {
+  const rail = $("sessionRail");
+  const toggle = $("sessionRenderToggleButton");
+  const expand = $("sessionRenderExpandButton");
+  if (rail) rail.classList.toggle("session-collapsed", state.sessionRenderCollapsed);
+  if (toggle) {
+    toggle.setAttribute("aria-label", "Hide session preview");
+    toggle.title = "Hide session preview";
+  }
+  if (expand) {
+    const selectedTitle =
+      state.activeSession?.thread?.display_title || state.activeSession?.thread?.title || state.activeSession?.id || "Session";
+    expand.title = `Show session preview${state.activeSession ? `: ${selectedTitle}` : ""}`;
+  }
+}
+
+function renderSessionFooter(footer, detail) {
+  if (!detail?.has_more) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "load-more-button";
+  button.disabled = state.activeThreadLoadingMore;
+  button.innerHTML = `
+    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 5v14"></path>
+      <path d="M5 12h14"></path>
+    </svg>
+    <span>${state.activeThreadLoadingMore ? "Loading..." : "Load more"}</span>
+  `;
+  button.addEventListener("click", () => loadThreadDetailPage({ append: true }));
+  const hint = document.createElement("span");
+  hint.textContent = `${detail.items?.length || 0}/${detail.item_total || 0}`;
+  footer.append(button, hint);
+}
+
+function setSessionRenderCollapsed(collapsed) {
+  state.sessionRenderCollapsed = collapsed;
+  renderSessionDetail();
+  if (!collapsed && state.activeSession && !state.activeThreadDetail && !state.activeThreadLoading) {
+    loadThreadDetailPage({ append: false }).catch(() => {});
   }
 }
 
@@ -964,6 +1056,8 @@ function bindEvents() {
   $("projectFilter").addEventListener("change", loadThreadLists);
   $("previewButton").addEventListener("click", previewCopy);
   $("copyButton").addEventListener("click", executeCopy);
+  $("sessionRenderToggleButton").addEventListener("click", () => setSessionRenderCollapsed(true));
+  $("sessionRenderExpandButton").addEventListener("click", () => setSessionRenderCollapsed(false));
   $("selectAll").addEventListener("change", (event) => {
     if (event.target.checked) {
       for (const thread of state.sourceThreads) state.selected.add(thread.id);
@@ -1000,6 +1094,7 @@ function renderFileRuntimeNotice() {
     "selectAll",
     "previewButton",
     "copyButton",
+    "sessionRenderToggleButton",
   ]) {
     const node = $(id);
     if (node) node.disabled = true;

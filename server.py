@@ -23,6 +23,8 @@ from urllib.parse import parse_qs, urlparse
 STATE_DB_FILENAME = "state_5.sqlite"
 SESSION_INDEX_FILENAME = "session_index.jsonl"
 BLOCKING_PROCESS_NAMES = {"codex", "codex-plus-plus", "codex-plus-plus-manager"}
+DEFAULT_THREAD_DETAIL_LIMIT = 80
+MAX_THREAD_DETAIL_LIMIT = 200
 ROLLOUT_NAME_RE = re.compile(
     r"^(?P<prefix>rollout-.+-)"
     r"(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -448,10 +450,18 @@ class CodexSessionTransfer:
             session_index = self._load_session_index()
             return [self._thread_summary(conn, row, session_index) for row in rows]
 
-    def thread_detail(self, thread_id: str) -> dict[str, Any]:
+    def thread_detail(
+        self,
+        thread_id: str,
+        *,
+        item_offset: int = 0,
+        item_limit: int = DEFAULT_THREAD_DETAIL_LIMIT,
+    ) -> dict[str, Any]:
         clean_id = thread_id.strip()
         if not clean_id:
             raise ValueError("thread id is required")
+        item_offset = max(0, int(item_offset))
+        item_limit = min(MAX_THREAD_DETAIL_LIMIT, max(1, int(item_limit)))
 
         with closing(self._connect(read_only=True)) as conn:
             row = conn.execute("SELECT * FROM threads WHERE id = ?", (clean_id,)).fetchone()
@@ -469,17 +479,25 @@ class CodexSessionTransfer:
         errors: list[str] = []
         meta: dict[str, Any] = {}
         items: list[dict[str, Any]] = []
+        item_total = 0
+        has_more = False
 
         if not rollout_path.exists():
             errors.append(f"Rollout file missing: {rollout_path}")
         elif rollout_path.suffix != ".jsonl":
             errors.append(f"Unsupported rollout format: {rollout_path.name}")
         else:
-            parsed = self._parse_rollout_for_render(rollout_path)
+            parsed = self._parse_rollout_for_render(
+                rollout_path,
+                item_offset=item_offset,
+                item_limit=item_limit,
+            )
             rollout["line_count"] = parsed["line_count"]
             errors.extend(parsed["errors"])
             meta = parsed["meta"]
             items = parsed["items"]
+            item_total = parsed["item_total"]
+            has_more = parsed["has_more"]
 
         return {
             "ok": not errors or bool(thread),
@@ -488,6 +506,10 @@ class CodexSessionTransfer:
             "meta": meta,
             "rollout": rollout,
             "items": items,
+            "item_offset": item_offset,
+            "item_limit": item_limit,
+            "item_total": item_total,
+            "has_more": has_more,
         }
 
     def preview_copy(self, request: CopyRequest) -> dict[str, Any]:
@@ -814,16 +836,30 @@ class CodexSessionTransfer:
             "child_count": int(child_count),
         }
 
-    def _parse_rollout_for_render(self, rollout_path: Path) -> dict[str, Any]:
+    def _parse_rollout_for_render(
+        self,
+        rollout_path: Path,
+        *,
+        item_offset: int,
+        item_limit: int,
+    ) -> dict[str, Any]:
         meta: dict[str, Any] = {}
         items: list[dict[str, Any]] = []
         errors: list[str] = []
         seen_messages: set[tuple[str, str]] = set()
+        item_total = 0
         line_count = 0
         try:
             lines = rollout_path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
-            return {"meta": meta, "items": items, "errors": [str(exc)], "line_count": line_count}
+            return {
+                "meta": meta,
+                "items": items,
+                "errors": [str(exc)],
+                "line_count": line_count,
+                "item_total": item_total,
+                "has_more": False,
+            }
 
         for line_count, line in enumerate(lines, start=1):
             if not line.strip():
@@ -832,17 +868,18 @@ class CodexSessionTransfer:
                 entry = json.loads(line)
             except json.JSONDecodeError as exc:
                 errors.append(f"Line {line_count}: invalid JSON ({exc.msg})")
-                items.append(
-                    {
-                        "kind": "warning",
-                        "role": "event",
-                        "title": "Invalid rollout JSON",
-                        "text": self._clip_text(line, 1200),
-                        "timestamp": None,
-                        "line": line_count,
-                        "data": {"error": exc.msg},
-                    }
-                )
+                warning_item = {
+                    "kind": "warning",
+                    "role": "event",
+                    "title": "Invalid rollout JSON",
+                    "text": self._clip_text(line, 1200),
+                    "timestamp": None,
+                    "line": line_count,
+                    "data": {"error": exc.msg},
+                }
+                if item_total >= item_offset and len(items) < item_limit:
+                    items.append(warning_item)
+                item_total += 1
                 continue
             if not isinstance(entry, dict):
                 continue
@@ -860,9 +897,18 @@ class CodexSessionTransfer:
                     if message_key in seen_messages:
                         continue
                     seen_messages.add(message_key)
-                items.append(item)
+                if item_total >= item_offset and len(items) < item_limit:
+                    items.append(item)
+                item_total += 1
 
-        return {"meta": meta, "items": items, "errors": errors, "line_count": line_count}
+        return {
+            "meta": meta,
+            "items": items,
+            "errors": errors,
+            "line_count": line_count,
+            "item_total": item_total,
+            "has_more": item_offset + len(items) < item_total,
+        }
 
     def _rollout_type_and_payload(self, entry: dict[str, Any]) -> tuple[str | None, Any]:
         item = entry.get("item")
@@ -1558,6 +1604,13 @@ def parse_bool(value: str | None) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
 
 
+def parse_int(value: str | None, default: int) -> int:
+    try:
+        return int(str(value or "").strip())
+    except ValueError:
+        return default
+
+
 def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[SimpleHTTPRequestHandler]:
     class TransferRequestHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1595,7 +1648,16 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                 return
             if parsed.path == "/api/thread-detail":
                 query = parse_qs(parsed.query)
-                self._send_json(transfer.thread_detail(query.get("id", [""])[0]))
+                self._send_json(
+                    transfer.thread_detail(
+                        query.get("id", [""])[0],
+                        item_offset=parse_int(query.get("offset", [""])[0], 0),
+                        item_limit=parse_int(
+                            query.get("limit", [""])[0],
+                            DEFAULT_THREAD_DETAIL_LIMIT,
+                        ),
+                    )
+                )
                 return
             if parsed.path == "/":
                 self.path = "/index.html"
