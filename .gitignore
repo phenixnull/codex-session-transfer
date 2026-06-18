@@ -17,6 +17,11 @@ dist/
 build/
 coverage/
 
+release/v*/**/*.exe
+release/v*/**/*.dmg
+release/v*/**/*.zip
+release/v*/**/latest*.yml
+
 .DS_Store
 Thumbs.db
 =ro

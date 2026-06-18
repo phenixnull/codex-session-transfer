@@ -1,15 +1,100 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Local Codex provider session transfer workbench.",
   "main": "electron/main.js",
   "scripts": {
     "server": "python server.py --host 127.0.0.1 --port 8765",
     "electron": "electron .",
-    "dev": "electron ."
+    "dev": "electron .",
+    "icons": "node scripts/run_python.js scripts/generate_icons.py",
+    "build:server": "node scripts/run_python.js scripts/build_server.py",
+    "build:server:win": "node scripts/run_python.js scripts/build_server.py --platform win",
+    "build:server:mac": "node scripts/run_python.js scripts/build_server.py --platform mac",
+    "dist:win": "npm run icons && npm run build:server:win && electron-builder --win nsis portable --x64",
+    "dist:mac": "npm run icons && npm run build:server:mac && electron-builder --mac dmg zip --x64 --arm64",
+    "release:win": "npm run dist:win && node scripts/run_python.js scripts/collect_release.py --platform win",
+    "release:mac": "npm run dist:mac && node scripts/run_python.js scripts/collect_release.py --platform mac"
+  },
+  "build": {
+    "appId": "com.phenixnull.codex-session-transfer",
+    "productName": "Codex Session Transfer",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "output/electron"
+    },
+    "files": [
+      "electron/**/*",
+      "static/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/server",
+        "to": "server",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "shortcutName": "Codex Session Transfer",
+      "uninstallDisplayName": "Codex Session Transfer",
+      "artifactName": "${productName}-${version}-Setup-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable-${arch}.${ext}"
+    },
+    "mac": {
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
+    }
   },
   "devDependencies": {
-    "electron": "^39.2.7"
+    "electron": "^39.2.7",
+    "electron-builder": "^26.15.3"
   }
 }

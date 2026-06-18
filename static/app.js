@@ -11,7 +11,7 @@ const state = {
   activeThreadDetail: null,
   activeThreadLoading: false,
   activeThreadLoadingMore: false,
-  sessionRenderCollapsed: false,
+  sessionRenderCollapsed: true,
   preview: null,
   copyResult: "",
 };

@@ -1611,6 +1611,10 @@ def parse_int(value: str | None, default: int) -> int:
         return default
 
 
+def app_base_dir() -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+
+
 def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[SimpleHTTPRequestHandler]:
     class TransferRequestHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1733,7 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     transfer = CodexSessionTransfer(codex_home=args.codex_home, sqlite_home=args.sqlite_home)
-    static_dir = Path(__file__).with_name("static")
+    static_dir = app_base_dir() / "static"
     server = ThreadingHTTPServer((args.host, args.port), make_handler(transfer, static_dir))
     url = f"http://{args.host}:{args.port}"
     print(f"Codex session transfer tool listening on {url}", flush=True)
