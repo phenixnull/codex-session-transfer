@@ -923,6 +923,11 @@ td p {
   color: oklch(0.86 0.12 85);
 }
 
+.file-runtime-notice a {
+  color: var(--foreground-strong);
+  font-weight: 700;
+}
+
 .preview-item {
   display: grid;
   gap: 5px;

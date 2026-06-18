@@ -764,7 +764,54 @@ function debounce(fn, delay) {
   };
 }
 
-bindEvents();
-loadAll().catch((error) => {
-  $("previewMessages").replaceChildren(message("error", error.message));
-});
+function renderFileRuntimeNotice() {
+  $("dbPath").textContent = "This screen needs the local HTTP API.";
+
+  for (const id of [
+    "killBlockingButton",
+    "repairNamesButton",
+    "sourceProvider",
+    "targetProviderSelect",
+    "targetProviderCustom",
+    "searchInput",
+    "sourceFilter",
+    "projectFilter",
+    "includeArchived",
+    "includeDescendants",
+    "selectAll",
+    "previewButton",
+    "copyButton",
+  ]) {
+    const node = $(id);
+    if (node) node.disabled = true;
+  }
+
+  const refresh = $("refreshButton");
+  refresh.textContent = "Open local app";
+  refresh.disabled = false;
+  refresh.addEventListener("click", () => {
+    window.location.href = "http://127.0.0.1:8765/";
+  });
+
+  const notice = document.createElement("div");
+  notice.className = "message error file-runtime-notice";
+  const link = document.createElement("a");
+  link.href = "http://127.0.0.1:8765/";
+  link.textContent = "http://127.0.0.1:8765/";
+  notice.append(
+    "This file:// preview cannot load providers or sessions. Start the local server or Electron app, then open ",
+    link,
+    ".",
+  );
+  $("previewMessages").replaceChildren(notice);
+  setCopyResult("The static file is read-only without the local API.", "error");
+}
+
+if (window.location.protocol === "file:") {
+  renderFileRuntimeNotice();
+} else {
+  bindEvents();
+  loadAll().catch((error) => {
+    $("previewMessages").replaceChildren(message("error", error.message));
+  });
+}
