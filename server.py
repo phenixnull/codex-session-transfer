@@ -29,6 +29,11 @@ ROLLOUT_NAME_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
     r"(?P<suffix>\.jsonl)$"
 )
+SECRET_PATTERNS = (
+    re.compile(r"\bghp_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+)
 
 JSONValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 ProcessChecker = Callable[[], list[dict[str, Any]]]
@@ -443,6 +448,48 @@ class CodexSessionTransfer:
             session_index = self._load_session_index()
             return [self._thread_summary(conn, row, session_index) for row in rows]
 
+    def thread_detail(self, thread_id: str) -> dict[str, Any]:
+        clean_id = thread_id.strip()
+        if not clean_id:
+            raise ValueError("thread id is required")
+
+        with closing(self._connect(read_only=True)) as conn:
+            row = conn.execute("SELECT * FROM threads WHERE id = ?", (clean_id,)).fetchone()
+            if row is None:
+                return {"ok": False, "errors": [f"Thread not found: {clean_id}"]}
+            session_index = self._load_session_index()
+            thread = self._thread_summary(conn, row, session_index)
+
+        rollout_path = Path(row["rollout_path"])
+        rollout = {
+            "path": str(rollout_path),
+            "exists": rollout_path.exists(),
+            "line_count": 0,
+        }
+        errors: list[str] = []
+        meta: dict[str, Any] = {}
+        items: list[dict[str, Any]] = []
+
+        if not rollout_path.exists():
+            errors.append(f"Rollout file missing: {rollout_path}")
+        elif rollout_path.suffix != ".jsonl":
+            errors.append(f"Unsupported rollout format: {rollout_path.name}")
+        else:
+            parsed = self._parse_rollout_for_render(rollout_path)
+            rollout["line_count"] = parsed["line_count"]
+            errors.extend(parsed["errors"])
+            meta = parsed["meta"]
+            items = parsed["items"]
+
+        return {
+            "ok": not errors or bool(thread),
+            "errors": errors,
+            "thread": thread,
+            "meta": meta,
+            "rollout": rollout,
+            "items": items,
+        }
+
     def preview_copy(self, request: CopyRequest) -> dict[str, Any]:
         with closing(self._connect(read_only=True)) as conn:
             plan = self._build_copy_plan(conn, request)
@@ -766,6 +813,219 @@ class CodexSessionTransfer:
             "parent_thread_id": parent,
             "child_count": int(child_count),
         }
+
+    def _parse_rollout_for_render(self, rollout_path: Path) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        items: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen_messages: set[tuple[str, str]] = set()
+        line_count = 0
+        try:
+            lines = rollout_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            return {"meta": meta, "items": items, "errors": [str(exc)], "line_count": line_count}
+
+        for line_count, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"Line {line_count}: invalid JSON ({exc.msg})")
+                items.append(
+                    {
+                        "kind": "warning",
+                        "role": "event",
+                        "title": "Invalid rollout JSON",
+                        "text": self._clip_text(line, 1200),
+                        "timestamp": None,
+                        "line": line_count,
+                        "data": {"error": exc.msg},
+                    }
+                )
+                continue
+            if not isinstance(entry, dict):
+                continue
+
+            entry_type, payload = self._rollout_type_and_payload(entry)
+            if entry_type == "session_meta":
+                if isinstance(payload, dict):
+                    meta = self._public_rollout_meta(payload)
+                continue
+
+            item = self._renderable_rollout_item(entry, entry_type, payload, line_count)
+            if item:
+                if item.get("kind") == "message":
+                    message_key = (str(item.get("role") or ""), str(item.get("text") or ""))
+                    if message_key in seen_messages:
+                        continue
+                    seen_messages.add(message_key)
+                items.append(item)
+
+        return {"meta": meta, "items": items, "errors": errors, "line_count": line_count}
+
+    def _rollout_type_and_payload(self, entry: dict[str, Any]) -> tuple[str | None, Any]:
+        item = entry.get("item")
+        if isinstance(item, dict):
+            return item.get("type"), item.get("payload")
+        return entry.get("type"), entry.get("payload")
+
+    def _renderable_rollout_item(
+        self,
+        entry: dict[str, Any],
+        entry_type: str | None,
+        payload: Any,
+        line: int,
+    ) -> dict[str, Any] | None:
+        timestamp = entry.get("timestamp")
+        if not isinstance(payload, dict):
+            return None
+
+        payload_type = payload.get("type")
+        item_type = str(payload_type or entry_type or "event")
+        if item_type == "message":
+            text = self._payload_text(payload)
+            if not text:
+                return None
+            role = str(payload.get("role") or "assistant")
+            if role in {"developer", "system"}:
+                return None
+            return {
+                "kind": "message",
+                "role": role,
+                "title": role.title(),
+                "text": self._clip_text(text),
+                "timestamp": timestamp,
+                "line": line,
+                "data": {"content_types": self._content_types(payload.get("content"))},
+            }
+
+        if item_type == "function_call":
+            name = str(payload.get("name") or payload.get("function") or payload.get("tool") or "tool call")
+            return {
+                "kind": "tool_call",
+                "role": "tool",
+                "title": name,
+                "text": name,
+                "timestamp": timestamp,
+                "line": line,
+                "data": {
+                    "call_id": payload.get("call_id"),
+                    "arguments": self._redact_sensitive_value(payload.get("arguments")),
+                },
+            }
+
+        if item_type == "function_call_output":
+            text = self._payload_text(payload)
+            return {
+                "kind": "tool_result",
+                "role": "tool",
+                "title": "Tool result",
+                "text": self._clip_text(text),
+                "timestamp": timestamp,
+                "line": line,
+                "data": {"call_id": payload.get("call_id")},
+            }
+
+        if item_type == "user_message":
+            text = payload.get("message")
+            if isinstance(text, str) and text.strip():
+                return {
+                    "kind": "message",
+                    "role": "user",
+                    "title": "User",
+                    "text": self._clip_text(text),
+                    "timestamp": timestamp,
+                    "line": line,
+                    "data": {"source": "event_msg"},
+                }
+
+        if item_type in {"task_started", "token_count", "reasoning"}:
+            return None
+        if entry_type == "event_msg":
+            return None
+
+        text = self._payload_text(payload)
+        if not text:
+            return None
+        return {
+            "kind": "event",
+            "role": "event",
+            "title": item_type,
+            "text": self._clip_text(text),
+            "timestamp": timestamp,
+            "line": line,
+            "data": {"entry_type": entry_type},
+        }
+
+    def _payload_text(self, payload: dict[str, Any]) -> str:
+        content = payload.get("content")
+        if content is not None:
+            text = self._content_text(content)
+            if text:
+                return text
+        for key in ("text", "message", "output"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                return value
+            if value is not None and key == "output":
+                return compact_json(value)
+        return ""
+
+    def _content_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [self._content_text(item) for item in content]
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, dict):
+            for key in ("text", "content", "message", "output"):
+                value = content.get(key)
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, (list, dict)):
+                    nested = self._content_text(value)
+                    if nested:
+                        return nested
+        return ""
+
+    def _content_types(self, content: Any) -> list[str]:
+        if not isinstance(content, list):
+            return []
+        types = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type"):
+                types.append(str(part["type"]))
+        return types
+
+    def _public_rollout_meta(self, payload: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"id", "timestamp", "cwd", "originator", "cli_version", "source", "model_provider"}
+        return {
+            key: self._redact_sensitive_value(value)
+            for key, value in payload.items()
+            if key in allowed
+        }
+
+    def _clip_text(self, text: str, limit: int = 12000) -> str:
+        text = self._redact_sensitive_text(text)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+    def _redact_sensitive_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._redact_sensitive_text(value)
+        if isinstance(value, list):
+            return [self._redact_sensitive_value(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): self._redact_sensitive_value(item) for key, item in value.items()}
+        return value
+
+    def _redact_sensitive_text(self, text: str) -> str:
+        redacted = text
+        for pattern in SECRET_PATTERNS:
+            redacted = pattern.sub("[redacted]", redacted)
+        return redacted
 
     def _build_copy_plan(self, conn: sqlite3.Connection, request: CopyRequest) -> dict[str, Any]:
         errors: list[str] = []
@@ -1332,6 +1592,10 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                         source=query.get("source", [""])[0],
                     )
                 )
+                return
+            if parsed.path == "/api/thread-detail":
+                query = parse_qs(parsed.query)
+                self._send_json(transfer.thread_detail(query.get("id", [""])[0]))
                 return
             if parsed.path == "/":
                 self.path = "/index.html"

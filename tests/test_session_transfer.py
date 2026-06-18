@@ -110,6 +110,7 @@ def write_rollout(
     source: object = "cli",
     parent_thread_id: str | None = None,
     stamp: str = "2026-06-13T10-00-00",
+    entries: list[dict[str, object]] | None = None,
 ) -> Path:
     root = codex_home / ("archived_sessions" if archived else "sessions")
     path = root / "2026" / "06" / "13" / f"rollout-{stamp}-{thread_id}.jsonl"
@@ -129,8 +130,11 @@ def write_rollout(
         "timestamp": "2026-06-13T10:00:00Z",
         "item": {"type": "session_meta", "payload": payload},
     }
+    rollout_entries = [line, {"item": {"type": "event_msg", "payload": {}}}]
+    if entries:
+        rollout_entries.extend(entries)
     path.write_text(
-        compact_json(line) + "\n" + compact_json({"item": {"type": "event_msg", "payload": {}}}) + "\n",
+        "".join(compact_json(entry) + "\n" for entry in rollout_entries),
         encoding="utf-8",
     )
     return path
@@ -275,6 +279,148 @@ class SessionTransferTests(unittest.TestCase):
         self.assertTrue(by_id[existing_id]["rollout_exists"])
         self.assertTrue(by_id[empty_preview_id]["hidden_empty_preview"])
         self.assertFalse(by_id[missing_id]["rollout_exists"])
+
+    def test_thread_detail_reads_rollout_as_renderable_session_items(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        rollout_path = write_rollout(
+            self.codex_home,
+            thread_id,
+            "ProviderA",
+            entries=[
+                {
+                    "timestamp": "2026-06-13T10:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Render this session"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell_command",
+                        "arguments": {"command": "echo ok"},
+                        "call_id": "call_1",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "ok\n",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Session rendered."}],
+                    },
+                },
+            ],
+        )
+        insert_thread(
+            self.db_path,
+            thread_id=thread_id,
+            rollout_path=rollout_path,
+            provider="ProviderA",
+            title="Renderable",
+        )
+
+        detail = self.transfer.thread_detail(thread_id)
+
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["thread"]["id"], thread_id)
+        self.assertEqual(detail["thread"]["display_title"], "Renderable")
+        self.assertEqual(detail["meta"]["model_provider"], "ProviderA")
+        self.assertTrue(detail["rollout"]["exists"])
+        self.assertEqual(detail["rollout"]["line_count"], 6)
+        self.assertEqual(
+            [(item["kind"], item["role"], item["text"]) for item in detail["items"]],
+            [
+                ("message", "user", "Render this session"),
+                ("tool_call", "tool", "shell_command"),
+                ("tool_result", "tool", "ok\n"),
+                ("message", "assistant", "Session rendered."),
+            ],
+        )
+
+    def test_thread_detail_hides_internal_messages_and_redacts_secrets(self) -> None:
+        thread_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        secret = "ghp_" + ("1" * 36)
+        visible_text = f"please keep this token private: {secret}"
+        rollout_path = write_rollout(
+            self.codex_home,
+            thread_id,
+            "ProviderA",
+            entries=[
+                {
+                    "timestamp": "2026-06-13T10:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": f"internal {secret}"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": visible_text}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": visible_text,
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-13T10:01:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "assistant_message",
+                        "message": "done",
+                    },
+                },
+            ],
+        )
+        insert_thread(
+            self.db_path,
+            thread_id=thread_id,
+            rollout_path=rollout_path,
+            provider="ProviderA",
+            title="Private",
+        )
+
+        detail = self.transfer.thread_detail(thread_id)
+
+        self.assertEqual([item["role"] for item in detail["items"]], ["user", "assistant"])
+        rendered_text = json.dumps(detail["items"], ensure_ascii=False)
+        self.assertNotIn(secret, rendered_text)
+        self.assertNotIn("ghp_", rendered_text)
+        self.assertIn("[redacted]", rendered_text)
 
     def test_preview_rejects_detached_child_thread(self) -> None:
         parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

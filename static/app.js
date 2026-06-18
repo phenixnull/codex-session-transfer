@@ -7,6 +7,9 @@ const state = {
   targetThreads: [],
   selected: new Set(),
   lastCopiedTargetIds: new Set(),
+  activeSession: null,
+  activeThreadDetail: null,
+  activeThreadLoading: false,
   preview: null,
   copyResult: "",
 };
@@ -88,6 +91,7 @@ async function loadSourceThreads(options = {}) {
   }
   renderSourceFilter();
   renderSourceThreads();
+  reconcileActiveSession();
   invalidatePreview({ clearResult: !options.preserveResult });
 }
 
@@ -99,6 +103,7 @@ async function loadTargetThreads() {
     state.targetThreads = await api(`/api/threads?${threadQueryParams(target).toString()}`);
   }
   renderTargetThreads();
+  reconcileActiveSession();
 }
 
 function ensureProviderSelection() {
@@ -382,13 +387,14 @@ function renderSourceThreads() {
   const body = $("sourceThreadsBody");
   body.replaceChildren();
   for (const thread of state.sourceThreads) {
-    const row = threadRow(thread);
+    const row = threadRow(thread, { side: "source" });
     const selectCell = document.createElement("td");
     selectCell.className = "select-cell";
     selectCell.dataset.label = "Select";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = state.selected.has(thread.id);
+    checkbox.addEventListener("click", (event) => event.stopPropagation());
     checkbox.addEventListener("change", () => {
       if (checkbox.checked) state.selected.add(thread.id);
       else state.selected.delete(thread.id);
@@ -407,7 +413,7 @@ function renderTargetThreads() {
   const body = $("targetThreadsBody");
   body.replaceChildren();
   for (const thread of state.targetThreads) {
-    const row = threadRow(thread, { target: true });
+    const row = threadRow(thread, { target: true, side: "target" });
     body.append(row);
   }
   renderListCount("targetListCount", state.targetThreads.length);
@@ -417,6 +423,17 @@ function threadRow(thread, options = {}) {
   const row = document.createElement("tr");
   if (!thread.rollout_exists) row.classList.add("warn-row");
   if (options.target && state.lastCopiedTargetIds.has(thread.id)) row.classList.add("new-row");
+  if (state.activeSession?.id === thread.id) row.classList.add("active-row");
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  row.setAttribute("aria-label", `Render ${options.side || "session"} session ${thread.display_title || thread.title || thread.id}`);
+  row.addEventListener("click", () => selectThreadForRender(thread, options.side || (options.target ? "target" : "source")));
+  row.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectThreadForRender(thread, options.side || (options.target ? "target" : "source"));
+    }
+  });
 
   const sessionCell = document.createElement("td");
   sessionCell.className = "session-cell";
@@ -454,6 +471,208 @@ function threadRow(thread, options = {}) {
     }),
   );
   return row;
+}
+
+async function selectThreadForRender(thread, side) {
+  state.activeSession = { id: thread.id, side };
+  state.activeThreadDetail = null;
+  state.activeThreadLoading = true;
+  renderSourceThreads();
+  renderTargetThreads();
+  renderSessionDetail();
+  try {
+    const detail = await api(`/api/thread-detail?id=${encodeURIComponent(thread.id)}`);
+    if (!state.activeSession || state.activeSession.id !== thread.id) return;
+    state.activeThreadDetail = detail;
+  } catch (error) {
+    if (!state.activeSession || state.activeSession.id !== thread.id) return;
+    state.activeThreadDetail = { ok: false, errors: [error.message], items: [], thread };
+  } finally {
+    if (state.activeSession && state.activeSession.id === thread.id) {
+      state.activeThreadLoading = false;
+      renderSessionDetail();
+    }
+  }
+}
+
+function reconcileActiveSession() {
+  if (!state.activeSession) {
+    renderSessionDetail();
+    return;
+  }
+  const sourceHasActive = state.sourceThreads.some((thread) => thread.id === state.activeSession.id);
+  const targetHasActive = state.targetThreads.some((thread) => thread.id === state.activeSession.id);
+  if (!sourceHasActive && !targetHasActive) {
+    state.activeSession = null;
+    state.activeThreadDetail = null;
+    state.activeThreadLoading = false;
+  }
+  renderSessionDetail();
+}
+
+function renderSessionDetail() {
+  const title = $("sessionRenderTitle");
+  const side = $("sessionRenderSide");
+  const meta = $("sessionRenderMeta");
+  const messages = $("sessionRenderMessages");
+  if (!title || !side || !meta || !messages) return;
+
+  meta.replaceChildren();
+  messages.replaceChildren();
+
+  if (!state.activeSession) {
+    title.textContent = "Session";
+    side.textContent = "Select a row";
+    messages.append(emptySessionNotice("Click any Source or Target session row to render its rollout transcript here."));
+    return;
+  }
+
+  side.textContent = state.activeSession.side === "target" ? "Target" : "Source";
+  if (state.activeThreadLoading) {
+    title.textContent = "Loading session...";
+    messages.append(emptySessionNotice("Reading rollout JSONL from disk."));
+    return;
+  }
+
+  const detail = state.activeThreadDetail;
+  const thread = detail?.thread || {};
+  title.textContent = thread.display_title || thread.title || state.activeSession.id;
+  meta.append(
+    sessionMetaField("Provider", thread.model_provider || detail?.meta?.model_provider),
+    sessionMetaField("Model", thread.model),
+    sessionMetaField("Project", shortPath(thread.cwd || detail?.meta?.cwd || "")),
+    sessionMetaField("Rollout", detail?.rollout?.exists ? `${detail.rollout.line_count || 0} lines` : "Missing"),
+  );
+
+  for (const error of detail?.errors || []) {
+    messages.append(message("warn", error));
+  }
+  if (!detail?.items?.length) {
+    messages.append(emptySessionNotice("No renderable messages were found in this rollout."));
+    return;
+  }
+
+  for (const item of detail.items) {
+    messages.append(sessionRenderItem(item));
+  }
+}
+
+function sessionMetaField(label, value) {
+  const node = document.createElement("div");
+  const span = document.createElement("span");
+  span.textContent = label;
+  const code = document.createElement("code");
+  code.textContent = value || "(none)";
+  code.title = value || "";
+  node.append(span, code);
+  return node;
+}
+
+function emptySessionNotice(text) {
+  const node = document.createElement("div");
+  node.className = "session-empty";
+  node.textContent = text;
+  return node;
+}
+
+function sessionRenderItem(item) {
+  const node = document.createElement("article");
+  node.className = `render-item ${item.kind || "event"} ${item.role || "event"}`;
+
+  const head = document.createElement("div");
+  head.className = "render-item-head";
+  const role = document.createElement("strong");
+  role.textContent = renderItemLabel(item);
+  const meta = document.createElement("span");
+  meta.textContent = renderItemMeta(item);
+  head.append(role, meta);
+
+  const body = document.createElement("div");
+  body.className = "render-item-body";
+  if (item.kind === "tool_call") {
+    const name = document.createElement("p");
+    name.textContent = item.text || item.title || "Tool call";
+    body.append(name);
+    if (item.data?.arguments !== undefined && item.data?.arguments !== null) {
+      body.append(codeBlock(formatStructuredValue(item.data.arguments)));
+    }
+  } else if (item.kind === "tool_result" || item.kind === "warning") {
+    body.append(codeBlock(item.text || ""));
+  } else {
+    appendFormattedText(body, item.text || "");
+  }
+
+  node.append(head, body);
+  return node;
+}
+
+function renderItemLabel(item) {
+  if (item.kind === "tool_call") return item.title || "Tool call";
+  if (item.kind === "tool_result") return "Tool result";
+  if (item.kind === "warning") return "Warning";
+  if (item.role) return item.role;
+  return item.title || "event";
+}
+
+function renderItemMeta(item) {
+  const bits = [];
+  if (item.kind) bits.push(item.kind);
+  if (item.line) bits.push(`line ${item.line}`);
+  if (item.timestamp) bits.push(formatTime(item.timestamp));
+  return bits.join(" / ");
+}
+
+function appendFormattedText(container, text) {
+  if (!text) {
+    container.append(document.createTextNode(""));
+    return;
+  }
+  const fencePattern = /```([\w-]*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match = fencePattern.exec(text);
+  while (match) {
+    appendTextBlock(container, text.slice(lastIndex, match.index));
+    container.append(codeBlock(match[2], match[1]));
+    lastIndex = fencePattern.lastIndex;
+    match = fencePattern.exec(text);
+  }
+  appendTextBlock(container, text.slice(lastIndex));
+}
+
+function appendTextBlock(container, text) {
+  if (!text) return;
+  const block = document.createElement("p");
+  block.textContent = text.trim() ? text.trim() : text;
+  container.append(block);
+}
+
+function codeBlock(text, language = "") {
+  const pre = document.createElement("pre");
+  if (language) pre.dataset.language = language;
+  const code = document.createElement("code");
+  code.textContent = text;
+  pre.append(code);
+  return pre;
+}
+
+function formatStructuredValue(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function renderListCount(id, count) {
@@ -804,6 +1023,7 @@ function renderFileRuntimeNotice() {
     ".",
   );
   $("previewMessages").replaceChildren(notice);
+  renderSessionDetail();
   setCopyResult("The static file is read-only without the local API.", "error");
 }
 
@@ -811,6 +1031,7 @@ if (window.location.protocol === "file:") {
   renderFileRuntimeNotice();
 } else {
   bindEvents();
+  renderSessionDetail();
   loadAll().catch((error) => {
     $("previewMessages").replaceChildren(message("error", error.message));
   });
