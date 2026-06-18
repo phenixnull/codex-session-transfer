@@ -54,11 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     checksums = []
     for path in copied:
         checksums.append({"file": path.name, "sha256": sha256(path), "bytes": path.stat().st_size})
-    (dest / "SHA256SUMS.txt").write_text(
+    (dest / f"SHA256SUMS-{platform_dir}.txt").write_text(
         "".join(f"{item['sha256']}  {item['file']}\n" for item in checksums),
         encoding="utf-8",
     )
-    (dest / "manifest.json").write_text(
+    (dest / f"manifest-{platform_dir}.json").write_text(
         json.dumps(
             {
                 "version": version,

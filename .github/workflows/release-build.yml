@@ -75,6 +75,6 @@ jobs:
           files=()
           while IFS= read -r -d '' file; do
             files+=("$file")
-          done < <(find github-release -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name 'SHA256SUMS.txt' -o -name 'manifest.json' \) -print0)
+          done < <(find github-release -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name 'SHA256SUMS-*.txt' -o -name 'manifest-*.json' \) -print0)
 
           gh release upload "$TAG_NAME" "${files[@]}" --clobber
