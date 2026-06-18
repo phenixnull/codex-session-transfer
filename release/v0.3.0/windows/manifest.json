@@ -1,21 +1,21 @@
 {
   "version": "0.3.0",
   "platform": "win",
-  "built_at": "2026-06-18T04:40:42.286560Z",
+  "built_at": "2026-06-18T04:53:07.126055Z",
   "artifacts": [
     {
       "file": "Codex Session Transfer-0.3.0-Portable-x64.exe",
-      "sha256": "1527cee868e794abbbfda97e754c39ceb229eefc5cc46cb83dd157753fd1980e",
-      "bytes": 102560684
+      "sha256": "35d82eae57f37d11fdf26395e69b6cd77fe7e719da1396fab98259bc255f6c76",
+      "bytes": 102559741
     },
     {
       "file": "Codex Session Transfer-0.3.0-Setup-x64.exe",
-      "sha256": "87f7120116184aa12e7d9c52ac43a227638e8d5fe7769ed5098aa9feeb8a42e4",
-      "bytes": 102814828
+      "sha256": "113a7e067f0ca33c80e2b76b936d1382f32df7ea8a72a96cd7e95dccb69cfb48",
+      "bytes": 102813877
     },
     {
       "file": "latest.yml",
-      "sha256": "8e5b7b869ef5475a924c9128f89cc3180c025a5cb18b5cca91f9cf225213141e",
+      "sha256": "f836d22dbbb120c0b7d50fed9dea6fe8b02a59744650b5bc84386940cc962cd0",
       "bytes": 381
     }
   ]

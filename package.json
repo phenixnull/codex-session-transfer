@@ -12,8 +12,8 @@
     "build:server": "node scripts/run_python.js scripts/build_server.py",
     "build:server:win": "node scripts/run_python.js scripts/build_server.py --platform win",
     "build:server:mac": "node scripts/run_python.js scripts/build_server.py --platform mac",
-    "dist:win": "npm run icons && npm run build:server:win && electron-builder --win nsis portable --x64",
-    "dist:mac": "npm run icons && npm run build:server:mac && electron-builder --mac dmg zip --x64 --arm64",
+    "dist:win": "npm run icons && npm run build:server:win && electron-builder --win nsis portable --x64 --publish never",
+    "dist:mac": "npm run icons && npm run build:server:mac && electron-builder --mac dmg zip --x64 --arm64 --publish never",
     "release:win": "npm run dist:win && node scripts/run_python.js scripts/collect_release.py --platform win",
     "release:mac": "npm run dist:mac && node scripts/run_python.js scripts/collect_release.py --platform mac"
   },
