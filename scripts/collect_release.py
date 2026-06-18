@@ -30,6 +30,10 @@ def artifact_patterns(platform: str) -> list[str]:
     return ["*.dmg", "*.zip", "latest-mac.yml"]
 
 
+def release_name(source_name: str) -> str:
+    return source_name.replace(" ", ".")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Collect packaged artifacts into the repo release folder.")
     parser.add_argument("--platform", choices=("win", "mac"), required=True)
@@ -44,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     copied: list[Path] = []
     for pattern in artifact_patterns(args.platform):
         for source in sorted(OUTPUT_DIR.glob(pattern)):
-            target = dest / source.name
+            target = dest / release_name(source.name)
             shutil.copy2(source, target)
             copied.append(target)
 

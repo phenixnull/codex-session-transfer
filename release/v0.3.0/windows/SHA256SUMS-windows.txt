@@ -1,3 +1,2 @@
-35d82eae57f37d11fdf26395e69b6cd77fe7e719da1396fab98259bc255f6c76  Codex Session Transfer-0.3.0-Portable-x64.exe
-113a7e067f0ca33c80e2b76b936d1382f32df7ea8a72a96cd7e95dccb69cfb48  Codex Session Transfer-0.3.0-Setup-x64.exe
-f836d22dbbb120c0b7d50fed9dea6fe8b02a59744650b5bc84386940cc962cd0  latest.yml
+25f63500f001e0724b9a4ee8a8dde76d6f532a04fb33f94c80e16f2ca2f7f099  Codex.Session.Transfer-0.3.0-Portable-x64.exe
+0ac981ed59e74cdf6f5f3ed87d64268a08b98417c622d4c6a50429160ad49c50  Codex.Session.Transfer-0.3.0-Setup-x64.exe

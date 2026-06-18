@@ -1,0 +1,27 @@
+{
+  "version": "0.3.0",
+  "platform": "mac",
+  "built_at": "2026-06-18T05:02:23Z",
+  "artifacts": [
+    {
+      "file": "Codex.Session.Transfer-0.3.0-mac-arm64.dmg",
+      "sha256": "24efa284b53ad147ecaf53e39610efc9df735bb9d91216b90caff620817ad335",
+      "bytes": 119081598
+    },
+    {
+      "file": "Codex.Session.Transfer-0.3.0-mac-arm64.zip",
+      "sha256": "624e8c067b46f98a521f7d2dbe6a15f1837132e01f509fe4e0b5987114d85c15",
+      "bytes": 118952173
+    },
+    {
+      "file": "Codex.Session.Transfer-0.3.0-mac-x64.dmg",
+      "sha256": "16b543b821d1ebe1eadcee053d953bf1909ee947975d7e7e382fde6668a5c41a",
+      "bytes": 124595046
+    },
+    {
+      "file": "Codex.Session.Transfer-0.3.0-mac-x64.zip",
+      "sha256": "1f703cc9275ee64787936d360f5f58f8b8f785e58458b6abc164844965805522",
+      "bytes": 124514491
+    }
+  ]
+}
