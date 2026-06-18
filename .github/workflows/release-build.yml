@@ -79,9 +79,15 @@ jobs:
 
           for file in "${files[@]}"; do
             name="$(basename "$file")"
+            normalized_name="${name// /.}"
             if gh release view "$TAG_NAME" --json assets \
               --jq '.assets[].name' | grep -Fxq "$name"; then
               echo "Skipping existing release asset: $name"
+              continue
+            fi
+            if gh release view "$TAG_NAME" --json assets \
+              --jq '.assets[].name' | grep -Fxq "$normalized_name"; then
+              echo "Skipping existing release asset: $normalized_name"
               continue
             fi
             gh release upload "$TAG_NAME" "$file"
