@@ -2,10 +2,17 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from contextlib import closing
 from pathlib import Path
 
-from server import CodexSessionTransfer, CopyRequest
+from server import (
+    CodexSessionTransfer,
+    CopyRequest,
+    ExportPackageRequest,
+    SkillImportRequest,
+    SkillPackageRequest,
+)
 
 
 THREAD_COLUMNS = [
@@ -150,6 +157,7 @@ def insert_thread(
     preview: str = "preview",
     archived: bool = False,
     source: object = "cli",
+    cwd: Path | None = None,
 ) -> None:
     values = {
         "id": thread_id,
@@ -166,7 +174,7 @@ def insert_thread(
         "model_provider": provider,
         "model": "gpt-test",
         "reasoning_effort": None,
-        "cwd": str(db_path.parent.parent / "work"),
+        "cwd": str(cwd or db_path.parent.parent / "work"),
         "cli_version": "test",
         "title": title,
         "preview": preview,
@@ -219,6 +227,7 @@ class SessionTransferTests(unittest.TestCase):
         archived: bool = False,
         source: object = "cli",
         parent_thread_id: str | None = None,
+        cwd: Path | None = None,
     ) -> Path:
         rollout_path = write_rollout(
             self.codex_home,
@@ -237,6 +246,7 @@ class SessionTransferTests(unittest.TestCase):
             preview=preview,
             archived=archived,
             source=source,
+            cwd=cwd,
         )
         return rollout_path
 
@@ -253,6 +263,16 @@ class SessionTransferTests(unittest.TestCase):
                 )
                 + "\n"
             )
+
+    def write_skill(self, skill_id: str, *, description: str = "Test skill", body: str = "") -> Path:
+        skill_dir = self.codex_home / "skills" / skill_id
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {skill_id}\ndescription: {description}\n---\n\n# {skill_id}\n{body}\n",
+            encoding="utf-8",
+        )
+        (skill_dir / "notes.txt").write_text(f"{skill_id} notes\n", encoding="utf-8")
+        return skill_dir
 
     def test_lists_providers_and_thread_health_flags(self) -> None:
         existing_id = "11111111-1111-4111-8111-111111111111"
@@ -765,6 +785,202 @@ requires_openai_auth = true
         self.assertEqual(stats["by_provider"]["ProviderB"]["archived"], 1)
         self.assertEqual(len(stats["by_project"]), 1)
         self.assertEqual(stats["by_project"][0]["total"], 2)
+
+    def test_export_package_preserves_selected_sessions_grouped_by_project(self) -> None:
+        first_id = "11111111-1111-4111-8111-111111111111"
+        second_id = "22222222-2222-4222-8222-222222222222"
+        first_project = Path(self.temp.name) / "projectA"
+        second_project = Path(self.temp.name) / "projectB"
+        self.add_thread(first_id, title="First", cwd=first_project)
+        self.add_thread(second_id, title="Second", cwd=second_project)
+        self.write_session_index(first_id, "Renamed first")
+
+        result = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [first_id, second_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        package_path = Path(result["package_path"])
+        self.assertTrue(package_path.exists())
+        self.assertEqual(result["thread_count"], 2)
+        with zipfile.ZipFile(package_path) as package:
+            manifest = json.loads(package.read("manifest.json").decode("utf-8"))
+            names = set(package.namelist())
+
+        self.assertEqual(manifest["source_provider"], "ProviderA")
+        grouped = {
+            project["cwd"]: {thread["id"] for thread in project["threads"]}
+            for project in manifest["projects"]
+        }
+        self.assertEqual(grouped[str(first_project)], {first_id})
+        self.assertEqual(grouped[str(second_project)], {second_id})
+        self.assertIn("sqlite/state_5.sqlite", names)
+        self.assertIn("session_index.jsonl", names)
+        self.assertTrue(any(name.startswith("sessions/") and first_id in name for name in names))
+        self.assertTrue(any(name.startswith("sessions/") and second_id in name for name in names))
+
+    def test_imported_package_can_copy_into_target_machine_with_same_provider(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, provider="ProviderA", title="Portable")
+        self.write_session_index(source_id, "Portable renamed")
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+
+        target_codex_home = Path(self.temp.name) / "target" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        create_schema(target_sqlite_home / "state_5.sqlite")
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+
+        loaded = target.load_transfer_package(Path(export["package_path"]))
+        self.assertTrue(loaded["ok"], loaded)
+        providers = target.package_status()["providers"]
+        self.assertEqual([provider["model_provider"] for provider in providers], ["ProviderA"])
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest("ProviderA", "ProviderA", [source_id], False, True)
+        )
+        self.assertTrue(preview["can_execute"], preview)
+        result = target.copy_imported_package_threads(
+            CopyRequest("ProviderA", "ProviderA", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        target_id = result["items"][0]["target_id"]
+        self.assertNotEqual(target_id, source_id)
+        self.assertTrue(Path(result["items"][0]["dest_rollout_path"]).is_relative_to(target_codex_home))
+        with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
+            copied = conn.execute(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(copied[0], "ProviderA")
+        self.assertTrue(Path(copied[1]).exists())
+
+        index_entries = {}
+        for line in (target_codex_home / "session_index.jsonl").read_text(encoding="utf-8").splitlines():
+            item = json.loads(line)
+            index_entries[item["id"]] = item
+        self.assertEqual(index_entries[target_id]["thread_name"], "Portable renamed")
+
+    def test_uploaded_package_file_is_saved_and_loaded_as_source(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, provider="ProviderA", title="Portable")
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+
+        target_codex_home = Path(self.temp.name) / "uploaded-target" / ".codex"
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_codex_home / "sqlite",
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+
+        uploaded = target.load_uploaded_transfer_package(
+            "portable-session.zip",
+            Path(export["package_path"]).read_bytes(),
+        )
+
+        self.assertTrue(uploaded["ok"], uploaded)
+        self.assertTrue(uploaded["loaded"])
+        saved_path = Path(uploaded["package_path"])
+        self.assertTrue(saved_path.exists())
+        self.assertTrue(saved_path.is_relative_to(target_codex_home / "session-transfer" / "packages"))
+        providers = target.package_status()["providers"]
+        self.assertEqual([provider["model_provider"] for provider in providers], ["ProviderA"])
+
+    def test_export_skills_package_contains_only_selected_skills(self) -> None:
+        self.write_skill("alpha-skill", description="Alpha")
+        self.write_skill("beta-skill", description="Beta")
+
+        result = self.transfer.export_skills_package(
+            SkillPackageRequest(["alpha-skill"])
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["skill_count"], 1)
+        package_path = Path(result["package_path"])
+        self.assertTrue(package_path.exists())
+        with zipfile.ZipFile(package_path) as package:
+            manifest = json.loads(package.read("manifest.json").decode("utf-8"))
+            names = set(package.namelist())
+
+        self.assertEqual(manifest["format"], "codex-skill-transfer-package")
+        self.assertEqual([skill["id"] for skill in manifest["skills"]], ["alpha-skill"])
+        self.assertIn("skills/alpha-skill/SKILL.md", names)
+        self.assertIn("skills/alpha-skill/notes.txt", names)
+        self.assertFalse(any(name.startswith("skills/beta-skill/") for name in names))
+
+    def test_loaded_skills_package_imports_selected_skills_and_respects_overwrite(self) -> None:
+        self.write_skill("alpha-skill", description="Alpha")
+        self.write_skill("beta-skill", description="Beta")
+        export = self.transfer.export_skills_package(
+            SkillPackageRequest(["alpha-skill", "beta-skill"])
+        )
+
+        target_codex_home = Path(self.temp.name) / "target-skills" / ".codex"
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_codex_home / "sqlite",
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        existing = target_codex_home / "skills" / "alpha-skill"
+        existing.mkdir(parents=True, exist_ok=True)
+        (existing / "SKILL.md").write_text("existing alpha\n", encoding="utf-8")
+
+        loaded = target.load_skills_package(Path(export["package_path"]))
+        self.assertTrue(loaded["ok"], loaded)
+        package_skills = target.list_package_skills()
+        self.assertEqual({skill["id"] for skill in package_skills}, {"alpha-skill", "beta-skill"})
+        self.assertTrue(next(skill for skill in package_skills if skill["id"] == "alpha-skill")["installed"])
+
+        preview = target.preview_import_skills(SkillImportRequest(["alpha-skill", "beta-skill"], False))
+        self.assertFalse(preview["can_execute"])
+        self.assertIn("already exists", " ".join(preview["errors"]))
+
+        result = target.import_skills(SkillImportRequest(["beta-skill"], False))
+        self.assertTrue(result["ok"], result)
+        self.assertTrue((target_codex_home / "skills" / "beta-skill" / "SKILL.md").exists())
+        self.assertEqual((existing / "SKILL.md").read_text(encoding="utf-8"), "existing alpha\n")
+
+        overwrite = target.import_skills(SkillImportRequest(["alpha-skill"], True))
+        self.assertTrue(overwrite["ok"], overwrite)
+        self.assertIn("description: Alpha", (existing / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_uploaded_skills_package_file_is_saved_and_loaded_as_source(self) -> None:
+        self.write_skill("alpha-skill", description="Alpha")
+        export = self.transfer.export_skills_package(
+            SkillPackageRequest(["alpha-skill"])
+        )
+
+        target_codex_home = Path(self.temp.name) / "uploaded-skills-target" / ".codex"
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_codex_home / "sqlite",
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+
+        uploaded = target.load_uploaded_skills_package(
+            "portable-skills.zip",
+            Path(export["package_path"]).read_bytes(),
+        )
+
+        self.assertTrue(uploaded["ok"], uploaded)
+        self.assertTrue(uploaded["loaded"])
+        saved_path = Path(uploaded["package_path"])
+        self.assertTrue(saved_path.exists())
+        self.assertTrue(saved_path.is_relative_to(target_codex_home / "session-transfer" / "skill-packages"))
+        package_skills = target.list_package_skills()
+        self.assertEqual([skill["id"] for skill in package_skills], ["alpha-skill"])
 
 
 if __name__ == "__main__":

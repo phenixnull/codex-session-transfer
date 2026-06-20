@@ -3,9 +3,17 @@ const state = {
   sessionProviders: [],
   targetProviders: [],
   stats: null,
+  page: "sessions",
+  mode: "local",
+  packageSource: { loaded: false },
+  skillsStatus: { total: 0, package_source: { loaded: false } },
+  skillPackageSource: { loaded: false },
   sourceThreads: [],
   targetThreads: [],
+  sourceSkills: [],
+  targetSkills: [],
   selected: new Set(),
+  selectedSkills: new Set(),
   lastCopiedTargetIds: new Set(),
   activeSession: null,
   activeThreadDetail: null,
@@ -13,17 +21,59 @@ const state = {
   activeThreadLoadingMore: false,
   sessionRenderCollapsed: true,
   preview: null,
+  skillPreview: null,
   copyResult: "",
+  skillsResult: "",
 };
 
 const $ = (id) => document.getElementById(id);
 const CUSTOM_TARGET = "__custom__";
 const SESSION_RENDER_PAGE_SIZE = 80;
 
+function usingPackageSource() {
+  return state.mode === "package" && Boolean(state.packageSource?.loaded);
+}
+
+function usingSkillPackageSource() {
+  return state.page === "skills" && Boolean(state.skillPackageSource?.loaded);
+}
+
+function currentSourceOrigin() {
+  return usingPackageSource() ? "package" : "local";
+}
+
+function currentSourceProviders() {
+  return usingPackageSource() ? state.packageSource.providers || [] : state.sessionProviders;
+}
+
+function currentSourceStats() {
+  return usingPackageSource() ? state.packageSource.session_stats || {} : state.stats;
+}
+
+function sourceThreadsEndpoint() {
+  return usingPackageSource() ? "/api/package-threads" : "/api/threads";
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error((data.errors || [response.statusText]).join("; "));
+  }
+  return data;
+}
+
+async function uploadPackageFile(path, file) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/zip",
+      "X-Package-Filename": encodeURIComponent(file.name),
+    },
+    body: file,
   });
   const data = await response.json();
   if (!response.ok) {
@@ -53,7 +103,11 @@ async function loadAll() {
   await loadStatus();
   ensureProviderSelection();
   renderAllShell();
-  await loadThreadLists();
+  if (state.page === "skills") {
+    await loadSkillLists();
+  } else {
+    await loadThreadLists();
+  }
 }
 
 async function loadStatus() {
@@ -61,21 +115,31 @@ async function loadStatus() {
   state.sessionProviders = state.status.providers || [];
   state.targetProviders = state.status.target_providers || [];
   state.stats = state.status.session_stats || null;
+  state.packageSource = state.status.package_source || { loaded: false };
+  state.skillsStatus = state.status.skills || { total: 0, package_source: { loaded: false } };
+  state.skillPackageSource = state.skillsStatus.package_source || { loaded: false };
 }
 
-function threadQueryParams(provider) {
-  return new URLSearchParams({
+function threadQueryParams(provider, options = {}) {
+  const params = new URLSearchParams({
     source_provider: provider || "",
     include_archived: $("includeArchived").checked ? "true" : "false",
     search: $("searchInput").value.trim(),
-    source: $("sourceFilter").value,
-    cwd: $("projectFilter").value,
   });
+  const omitSourceFilters = options.target && usingPackageSource();
+  params.set("source", omitSourceFilters ? "" : $("sourceFilter").value);
+  params.set("cwd", omitSourceFilters ? "" : $("projectFilter").value);
+  return params;
 }
 
 async function loadThreadLists(options = {}) {
   await loadSourceThreads(options);
   await loadTargetThreads();
+}
+
+async function loadSkillLists(options = {}) {
+  await loadSourceSkills(options);
+  await loadTargetSkills();
 }
 
 async function loadSourceThreads(options = {}) {
@@ -86,12 +150,7 @@ async function loadSourceThreads(options = {}) {
     source: $("sourceFilter").value,
     cwd: $("projectFilter").value,
   });
-  state.sourceThreads = await api(`/api/threads?${params.toString()}`);
-  for (const id of Array.from(state.selected)) {
-    if (!state.sourceThreads.some((thread) => thread.id === id)) {
-      state.selected.delete(id);
-    }
-  }
+  state.sourceThreads = await api(`${sourceThreadsEndpoint()}?${params.toString()}`);
   renderSourceFilter();
   renderSourceThreads();
   reconcileActiveSession();
@@ -103,10 +162,28 @@ async function loadTargetThreads() {
   if (!target) {
     state.targetThreads = [];
   } else {
-    state.targetThreads = await api(`/api/threads?${threadQueryParams(target).toString()}`);
+    state.targetThreads = await api(`/api/threads?${threadQueryParams(target, { target: true }).toString()}`);
   }
   renderTargetThreads();
   reconcileActiveSession();
+}
+
+async function loadSourceSkills(options = {}) {
+  const params = new URLSearchParams({
+    search: $("skillsSearchInput").value.trim(),
+  });
+  const endpoint = usingSkillPackageSource() ? "/api/package-skills" : "/api/skills";
+  state.sourceSkills = await api(`${endpoint}?${params.toString()}`);
+  renderSourceSkills();
+  invalidateSkillPreview({ clearResult: !options.preserveResult });
+}
+
+async function loadTargetSkills() {
+  const params = new URLSearchParams({
+    search: $("skillsSearchInput").value.trim(),
+  });
+  state.targetSkills = await api(`/api/skills?${params.toString()}`);
+  renderTargetSkills();
 }
 
 function ensureProviderSelection() {
@@ -115,18 +192,20 @@ function ensureProviderSelection() {
   if (sourceProvider) sourceSelect.value = sourceProvider;
 
   const targetSelect = $("targetProviderSelect");
-  const targetProvider = preferredTargetProvider(targetSelect.value, sourceProvider || sourceSelect.value);
+  const targetSourceValue = usingPackageSource() ? "" : sourceProvider || sourceSelect.value;
+  const targetProvider = preferredTargetProvider(targetSelect.value, targetSourceValue);
   if (targetProvider) targetSelect.value = targetProvider;
 }
 
 function preferredSourceProvider(currentValue) {
-  const current = state.sessionProviders.find((provider) => provider.model_provider === currentValue);
+  const providers = currentSourceProviders();
+  const current = providers.find((provider) => provider.model_provider === currentValue);
   if (current && current.active > 0) return current.model_provider;
 
-  const activeProvider = state.sessionProviders.find((provider) => provider.active > 0);
+  const activeProvider = providers.find((provider) => provider.active > 0);
   if (activeProvider) return activeProvider.model_provider;
 
-  return current?.model_provider || state.sessionProviders[0]?.model_provider || "";
+  return current?.model_provider || providers[0]?.model_provider || "";
 }
 
 function preferredTargetProvider(currentValue, sourceValue) {
@@ -144,12 +223,138 @@ function preferredTargetProvider(currentValue, sourceValue) {
 }
 
 function renderAllShell() {
+  renderPageChrome();
+  renderModeChrome();
   renderStatus();
   renderStats();
   renderProviders();
   renderTargetProviders();
   renderLiveTargetPanel();
   renderProjectFilter();
+  renderPackagePanel();
+  renderSkillsPackagePanel();
+}
+
+function renderPageChrome() {
+  const skillsPage = state.page === "skills";
+  const sessionButton = $("sessionPageButton");
+  const skillsButton = $("skillsPageButton");
+  if (sessionButton) {
+    sessionButton.classList.toggle("active", !skillsPage);
+    sessionButton.setAttribute("aria-selected", String(!skillsPage));
+  }
+  if (skillsButton) {
+    skillsButton.classList.toggle("active", skillsPage);
+    skillsButton.setAttribute("aria-selected", String(skillsPage));
+  }
+  for (const id of ["sessionControlPanel", "sessionTransferGrid", "sessionRail", "rightRail", "sessionRailGutter", "rightRailGutter"]) {
+    const node = $(id);
+    if (node) node.hidden = skillsPage;
+  }
+  const skillsWorkbench = $("skillsWorkbench");
+  if (skillsWorkbench) skillsWorkbench.hidden = !skillsPage;
+}
+
+function renderModeChrome() {
+  const localButton = $("localModeButton");
+  const packageButton = $("packageModeButton");
+  const isPackageMode = state.mode === "package";
+  if (localButton) {
+    localButton.classList.toggle("active", !isPackageMode);
+    localButton.setAttribute("aria-selected", String(!isPackageMode));
+  }
+  if (packageButton) {
+    packageButton.classList.toggle("active", isPackageMode);
+    packageButton.setAttribute("aria-selected", String(isPackageMode));
+  }
+  const panel = $("packagePanel");
+  if (panel) panel.hidden = !isPackageMode;
+  const title = $("workbenchTitle");
+  if (title) title.textContent = usingPackageSource() ? "Package Source Sessions" : "Source Sessions";
+  const kind = $("sourceSetupKind");
+  if (kind) kind.textContent = usingPackageSource() ? "Package" : "Provider";
+  const label = $("sourceProviderLabel");
+  if (label) label.textContent = usingPackageSource() ? "Package source provider" : "Source session provider";
+}
+
+function renderPackagePanel() {
+  const line = $("packageStatusLine");
+  if (!line) return;
+  line.replaceChildren();
+  const loaded = Boolean(state.packageSource?.loaded);
+  const exportButton = $("exportPackageButton");
+  const loadButton = $("loadPackageButton");
+  const unloadButton = $("unloadPackageButton");
+  const pathInput = $("packagePathInput");
+  if (exportButton) {
+    exportButton.disabled = state.mode !== "package" || loaded || state.selected.size === 0;
+    exportButton.title = loaded
+      ? "Unload the package source before exporting from local sessions."
+      : state.selected.size
+        ? "Export the selected local source sessions into a transfer package."
+        : "Select one or more local source sessions to export.";
+  }
+  if (loadButton) {
+    loadButton.disabled = state.mode !== "package";
+  }
+  if (unloadButton) unloadButton.disabled = !loaded;
+
+  if (!loaded) {
+    line.append(message("info", "Local source selected for package export."));
+    return;
+  }
+
+  const manifest = state.packageSource.manifest || {};
+  const packagePath = state.packageSource.package_path || "";
+  const projectCount = manifest.projects?.length ?? 0;
+  const threadCount = manifest.thread_count ?? 0;
+  line.append(
+    statusPill("Package", packagePath ? shortPath(packagePath) : "Loaded", true),
+    statusPill("Contents", `${threadCount} sessions / ${projectCount} projects`, true),
+  );
+}
+
+function renderSkillsPackagePanel() {
+  const line = $("skillsPackageStatusLine");
+  if (!line) return;
+  line.replaceChildren();
+  const loaded = Boolean(state.skillPackageSource?.loaded);
+  const exportButton = $("exportSkillsPackageButton");
+  const loadButton = $("loadSkillsPackageButton");
+  const unloadButton = $("unloadSkillsPackageButton");
+  const previewButton = $("previewSkillsButton");
+  const importButton = $("importSkillsButton");
+  const pathInput = $("skillsPackagePathInput");
+  if (exportButton) {
+    exportButton.disabled = state.page !== "skills" || loaded || state.selectedSkills.size === 0;
+    exportButton.title = loaded
+      ? "Unload the skills package source before exporting local skills."
+      : state.selectedSkills.size
+        ? "Export the selected local skills into a transfer package."
+        : "Select one or more local skills to export.";
+  }
+  if (loadButton) loadButton.disabled = state.page !== "skills";
+  if (unloadButton) unloadButton.disabled = !loaded;
+  if (previewButton) previewButton.disabled = !loaded || state.selectedSkills.size === 0;
+  if (importButton) {
+    importButton.disabled = !loaded || !state.skillPreview?.can_execute;
+  }
+
+  const title = $("skillsWorkbenchTitle");
+  if (title) title.textContent = loaded ? "Skills Package Import" : "Skills Package Export";
+  const sourceTitle = $("skillsSourceTitle");
+  if (sourceTitle) sourceTitle.textContent = loaded ? "Package skills" : "Local skills";
+
+  if (!loaded) {
+    line.append(message("info", "Local skills selected here can be exported into a portable package."));
+    return;
+  }
+
+  const manifest = state.skillPackageSource.manifest || {};
+  line.append(
+    statusPill("Skills package", state.skillPackageSource.package_path ? shortPath(state.skillPackageSource.package_path) : "Loaded", true),
+    statusPill("Contents", `${manifest.skill_count ?? state.skillPackageSource.total ?? 0} skills`, true),
+  );
 }
 
 function renderStatus() {
@@ -168,6 +373,9 @@ function renderStatus() {
     statusPill("Processes", blocking.length ? `${blocking.length} blocking` : "Clear", blocking.length === 0),
     statusPill("WAL", `${(state.status.wal_files || []).length}`, true),
     statusPill("Session index", `${state.status.session_index?.entries ?? 0}`, Boolean(state.status.session_index?.exists)),
+    statusPill("Package", state.packageSource?.loaded ? "Loaded" : "None", true),
+    statusPill("Skills", `${state.skillsStatus?.total ?? 0}`, true),
+    statusPill("Skill package", state.skillPackageSource?.loaded ? "Loaded" : "None", true),
     statusPill("Current provider", current.model_provider || "Unknown", Boolean(current.model_provider)),
     statusPill("Current model", current.model || "(not set)", true),
   );
@@ -215,6 +423,7 @@ function renderStats() {
     statTile("Active", totals.active),
     statTile("Archived", totals.archived),
     statTile("Projects", totals.projects),
+    statTile("Skills", state.skillsStatus?.total ?? 0),
     statTile("Missing rollout", totals.missing_rollouts),
     statTile("Empty preview", totals.hidden_empty_preview),
   );
@@ -232,22 +441,40 @@ function statTile(label, value) {
 }
 
 function renderProviders() {
+  renderSourceProviders();
+  renderProviderGrid();
+}
+
+function renderSourceProviders() {
   const select = $("sourceProvider");
   const current = select.value;
   select.replaceChildren();
+  const providers = currentSourceProviders();
+
+  if (!providers.length) {
+    select.append(new Option(usingPackageSource() ? "No package providers" : "No providers", ""));
+  }
+
+  for (const provider of providers) {
+    const option = document.createElement("option");
+    option.value = provider.model_provider;
+    option.textContent = `${provider.model_provider} (${provider.total})`;
+    option.title = providerTooltip(provider, currentSourceStats());
+    select.append(option);
+  }
+
+  const preferred = preferredSourceProvider(current);
+  if (preferred) select.value = preferred;
+}
+
+function renderProviderGrid() {
   const grid = $("providerGrid");
   grid.replaceChildren();
 
   for (const provider of state.sessionProviders) {
-    const option = document.createElement("option");
-    option.value = provider.model_provider;
-    option.textContent = `${provider.model_provider} (${provider.total})`;
-    option.title = providerTooltip(provider);
-    select.append(option);
-
     const card = document.createElement("div");
     card.className = "provider-tile";
-    card.title = providerTooltip(provider);
+    card.title = providerTooltip(provider, state.stats);
     const providerStats = state.stats?.by_provider?.[provider.model_provider];
     card.innerHTML = `
       <strong>${escapeHtml(provider.model_provider)}</strong>
@@ -257,17 +484,15 @@ function renderProviders() {
     `;
     grid.append(card);
   }
-  const preferred = preferredSourceProvider(current);
-  if (preferred) select.value = preferred;
 }
 
-function providerTooltip(provider) {
+function providerTooltip(provider, stats = state.stats) {
   const details = [];
   if (provider.model_provider) details.push(`Provider: ${provider.model_provider}`);
   details.push(`Active: ${provider.active ?? 0}`);
   details.push(`Archived: ${provider.archived ?? 0}`);
   details.push(`Total: ${provider.total ?? 0}`);
-  const providerStats = state.stats?.by_provider?.[provider.model_provider];
+  const providerStats = stats?.by_provider?.[provider.model_provider];
   if (providerStats) details.push(`Projects: ${providerStats.projects ?? 0}`);
   return details.join(" | ");
 }
@@ -283,7 +508,7 @@ function renderTargetProviders() {
     select.append(option);
   }
   select.append(new Option("Custom provider id...", CUSTOM_TARGET));
-  const preferred = preferredTargetProvider(current, $("sourceProvider").value);
+  const preferred = preferredTargetProvider(current, usingPackageSource() ? "" : $("sourceProvider").value);
   if (preferred) {
     select.value = preferred;
   }
@@ -360,7 +585,7 @@ function renderProjectFilter() {
   const select = $("projectFilter");
   const current = select.value;
   select.replaceChildren(new Option("All projects", ""));
-  for (const project of state.stats?.by_project || []) {
+  for (const project of currentSourceStats()?.by_project || []) {
     const label = `${project.label} (${project.total})`;
     const option = new Option(label, project.cwd);
     option.title = project.normalized_cwd || project.cwd;
@@ -422,6 +647,83 @@ function renderTargetThreads() {
   renderListCount("targetListCount", state.targetThreads.length);
 }
 
+function renderSourceSkills() {
+  const body = $("skillsSourceBody");
+  if (!body) return;
+  body.replaceChildren();
+  for (const skill of state.sourceSkills) {
+    const row = skillRow(skill, { source: true });
+    const selectCell = document.createElement("td");
+    selectCell.className = "select-cell";
+    selectCell.dataset.label = "Select";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedSkills.has(skill.id);
+    checkbox.addEventListener("click", (event) => event.stopPropagation());
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.selectedSkills.add(skill.id);
+      else state.selectedSkills.delete(skill.id);
+      renderSkillSelectionState();
+      invalidateSkillPreview();
+    });
+    selectCell.append(checkbox);
+    row.prepend(selectCell);
+    body.append(row);
+  }
+  renderSkillSelectionState();
+  renderListCount("skillsSourceCount", state.sourceSkills.length);
+}
+
+function renderTargetSkills() {
+  const body = $("skillsTargetBody");
+  if (!body) return;
+  body.replaceChildren();
+  for (const skill of state.targetSkills) {
+    body.append(skillRow(skill, { target: true }));
+  }
+  renderListCount("skillsTargetCount", state.targetSkills.length);
+}
+
+function skillRow(skill, options = {}) {
+  const row = document.createElement("tr");
+  const skillCell = document.createElement("td");
+  skillCell.className = "session-cell";
+  skillCell.dataset.label = "Skill";
+  const title = document.createElement("strong");
+  title.className = "session-title";
+  title.textContent = skill.name || skill.id;
+  title.title = skill.id;
+  const path = document.createElement("p");
+  path.textContent = skill.id;
+  path.title = skill.path || skill.id;
+  skillCell.append(title, path);
+
+  row.append(
+    skillCell,
+    textCell(skill.description || "", { className: "origin-cell", title: skill.description || "", label: "Description" }),
+    textCell(String(skill.file_count || 0), { className: "count-cell", title: `${skill.file_count || 0} files`, label: "Files" }),
+    skillStateCell(skill, options),
+  );
+  return row;
+}
+
+function skillStateCell(skill, options = {}) {
+  const cell = document.createElement("td");
+  cell.className = "state-cell";
+  cell.dataset.label = "State";
+  const flags = [];
+  if (skill.installed) flags.push("Installed");
+  if (usingSkillPackageSource() && options.source && !skill.installed) flags.push("New");
+  if (!flags.length) flags.push(options.target ? "Local" : "Ready");
+  for (const flag of flags) {
+    const badge = document.createElement("span");
+    badge.className = flag === "Installed" || flag === "Ready" || flag === "Local" ? "badge ok" : "badge";
+    badge.textContent = flag;
+    cell.append(badge);
+  }
+  return cell;
+}
+
 function threadRow(thread, options = {}) {
   const row = document.createElement("tr");
   if (!thread.rollout_exists) row.classList.add("warn-row");
@@ -478,7 +780,8 @@ function threadRow(thread, options = {}) {
 
 async function selectThreadForRender(thread, side) {
   const sameThread = state.activeSession?.id === thread.id;
-  state.activeSession = { id: thread.id, side, thread };
+  const origin = side === "source" ? currentSourceOrigin() : "local";
+  state.activeSession = { id: thread.id, side, thread, origin };
   if (!sameThread) state.activeThreadDetail = null;
   state.activeThreadLoading = false;
   state.activeThreadLoadingMore = false;
@@ -497,8 +800,9 @@ async function loadThreadDetailPage({ append = false } = {}) {
   else state.activeThreadLoading = true;
   renderSessionDetail();
   try {
+    const endpoint = state.activeSession.origin === "package" ? "/api/package-thread-detail" : "/api/thread-detail";
     const detail = await api(
-      `/api/thread-detail?id=${encodeURIComponent(activeId)}&offset=${offset}&limit=${SESSION_RENDER_PAGE_SIZE}`
+      `${endpoint}?id=${encodeURIComponent(activeId)}&offset=${offset}&limit=${SESSION_RENDER_PAGE_SIZE}`
     );
     if (!state.activeSession || state.activeSession.id !== activeId) return;
     if (append && state.activeThreadDetail) {
@@ -805,10 +1109,20 @@ function renderSelectionState() {
   $("selectAll").checked =
     state.sourceThreads.length > 0 && state.sourceThreads.every((thread) => state.selected.has(thread.id));
   updateCopyButton();
+  renderPackagePanel();
+}
+
+function renderSkillSelectionState() {
+  $("skillsSelectedCount").textContent = `${state.selectedSkills.size} selected`;
+  $("skillsSelectAll").checked =
+    state.sourceSkills.length > 0 && state.sourceSkills.every((skill) => state.selectedSkills.has(skill.id));
+  updateSkillsButtons();
+  renderSkillsPackagePanel();
 }
 
 async function previewCopy() {
-  const plan = await api("/api/preview-copy", {
+  const endpoint = usingPackageSource() ? "/api/preview-package-copy" : "/api/preview-copy";
+  const plan = await api(endpoint, {
     method: "POST",
     body: JSON.stringify(copyRequest()),
   });
@@ -816,7 +1130,7 @@ async function previewCopy() {
   renderPreview(plan);
   setCopyResult(
     plan.can_execute
-      ? `Preview ready: ${plan.items.length} session(s) can be copied.`
+      ? `Preview ready: ${plan.items.length} session(s) can be ${usingPackageSource() ? "imported" : "copied"}.`
       : "Preview is not executable. Fix the messages above.",
     plan.can_execute ? "info" : "error",
   );
@@ -876,19 +1190,21 @@ async function executeCopy() {
   const count = state.preview ? state.preview.items.length : 0;
   if (!count) return;
   const target = targetProviderValue();
-  const confirmed = window.confirm(`Copy ${count} session(s) to ${target}?`);
+  const action = usingPackageSource() ? "Import" : "Copy";
+  const confirmed = window.confirm(`${action} ${count} session(s) to ${target}?`);
   if (!confirmed) return;
   $("copyButton").disabled = true;
-  setCopyResult("Copying...", "info");
-  const result = await api("/api/copy", {
+  setCopyResult(`${action}ing...`, "info");
+  const endpoint = usingPackageSource() ? "/api/copy-package" : "/api/copy";
+  const result = await api(endpoint, {
     method: "POST",
     body: JSON.stringify(copyRequest()),
   });
   state.preview = result;
   renderPreview(result);
   const resultText = result.ok
-    ? `Copied ${result.items?.length || 0} session(s). Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
-    : `Not copied. ${(result.errors || []).join("; ")}`;
+    ? `${usingPackageSource() ? "Imported" : "Copied"} ${result.items?.length || 0} session(s). Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
+    : `Not ${usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
   await loadStatus();
   renderAllShell();
   state.lastCopiedTargetIds = new Set((result.items || []).map((item) => item.target_id));
@@ -955,6 +1271,307 @@ async function repairSessionIndexNames() {
   );
 }
 
+async function exportPackage() {
+  if (usingPackageSource()) return;
+  const count = state.selected.size;
+  if (!count) return;
+  const confirmed = window.confirm(`Export ${count} selected session(s) into a transfer package?`);
+  if (!confirmed) return;
+
+  const button = $("exportPackageButton");
+  button.disabled = true;
+  setCopyResult("Exporting package...", "info");
+  const result = await api("/api/export-package", {
+    method: "POST",
+    body: JSON.stringify({
+      source_provider: $("sourceProvider").value,
+      thread_ids: Array.from(state.selected),
+      include_descendants: $("includeDescendants").checked,
+      include_archived: $("includeArchived").checked,
+    }),
+  });
+  if (result.ok && result.package_path) {
+    $("packagePathInput").value = result.package_path;
+  }
+  renderPackagePanel();
+  setCopyResult(
+    result.ok
+      ? `Exported ${result.thread_count || 0} session(s) from ${result.project_count || 0} project(s). Package: ${result.package_path}`
+      : `Export failed. ${(result.errors || []).join("; ")}`,
+    result.ok ? "success" : "error",
+  );
+}
+
+function chooseSessionPackageFile() {
+  const input = $("packageFileInput");
+  input.value = "";
+  input.click();
+}
+
+async function loadPackageFromPath() {
+  const path = $("packagePathInput").value.trim();
+  if (!path) {
+    $("packagePathInput").focus();
+    setCopyResult("Choose a session package zip, or paste a package path and press Enter.", "error");
+    return;
+  }
+  setCopyResult("Loading package...", "info");
+  const result = await api("/api/load-package", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  if (!result.loaded) {
+    setCopyResult(`Package not loaded. ${(result.errors || []).join("; ")}`, "error");
+    return;
+  }
+  state.packageSource = result;
+  state.selected.clear();
+  state.lastCopiedTargetIds.clear();
+  state.activeSession = null;
+  state.activeThreadDetail = null;
+  ensureProviderSelection();
+  renderAllShell();
+  await loadThreadLists();
+  setCopyResult(`Loaded package source: ${result.package_path}`, "success");
+}
+
+async function loadPackageFromFile(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".zip")) {
+    setCopyResult("Choose a .zip session package file.", "error");
+    return;
+  }
+  $("packagePathInput").value = file.name;
+  setCopyResult(`Loading selected package: ${file.name}`, "info");
+  const result = await uploadPackageFile("/api/upload-package", file);
+  if (!result.loaded) {
+    setCopyResult(`Package not loaded. ${(result.errors || []).join("; ")}`, "error");
+    return;
+  }
+  $("packagePathInput").value = result.package_path || file.name;
+  state.packageSource = result;
+  state.selected.clear();
+  state.lastCopiedTargetIds.clear();
+  state.activeSession = null;
+  state.activeThreadDetail = null;
+  ensureProviderSelection();
+  renderAllShell();
+  await loadThreadLists();
+  setCopyResult(`Loaded package source: ${result.package_path}`, "success");
+}
+
+async function unloadPackage() {
+  const result = await api("/api/unload-package", { method: "POST", body: "{}" });
+  state.packageSource = result;
+  state.selected.clear();
+  state.activeSession = null;
+  state.activeThreadDetail = null;
+  ensureProviderSelection();
+  renderAllShell();
+  await loadThreadLists();
+  setCopyResult("Package source unloaded.", "info");
+}
+
+function skillImportRequest() {
+  return {
+    skill_ids: Array.from(state.selectedSkills),
+    overwrite: $("overwriteSkills").checked,
+  };
+}
+
+async function exportSkillsPackage() {
+  if (usingSkillPackageSource()) return;
+  const count = state.selectedSkills.size;
+  if (!count) return;
+  const confirmed = window.confirm(`Export ${count} selected skill(s) into a transfer package?`);
+  if (!confirmed) return;
+  setSkillsResult("Exporting skills package...", "info");
+  const result = await api("/api/export-skills-package", {
+    method: "POST",
+    body: JSON.stringify({ skill_ids: Array.from(state.selectedSkills) }),
+  });
+  if (result.ok && result.package_path) {
+    $("skillsPackagePathInput").value = result.package_path;
+  }
+  renderSkillsPackagePanel();
+  setSkillsResult(
+    result.ok
+      ? `Exported ${result.skill_count || 0} skill(s). Package: ${result.package_path}`
+      : `Export failed. ${(result.errors || []).join("; ")}`,
+    result.ok ? "success" : "error",
+  );
+}
+
+function chooseSkillsPackageFile() {
+  const input = $("skillsPackageFileInput");
+  input.value = "";
+  input.click();
+}
+
+async function loadSkillsPackageFromPath() {
+  const path = $("skillsPackagePathInput").value.trim();
+  if (!path) {
+    $("skillsPackagePathInput").focus();
+    setSkillsResult("Choose a skills package zip, or paste a package path and press Enter.", "error");
+    return;
+  }
+  setSkillsResult("Loading skills package...", "info");
+  const result = await api("/api/load-skills-package", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  if (!result.loaded) {
+    setSkillsResult(`Skills package not loaded. ${(result.errors || []).join("; ")}`, "error");
+    return;
+  }
+  state.skillPackageSource = result;
+  state.selectedSkills.clear();
+  state.skillPreview = null;
+  renderAllShell();
+  await loadSkillLists();
+  setSkillsResult(`Loaded skills package: ${result.package_path}`, "success");
+}
+
+async function loadSkillsPackageFromFile(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".zip")) {
+    setSkillsResult("Choose a .zip skills package file.", "error");
+    return;
+  }
+  $("skillsPackagePathInput").value = file.name;
+  setSkillsResult(`Loading selected skills package: ${file.name}`, "info");
+  const result = await uploadPackageFile("/api/upload-skills-package", file);
+  if (!result.loaded) {
+    setSkillsResult(`Skills package not loaded. ${(result.errors || []).join("; ")}`, "error");
+    return;
+  }
+  $("skillsPackagePathInput").value = result.package_path || file.name;
+  state.skillPackageSource = result;
+  state.selectedSkills.clear();
+  state.skillPreview = null;
+  renderAllShell();
+  await loadSkillLists();
+  setSkillsResult(`Loaded skills package: ${result.package_path}`, "success");
+}
+
+async function unloadSkillsPackage() {
+  const result = await api("/api/unload-skills-package", { method: "POST", body: "{}" });
+  state.skillPackageSource = result;
+  state.selectedSkills.clear();
+  state.skillPreview = null;
+  renderAllShell();
+  await loadSkillLists();
+  setSkillsResult("Skills package unloaded.", "info");
+}
+
+async function previewSkillsImport() {
+  const plan = await api("/api/preview-skill-import", {
+    method: "POST",
+    body: JSON.stringify(skillImportRequest()),
+  });
+  state.skillPreview = plan;
+  renderSkillsPreview(plan);
+  setSkillsResult(
+    plan.can_execute
+      ? `Preview ready: ${plan.items.length} skill(s) can be imported.`
+      : "Skills import preview is not executable.",
+    plan.can_execute ? "info" : "error",
+  );
+}
+
+async function importSkills() {
+  if (!state.skillPreview?.can_execute) return;
+  const count = state.skillPreview.items?.length || 0;
+  const confirmed = window.confirm(`Import ${count} skill(s) into this machine?`);
+  if (!confirmed) return;
+  setSkillsResult("Importing skills...", "info");
+  const result = await api("/api/import-skills", {
+    method: "POST",
+    body: JSON.stringify(skillImportRequest()),
+  });
+  state.skillPreview = result;
+  renderSkillsPreview(result);
+  await loadStatus();
+  renderAllShell();
+  await loadSkillLists({ preserveResult: true });
+  setSkillsResult(
+    result.ok
+      ? `Imported ${result.imported_count || 0} skill(s).`
+      : `Skills not imported. ${(result.errors || []).join("; ")}`,
+    result.ok ? "success" : "error",
+  );
+}
+
+function renderSkillsPreview(plan) {
+  const items = $("skillsPreviewItems");
+  if (!items) return;
+  items.replaceChildren();
+  if (!plan) {
+    updateSkillsButtons();
+    return;
+  }
+  for (const error of plan.errors || []) {
+    items.append(message("error", error));
+  }
+  for (const warning of plan.warnings || []) {
+    items.append(message("warn", warning));
+  }
+  for (const item of plan.items || []) {
+    const node = document.createElement("div");
+    node.className = "preview-item";
+    node.innerHTML = `
+      <strong>${escapeHtml(item.name || item.id)}</strong>
+      <span>${escapeHtml(item.action || "import")} / ${escapeHtml(item.installed ? "installed" : "new")}</span>
+      <code>${escapeHtml(item.id)}</code>
+    `;
+    items.append(node);
+  }
+  updateSkillsButtons();
+}
+
+function invalidateSkillPreview({ clearResult = true } = {}) {
+  state.skillPreview = null;
+  renderSkillsPreview(null);
+  if (clearResult) setSkillsResult("");
+}
+
+function setSkillsResult(text, kind = "") {
+  state.skillsResult = text;
+  const node = $("skillsResult");
+  if (!node) return;
+  node.textContent = text;
+  node.className = `result${kind ? ` ${kind}` : ""}`;
+}
+
+function updateSkillsButtons() {
+  const reasons = skillDisabledReasons();
+  const importButton = $("importSkillsButton");
+  if (importButton) {
+    importButton.disabled = reasons.length > 0;
+    importButton.title = reasons.join(" ");
+  }
+  const reasonNode = $("skillsDisabledReason");
+  if (reasonNode) reasonNode.textContent = reasons.length ? reasons.join(" ") : "Ready to import skills.";
+}
+
+function skillDisabledReasons() {
+  const reasons = [];
+  if (!usingSkillPackageSource()) {
+    reasons.push("Load a skills package before importing.");
+  }
+  if (state.selectedSkills.size === 0) {
+    reasons.push("Select at least one skill.");
+  }
+  if (!state.skillPreview) {
+    reasons.push("Run Preview import first.");
+  } else if (state.skillPreview.errors?.length) {
+    reasons.push(`Preview has errors: ${state.skillPreview.errors[0]}`);
+  } else if (!state.skillPreview.can_execute) {
+    reasons.push("Preview plan is not executable.");
+  }
+  return reasons;
+}
+
 function updateCopyButton() {
   const blocked = (state.status && state.status.blocking_processes || []).length > 0;
   const reasons = copyDisabledReasons(blocked);
@@ -977,7 +1594,7 @@ function copyDisabledReasons(blocked) {
   if (!target) {
     reasons.push("Choose a target provider.");
   }
-  if (source && target && source === target) {
+  if (!usingPackageSource() && source && target && source === target) {
     reasons.push("Source and target must be different.");
   }
   if (!state.preview) {
@@ -1000,6 +1617,30 @@ function updateCustomTargetVisibility() {
   if (!isCustom) custom.value = "";
 }
 
+function setMode(mode) {
+  if (state.mode === mode) return;
+  state.mode = mode;
+  state.selected.clear();
+  state.lastCopiedTargetIds.clear();
+  state.activeSession = null;
+  state.activeThreadDetail = null;
+  invalidatePreview();
+  ensureProviderSelection();
+  renderAllShell();
+  loadThreadLists().catch((error) => setCopyResult(error.message, "error"));
+}
+
+function setPage(page) {
+  if (state.page === page) return;
+  state.page = page;
+  renderAllShell();
+  if (page === "skills") {
+    loadSkillLists().catch((error) => setSkillsResult(error.message, "error"));
+  } else {
+    loadThreadLists().catch((error) => setCopyResult(error.message, "error"));
+  }
+}
+
 function shortPath(value) {
   if (!value) return "";
   const parts = value.split(/[\\/]/);
@@ -1018,6 +1659,57 @@ function escapeHtml(value) {
 
 function bindEvents() {
   $("refreshButton").addEventListener("click", loadAll);
+  $("sessionPageButton").addEventListener("click", () => setPage("sessions"));
+  $("skillsPageButton").addEventListener("click", () => setPage("skills"));
+  $("localModeButton").addEventListener("click", () => setMode("local"));
+  $("packageModeButton").addEventListener("click", () => setMode("package"));
+  $("exportPackageButton").addEventListener("click", () => {
+    exportPackage().catch((error) => {
+      setCopyResult(error.message, "error");
+      renderPackagePanel();
+    });
+  });
+  $("loadPackageButton").addEventListener("click", chooseSessionPackageFile);
+  $("packageFileInput").addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    loadPackageFromFile(file).catch((error) => setCopyResult(error.message, "error"));
+  });
+  $("unloadPackageButton").addEventListener("click", () => {
+    unloadPackage().catch((error) => setCopyResult(error.message, "error"));
+  });
+  $("packagePathInput").addEventListener("input", renderPackagePanel);
+  $("packagePathInput").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      loadPackageFromPath().catch((error) => setCopyResult(error.message, "error"));
+    }
+  });
+  $("exportSkillsPackageButton").addEventListener("click", () => {
+    exportSkillsPackage().catch((error) => setSkillsResult(error.message, "error"));
+  });
+  $("loadSkillsPackageButton").addEventListener("click", chooseSkillsPackageFile);
+  $("skillsPackageFileInput").addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    loadSkillsPackageFromFile(file).catch((error) => setSkillsResult(error.message, "error"));
+  });
+  $("unloadSkillsPackageButton").addEventListener("click", () => {
+    unloadSkillsPackage().catch((error) => setSkillsResult(error.message, "error"));
+  });
+  $("skillsPackagePathInput").addEventListener("input", renderSkillsPackagePanel);
+  $("skillsPackagePathInput").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      loadSkillsPackageFromPath().catch((error) => setSkillsResult(error.message, "error"));
+    }
+  });
+  $("skillsSearchInput").addEventListener("input", debounce(loadSkillLists, 250));
+  $("overwriteSkills").addEventListener("change", () => invalidateSkillPreview());
+  $("previewSkillsButton").addEventListener("click", () => {
+    previewSkillsImport().catch((error) => setSkillsResult(error.message, "error"));
+  });
+  $("importSkillsButton").addEventListener("click", () => {
+    importSkills().catch((error) => setSkillsResult(error.message, "error"));
+  });
   $("killBlockingButton").addEventListener("click", () => {
     killBlockingProcesses().catch((error) => {
       setCopyResult(error.message, "error");
@@ -1067,6 +1759,15 @@ function bindEvents() {
     renderSourceThreads();
     invalidatePreview();
   });
+  $("skillsSelectAll").addEventListener("change", (event) => {
+    if (event.target.checked) {
+      for (const skill of state.sourceSkills) state.selectedSkills.add(skill.id);
+    } else {
+      state.selectedSkills.clear();
+    }
+    renderSourceSkills();
+    invalidateSkillPreview();
+  });
 }
 
 function debounce(fn, delay) {
@@ -1083,6 +1784,14 @@ function renderFileRuntimeNotice() {
   for (const id of [
     "killBlockingButton",
     "repairNamesButton",
+    "sessionPageButton",
+    "skillsPageButton",
+    "localModeButton",
+    "packageModeButton",
+    "exportPackageButton",
+    "packagePathInput",
+    "loadPackageButton",
+    "unloadPackageButton",
     "sourceProvider",
     "targetProviderSelect",
     "targetProviderCustom",
@@ -1094,6 +1803,15 @@ function renderFileRuntimeNotice() {
     "selectAll",
     "previewButton",
     "copyButton",
+    "exportSkillsPackageButton",
+    "skillsPackagePathInput",
+    "loadSkillsPackageButton",
+    "unloadSkillsPackageButton",
+    "skillsSearchInput",
+    "overwriteSkills",
+    "skillsSelectAll",
+    "previewSkillsButton",
+    "importSkillsButton",
     "sessionRenderToggleButton",
   ]) {
     const node = $(id);

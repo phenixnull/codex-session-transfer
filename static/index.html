@@ -64,6 +64,11 @@
               </div>
             </div>
 
+            <div class="page-tabs" role="tablist" aria-label="Workbench page">
+              <button id="sessionPageButton" class="active" type="button" role="tab" aria-selected="true">Sessions</button>
+              <button id="skillsPageButton" type="button" role="tab" aria-selected="false">Skills</button>
+            </div>
+
             <div class="sidebar-section">
               <div class="section-head">
                 <h2>Status</h2>
@@ -91,22 +96,60 @@
 
         <section class="panel-frame main-frame" data-platform-card-frame="main">
           <div class="panel-surface main-surface" data-platform-main-content>
-            <section class="control-panel">
+            <section id="sessionControlPanel" class="control-panel">
               <div class="workbench-head">
                 <div>
-                  <h2>Source Sessions</h2>
+                  <h2 id="workbenchTitle">Source Sessions</h2>
+                </div>
+                <div class="mode-switch" role="tablist" aria-label="Migration mode">
+                  <button id="localModeButton" type="button" role="tab" aria-selected="true">Local session migration</button>
+                  <button id="packageModeButton" type="button" role="tab" aria-selected="false">Cross-machine migration</button>
                 </div>
                 <span id="selectedCount" class="count-chip">0 selected</span>
               </div>
+
+              <section id="packagePanel" class="package-panel" aria-label="Cross-machine package" hidden>
+                <div class="package-actions">
+                  <button id="exportPackageButton" type="button">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 3v12"></path>
+                      <path d="m7 10 5 5 5-5"></path>
+                      <path d="M5 21h14"></path>
+                    </svg>
+                    <span>Export package</span>
+                  </button>
+                  <label class="field package-path-field">
+                    Package path
+                    <input id="packagePathInput" placeholder="Choose with Load, or paste path and press Enter">
+                  </label>
+                  <button id="loadPackageButton" type="button">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 21V9"></path>
+                      <path d="m7 14 5-5 5 5"></path>
+                      <path d="M5 3h14"></path>
+                    </svg>
+                    <span>Load package</span>
+                  </button>
+                  <input id="packageFileInput" class="file-input" type="file" accept=".zip,application/zip,application/x-zip-compressed">
+                  <button id="unloadPackageButton" type="button">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M18 6 6 18"></path>
+                      <path d="m6 6 12 12"></path>
+                    </svg>
+                    <span>Unload</span>
+                  </button>
+                </div>
+                <div id="packageStatusLine" class="package-status-line"></div>
+              </section>
 
               <div class="toolbar">
                 <section class="setup-panel source-setup" aria-label="Source setup">
                   <div class="setup-panel-head">
                     <span>Source</span>
-                    <strong>Provider</strong>
+                    <strong id="sourceSetupKind">Provider</strong>
                   </div>
                   <label class="field source-field">
-                    Source session provider
+                    <span id="sourceProviderLabel">Source session provider</span>
                     <select id="sourceProvider"></select>
                   </label>
                   <div class="setup-grid">
@@ -152,7 +195,7 @@
               </div>
             </section>
 
-            <div class="transfer-grid">
+            <div id="sessionTransferGrid" class="transfer-grid">
               <div class="table-wrap transfer-list-panel source-list">
                 <div class="table-head">
                   <h2>Source</h2>
@@ -198,10 +241,132 @@
                 </table>
               </div>
             </div>
+
+            <section id="skillsWorkbench" class="skills-workbench" hidden>
+              <section class="control-panel">
+                <div class="workbench-head">
+                  <div>
+                    <h2 id="skillsWorkbenchTitle">Skills Migration</h2>
+                  </div>
+                  <span id="skillsSelectedCount" class="count-chip">0 selected</span>
+                </div>
+
+                <section class="package-panel" aria-label="Skills package">
+                  <div class="package-actions skills-package-actions">
+                    <button id="exportSkillsPackageButton" type="button">
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 3v12"></path>
+                        <path d="m7 10 5 5 5-5"></path>
+                        <path d="M5 21h14"></path>
+                      </svg>
+                      <span>Export skills</span>
+                    </button>
+                    <label class="field package-path-field">
+                      Skills package path
+                      <input id="skillsPackagePathInput" placeholder="Choose with Load, or paste path and press Enter">
+                    </label>
+                    <button id="loadSkillsPackageButton" type="button">
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 21V9"></path>
+                        <path d="m7 14 5-5 5 5"></path>
+                        <path d="M5 3h14"></path>
+                      </svg>
+                      <span>Load skills</span>
+                    </button>
+                    <input id="skillsPackageFileInput" class="file-input" type="file" accept=".zip,application/zip,application/x-zip-compressed">
+                    <button id="unloadSkillsPackageButton" type="button">
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M18 6 6 18"></path>
+                        <path d="m6 6 12 12"></path>
+                      </svg>
+                      <span>Unload</span>
+                    </button>
+                  </div>
+                  <div class="skill-option-row">
+                    <label class="field search-field">
+                      Search
+                      <input id="skillsSearchInput" placeholder="Skill name, description, id">
+                    </label>
+                    <label class="check">
+                      <input id="overwriteSkills" type="checkbox">
+                      <span>Overwrite</span>
+                    </label>
+                  </div>
+                  <div id="skillsPackageStatusLine" class="package-status-line"></div>
+                </section>
+              </section>
+
+              <div class="transfer-grid skills-grid">
+                <div class="table-wrap transfer-list-panel source-list">
+                  <div class="table-head">
+                    <h2 id="skillsSourceTitle">Local skills</h2>
+                    <div class="table-head-actions">
+                      <label class="select-all-control" title="Select all shown skills">
+                        <input id="skillsSelectAll" type="checkbox" aria-label="Select all shown skills">
+                        <span>All</span>
+                      </label>
+                      <span id="skillsSourceCount" class="count-chip">0 shown</span>
+                    </div>
+                  </div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th class="select-col">Select</th>
+                        <th>Skill</th>
+                        <th>Description</th>
+                        <th>Files</th>
+                        <th>State</th>
+                      </tr>
+                    </thead>
+                    <tbody id="skillsSourceBody"></tbody>
+                  </table>
+                </div>
+
+                <div class="table-wrap transfer-list-panel target-list">
+                  <div class="table-head">
+                    <h2>Installed skills</h2>
+                    <span id="skillsTargetCount" class="count-chip">0 shown</span>
+                  </div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Skill</th>
+                        <th>Description</th>
+                        <th>Files</th>
+                        <th>State</th>
+                      </tr>
+                    </thead>
+                    <tbody id="skillsTargetBody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <section class="skill-actions-panel">
+                <div class="copy-actions">
+                  <button id="previewSkillsButton" type="button">
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
+                      <path d="M12 9.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"></path>
+                    </svg>
+                    <span>Preview import</span>
+                  </button>
+                  <button id="importSkillsButton" type="button" disabled>
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M8 8h10v10H8z"></path>
+                      <path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path>
+                    </svg>
+                    <span>Import skills</span>
+                  </button>
+                </div>
+                <p id="skillsDisabledReason" class="copy-hint"></p>
+                <div id="skillsPreviewItems" class="preview-items"></div>
+                <p id="skillsResult" class="result"></p>
+              </section>
+            </section>
           </div>
         </section>
 
-        <div class="resize-gutter" aria-hidden="true"></div>
+        <div id="sessionRailGutter" class="resize-gutter" aria-hidden="true"></div>
 
         <aside id="sessionRail" class="session-rail">
           <button id="sessionRenderExpandButton" class="session-expand-tab" type="button" aria-label="Show session preview">
@@ -232,9 +397,9 @@
           </div>
         </aside>
 
-        <div class="resize-gutter" aria-hidden="true"></div>
+        <div id="rightRailGutter" class="resize-gutter" aria-hidden="true"></div>
 
-        <aside class="right-rail">
+        <aside id="rightRail" class="right-rail">
           <div class="panel-frame rail-frame preview-frame" data-platform-card-frame="assistant">
             <aside class="panel-surface preview-pane" data-platform-assistant>
               <div class="pane-head">

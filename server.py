@@ -5,19 +5,22 @@ import csv
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import tomllib
 import uuid
+import zipfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 STATE_DB_FILENAME = "state_5.sqlite"
@@ -25,6 +28,14 @@ SESSION_INDEX_FILENAME = "session_index.jsonl"
 BLOCKING_PROCESS_NAMES = {"codex", "codex-plus-plus", "codex-plus-plus-manager"}
 DEFAULT_THREAD_DETAIL_LIMIT = 80
 MAX_THREAD_DETAIL_LIMIT = 200
+PACKAGE_FORMAT = "codex-session-transfer-package"
+PACKAGE_VERSION = 1
+PACKAGE_MANIFEST_NAME = "manifest.json"
+PACKAGE_DB_PATH = f"sqlite/{STATE_DB_FILENAME}"
+PACKAGE_SCHEMA_TABLES = ("threads", "thread_spawn_edges", "thread_dynamic_tools")
+SKILL_PACKAGE_FORMAT = "codex-skill-transfer-package"
+SKILL_PACKAGE_VERSION = 1
+SKILL_PACKAGE_DIRNAME = "skills"
 ROLLOUT_NAME_RE = re.compile(
     r"^(?P<prefix>rollout-.+-)"
     r"(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -62,6 +73,76 @@ class CopyRequest:
             include_descendants=bool(data.get("include_descendants", False)),
             include_archived=bool(data.get("include_archived", False)),
         )
+
+
+@dataclass(frozen=True)
+class ExportPackageRequest:
+    source_provider: str
+    thread_ids: list[str]
+    include_descendants: bool
+    include_archived: bool
+    output_path: str = ""
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "ExportPackageRequest":
+        thread_ids = data.get("thread_ids", [])
+        if not isinstance(thread_ids, list):
+            raise ValueError("thread_ids must be a list")
+        return cls(
+            source_provider=str(data.get("source_provider", "")).strip(),
+            thread_ids=[str(thread_id).strip() for thread_id in thread_ids if str(thread_id).strip()],
+            include_descendants=bool(data.get("include_descendants", False)),
+            include_archived=bool(data.get("include_archived", False)),
+            output_path=str(data.get("output_path", "")).strip(),
+        )
+
+
+@dataclass(frozen=True)
+class LoadedTransferPackage:
+    package_path: Path
+    extract_dir: Path
+    db_path: Path
+    session_index_path: Path
+    manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SkillPackageRequest:
+    skill_ids: list[str]
+    output_path: str = ""
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "SkillPackageRequest":
+        skill_ids = data.get("skill_ids", [])
+        if not isinstance(skill_ids, list):
+            raise ValueError("skill_ids must be a list")
+        return cls(
+            skill_ids=[str(skill_id).strip() for skill_id in skill_ids if str(skill_id).strip()],
+            output_path=str(data.get("output_path", "")).strip(),
+        )
+
+
+@dataclass(frozen=True)
+class SkillImportRequest:
+    skill_ids: list[str]
+    overwrite: bool = False
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "SkillImportRequest":
+        skill_ids = data.get("skill_ids", [])
+        if not isinstance(skill_ids, list):
+            raise ValueError("skill_ids must be a list")
+        return cls(
+            skill_ids=[str(skill_id).strip() for skill_id in skill_ids if str(skill_id).strip()],
+            overwrite=bool(data.get("overwrite", False)),
+        )
+
+
+@dataclass(frozen=True)
+class LoadedSkillPackage:
+    package_path: Path
+    extract_dir: Path
+    manifest: dict[str, Any]
 
 
 def compact_json(value: JSONValue) -> str:
@@ -157,9 +238,16 @@ class CodexSessionTransfer:
             provider_switch_home or default_switch_home / "codex-provider-switch"
         )
         self.manifest_dir = self.codex_home / "session-transfer" / "manifests"
+        self.package_dir = self.codex_home / "session-transfer" / "packages"
+        self.package_import_dir = self.codex_home / "session-transfer" / "imports"
+        self.skills_root = self.codex_home / "skills"
+        self.skill_package_dir = self.codex_home / "session-transfer" / "skill-packages"
+        self.skill_package_import_dir = self.codex_home / "session-transfer" / "skill-imports"
         self.session_index_path = self.codex_home / SESSION_INDEX_FILENAME
         self.process_checker = process_checker or default_process_checker
         self.process_terminator = process_terminator or default_process_terminator
+        self.loaded_package: LoadedTransferPackage | None = None
+        self.loaded_skill_package: LoadedSkillPackage | None = None
 
     def status(self) -> dict[str, Any]:
         integrity = "missing"
@@ -183,6 +271,8 @@ class CodexSessionTransfer:
             "session_stats": self.session_stats() if self.db_path.exists() else {},
             "providers": self.list_providers() if self.db_path.exists() else [],
             "target_providers": self.list_target_providers() if self.db_path.exists() else [],
+            "package_source": self.package_status(),
+            "skills": self.skills_status(),
         }
 
     def session_index_status(self) -> dict[str, Any]:
@@ -195,14 +285,17 @@ class CodexSessionTransfer:
 
     def list_providers(self) -> list[dict[str, Any]]:
         with closing(self._connect(read_only=True)) as conn:
-            rows = conn.execute(
-                """
-                SELECT model_provider, archived, COUNT(*) AS count
-                FROM threads
-                GROUP BY model_provider, archived
-                ORDER BY model_provider, archived
-                """
-            ).fetchall()
+            return self._list_providers_from_connection(conn)
+
+    def _list_providers_from_connection(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT model_provider, archived, COUNT(*) AS count
+            FROM threads
+            GROUP BY model_provider, archived
+            ORDER BY model_provider, archived
+            """
+        ).fetchall()
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
             provider = row["model_provider"]
@@ -322,14 +415,21 @@ class CodexSessionTransfer:
 
     def session_stats(self) -> dict[str, Any]:
         with closing(self._connect(read_only=True)) as conn:
-            rows = conn.execute(
-                """
-                SELECT id, cwd, model_provider, archived, rollout_path, preview
-                FROM threads
-                ORDER BY cwd, model_provider
-                """
-            ).fetchall()
+            return self._session_stats_from_connection(conn, include_current_config=True)
 
+    def _session_stats_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        include_current_config: bool,
+    ) -> dict[str, Any]:
+        rows = conn.execute(
+            """
+            SELECT id, cwd, model_provider, archived, rollout_path, preview
+            FROM threads
+            ORDER BY cwd, model_provider
+            """
+        ).fetchall()
         totals = {
             "total": 0,
             "active": 0,
@@ -407,12 +507,34 @@ class CodexSessionTransfer:
             "totals": totals,
             "by_provider": provider_output,
             "by_project": project_output,
-            "current_config": self.current_config(),
+            "current_config": self.current_config() if include_current_config else {},
         }
 
     def list_threads(
         self,
         *,
+        source_provider: str | None = None,
+        include_archived: bool = False,
+        search: str = "",
+        cwd: str = "",
+        source: str = "",
+    ) -> list[dict[str, Any]]:
+        with closing(self._connect(read_only=True)) as conn:
+            return self._list_threads_from_connection(
+                conn,
+                session_index=self._load_session_index(),
+                source_provider=source_provider,
+                include_archived=include_archived,
+                search=search,
+                cwd=cwd,
+                source=source,
+            )
+
+    def _list_threads_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        session_index: dict[str, dict[str, Any]],
         source_provider: str | None = None,
         include_archived: bool = False,
         search: str = "",
@@ -445,15 +567,31 @@ class CodexSessionTransfer:
             WHERE {' AND '.join(clauses)}
             ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC
         """
-        with closing(self._connect(read_only=True)) as conn:
-            rows = conn.execute(query, params).fetchall()
-            session_index = self._load_session_index()
-            return [self._thread_summary(conn, row, session_index) for row in rows]
+        rows = conn.execute(query, params).fetchall()
+        return [self._thread_summary(conn, row, session_index) for row in rows]
 
     def thread_detail(
         self,
         thread_id: str,
         *,
+        item_offset: int = 0,
+        item_limit: int = DEFAULT_THREAD_DETAIL_LIMIT,
+    ) -> dict[str, Any]:
+        with closing(self._connect(read_only=True)) as conn:
+            return self._thread_detail_from_connection(
+                conn,
+                thread_id,
+                session_index=self._load_session_index(),
+                item_offset=item_offset,
+                item_limit=item_limit,
+            )
+
+    def _thread_detail_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        thread_id: str,
+        *,
+        session_index: dict[str, dict[str, Any]],
         item_offset: int = 0,
         item_limit: int = DEFAULT_THREAD_DETAIL_LIMIT,
     ) -> dict[str, Any]:
@@ -463,12 +601,10 @@ class CodexSessionTransfer:
         item_offset = max(0, int(item_offset))
         item_limit = min(MAX_THREAD_DETAIL_LIMIT, max(1, int(item_limit)))
 
-        with closing(self._connect(read_only=True)) as conn:
-            row = conn.execute("SELECT * FROM threads WHERE id = ?", (clean_id,)).fetchone()
-            if row is None:
-                return {"ok": False, "errors": [f"Thread not found: {clean_id}"]}
-            session_index = self._load_session_index()
-            thread = self._thread_summary(conn, row, session_index)
+        row = conn.execute("SELECT * FROM threads WHERE id = ?", (clean_id,)).fetchone()
+        if row is None:
+            return {"ok": False, "errors": [f"Thread not found: {clean_id}"]}
+        thread = self._thread_summary(conn, row, session_index)
 
         rollout_path = Path(row["rollout_path"])
         rollout = {
@@ -699,14 +835,1051 @@ class CodexSessionTransfer:
             "session_index_path": str(self.session_index_path),
         }
 
+    def skills_status(self) -> dict[str, Any]:
+        skills = self.list_skills()
+        return {
+            "root": str(self.skills_root),
+            "exists": self.skills_root.exists(),
+            "total": len(skills),
+            "package_source": self.skills_package_status(),
+        }
+
+    def list_skills(self, *, search: str = "") -> list[dict[str, Any]]:
+        return self._list_skills_from_root(self.skills_root, search=search)
+
+    def export_skills_package(self, request: SkillPackageRequest) -> dict[str, Any]:
+        errors: list[str] = []
+        selected_ids = self._dedupe(request.skill_ids)
+        if not selected_ids:
+            errors.append("Select at least one skill")
+
+        local_skills = {skill["id"]: skill for skill in self.list_skills()}
+        for skill_id in selected_ids:
+            if not self._is_safe_skill_id(skill_id):
+                errors.append(f"Invalid skill id: {skill_id}")
+            elif skill_id not in local_skills:
+                errors.append(f"Skill not found: {skill_id}")
+        if errors:
+            return {"ok": False, "can_execute": False, "errors": errors, "items": []}
+
+        package_path = self._skill_package_output_path(request.output_path)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                staging_dir = Path(tmp)
+                manifest = self._stage_skills_package(selected_ids, staging_dir)
+                self._zip_directory(staging_dir, package_path)
+        except Exception as exc:
+            return {"ok": False, "can_execute": False, "errors": [str(exc)], "items": []}
+
+        return {
+            "ok": True,
+            "can_execute": True,
+            "package_path": str(package_path),
+            "skill_count": len(selected_ids),
+            "items": manifest["skills"],
+        }
+
+    def load_skills_package(self, package_path: Path) -> dict[str, Any]:
+        path = Path(package_path).expanduser()
+        if not path.exists():
+            return {"ok": False, "loaded": False, "errors": [f"Package not found: {path}"]}
+        if not path.is_file():
+            return {"ok": False, "loaded": False, "errors": [f"Package path is not a file: {path}"]}
+
+        extract_dir = self._new_skill_package_extract_dir(path)
+        try:
+            with zipfile.ZipFile(path) as package:
+                manifest = self._read_skill_package_manifest(package)
+                self._safe_extract_zip(package, extract_dir)
+            for skill in manifest.get("skills") or []:
+                skill_id = str(skill.get("id") or "")
+                if not self._is_safe_skill_id(skill_id):
+                    raise ValueError(f"Invalid skill id in package: {skill_id}")
+                if not (extract_dir / SKILL_PACKAGE_DIRNAME / skill_id / "SKILL.md").exists():
+                    raise ValueError(f"Package skill is missing SKILL.md: {skill_id}")
+            self.loaded_skill_package = LoadedSkillPackage(
+                package_path=path,
+                extract_dir=extract_dir,
+                manifest=manifest,
+            )
+        except Exception as exc:
+            try:
+                shutil.rmtree(extract_dir)
+            except FileNotFoundError:
+                pass
+            return {"ok": False, "loaded": False, "errors": [str(exc)]}
+
+        return {"ok": True, **self.skills_package_status()}
+
+    def load_uploaded_skills_package(self, filename: str, content: bytes) -> dict[str, Any]:
+        try:
+            path = self._save_uploaded_package_file(
+                filename,
+                content,
+                self.skill_package_dir,
+                "codex-skills-package-upload",
+            )
+        except ValueError as exc:
+            return {"ok": False, "loaded": False, "errors": [str(exc)]}
+        return self.load_skills_package(path)
+
+    def unload_skills_package(self) -> dict[str, Any]:
+        self.loaded_skill_package = None
+        return {"ok": True, "loaded": False}
+
+    def skills_package_status(self) -> dict[str, Any]:
+        package = self.loaded_skill_package
+        if package is None:
+            return {"loaded": False, "manifest": None, "skills": []}
+        skills = self.list_package_skills()
+        return {
+            "loaded": True,
+            "package_path": str(package.package_path),
+            "extract_dir": str(package.extract_dir),
+            "manifest": package.manifest,
+            "skills": skills,
+            "total": len(skills),
+        }
+
+    def list_package_skills(self, *, search: str = "") -> list[dict[str, Any]]:
+        package = self._require_loaded_skill_package()
+        return self._list_skills_from_root(
+            package.extract_dir / SKILL_PACKAGE_DIRNAME,
+            search=search,
+            installed_root=self.skills_root,
+        )
+
+    def preview_import_skills(self, request: SkillImportRequest) -> dict[str, Any]:
+        package = self._require_loaded_skill_package()
+        errors: list[str] = []
+        warnings: list[str] = []
+        selected_ids = self._dedupe(request.skill_ids)
+        if not selected_ids:
+            errors.append("Select at least one skill")
+
+        package_skills = {skill["id"]: skill for skill in self.list_package_skills()}
+        items = []
+        for skill_id in selected_ids:
+            if not self._is_safe_skill_id(skill_id):
+                errors.append(f"Invalid skill id: {skill_id}")
+                continue
+            skill = package_skills.get(skill_id)
+            if skill is None:
+                errors.append(f"Skill not found in package: {skill_id}")
+                continue
+            dest_path = self.skills_root / skill_id
+            installed = dest_path.exists()
+            if installed and not request.overwrite:
+                errors.append(f"Skill already exists: {skill_id}")
+            items.append(
+                {
+                    "id": skill_id,
+                    "name": skill.get("name") or skill_id,
+                    "description": skill.get("description") or "",
+                    "source_path": str(package.extract_dir / SKILL_PACKAGE_DIRNAME / skill_id),
+                    "dest_path": str(dest_path),
+                    "installed": installed,
+                    "action": "replace" if installed and request.overwrite else "create",
+                }
+            )
+
+        return {
+            "can_execute": not errors and bool(items),
+            "errors": errors,
+            "warnings": warnings,
+            "items": items,
+            "overwrite": request.overwrite,
+            "package_path": str(package.package_path),
+        }
+
+    def import_skills(self, request: SkillImportRequest) -> dict[str, Any]:
+        plan = self.preview_import_skills(request)
+        if not plan["can_execute"]:
+            return {"ok": False, "blocked": False, **plan}
+
+        imported = []
+        try:
+            for item in plan["items"]:
+                source_path = Path(item["source_path"])
+                dest_path = Path(item["dest_path"])
+                if dest_path.exists() and request.overwrite:
+                    shutil.rmtree(dest_path)
+                self._copy_tree_no_symlinks(source_path, dest_path)
+                imported.append(item)
+        except Exception as exc:
+            return {"ok": False, "blocked": False, "errors": [str(exc)], "items": imported}
+
+        return {"ok": True, "blocked": False, **plan, "imported_count": len(imported)}
+
+    def export_package(self, request: ExportPackageRequest) -> dict[str, Any]:
+        copy_request = CopyRequest(
+            request.source_provider,
+            f"{request.source_provider}__transfer_package_target__",
+            request.thread_ids,
+            request.include_descendants,
+            request.include_archived,
+        )
+        with closing(self._connect(read_only=True)) as conn:
+            plan = self._build_copy_plan(conn, copy_request)
+            if plan["errors"]:
+                return {
+                    "ok": False,
+                    "can_execute": False,
+                    "errors": plan["errors"],
+                    "warnings": plan["warnings"],
+                    "items": plan["items"],
+                }
+
+            package_path = self._package_output_path(request.output_path)
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    staging_dir = Path(tmp)
+                    manifest = self._stage_transfer_package(conn, plan, request, staging_dir)
+                    self._zip_directory(staging_dir, package_path)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "can_execute": False,
+                    "errors": [str(exc)],
+                    "warnings": [],
+                    "items": [],
+                }
+
+        return {
+            "ok": True,
+            "can_execute": True,
+            "package_path": str(package_path),
+            "thread_count": len(plan["_ordered_ids"]),
+            "project_count": len(manifest["projects"]),
+            "source_provider": request.source_provider,
+            "include_descendants": request.include_descendants,
+            "include_archived": request.include_archived,
+            "items": self._export_items(plan, manifest),
+        }
+
+    def load_transfer_package(self, package_path: Path) -> dict[str, Any]:
+        path = Path(package_path).expanduser()
+        if not path.exists():
+            return {"ok": False, "loaded": False, "errors": [f"Package not found: {path}"]}
+        if not path.is_file():
+            return {"ok": False, "loaded": False, "errors": [f"Package path is not a file: {path}"]}
+
+        extract_dir = self._new_package_extract_dir(path)
+        try:
+            with zipfile.ZipFile(path) as package:
+                manifest = self._read_package_manifest(package)
+                self._safe_extract_zip(package, extract_dir)
+            db_path = extract_dir / PACKAGE_DB_PATH
+            session_index_path = extract_dir / SESSION_INDEX_FILENAME
+            if not db_path.exists():
+                raise ValueError(f"Package is missing {PACKAGE_DB_PATH}")
+            self._materialize_package_rollout_paths(db_path, extract_dir)
+            self.loaded_package = LoadedTransferPackage(
+                package_path=path,
+                extract_dir=extract_dir,
+                db_path=db_path,
+                session_index_path=session_index_path,
+                manifest=manifest,
+            )
+        except Exception as exc:
+            try:
+                shutil.rmtree(extract_dir)
+            except FileNotFoundError:
+                pass
+            return {"ok": False, "loaded": False, "errors": [str(exc)]}
+
+        return {"ok": True, **self.package_status()}
+
+    def load_uploaded_transfer_package(self, filename: str, content: bytes) -> dict[str, Any]:
+        try:
+            path = self._save_uploaded_package_file(
+                filename,
+                content,
+                self.package_dir,
+                "codex-session-package-upload",
+            )
+        except ValueError as exc:
+            return {"ok": False, "loaded": False, "errors": [str(exc)]}
+        return self.load_transfer_package(path)
+
+    def unload_transfer_package(self) -> dict[str, Any]:
+        self.loaded_package = None
+        return {"ok": True, "loaded": False}
+
+    def package_status(self) -> dict[str, Any]:
+        package = self.loaded_package
+        if package is None:
+            return {"loaded": False, "providers": [], "session_stats": {}, "manifest": None}
+        source_index = self._load_session_index_from_path(package.session_index_path)
+        with closing(self._connect_path(package.db_path, read_only=True)) as conn:
+            return {
+                "loaded": True,
+                "package_path": str(package.package_path),
+                "extract_dir": str(package.extract_dir),
+                "manifest": package.manifest,
+                "providers": self._list_providers_from_connection(conn),
+                "session_stats": self._session_stats_from_connection(
+                    conn,
+                    include_current_config=False,
+                ),
+                "session_index": {
+                    "path": str(package.session_index_path),
+                    "exists": package.session_index_path.exists(),
+                    "entries": len(source_index),
+                },
+            }
+
+    def list_package_threads(
+        self,
+        *,
+        source_provider: str | None = None,
+        include_archived: bool = False,
+        search: str = "",
+        cwd: str = "",
+        source: str = "",
+    ) -> list[dict[str, Any]]:
+        package = self._require_loaded_package()
+        with closing(self._connect_path(package.db_path, read_only=True)) as conn:
+            return self._list_threads_from_connection(
+                conn,
+                session_index=self._load_session_index_from_path(package.session_index_path),
+                source_provider=source_provider,
+                include_archived=include_archived,
+                search=search,
+                cwd=cwd,
+                source=source,
+            )
+
+    def package_thread_detail(
+        self,
+        thread_id: str,
+        *,
+        item_offset: int = 0,
+        item_limit: int = DEFAULT_THREAD_DETAIL_LIMIT,
+    ) -> dict[str, Any]:
+        package = self._require_loaded_package()
+        with closing(self._connect_path(package.db_path, read_only=True)) as conn:
+            return self._thread_detail_from_connection(
+                conn,
+                thread_id,
+                session_index=self._load_session_index_from_path(package.session_index_path),
+                item_offset=item_offset,
+                item_limit=item_limit,
+            )
+
+    def preview_imported_package_copy(self, request: CopyRequest) -> dict[str, Any]:
+        package = self._require_loaded_package()
+        with closing(self._connect_path(package.db_path, read_only=True)) as source_conn:
+            with closing(self._connect(read_only=True)) as target_conn:
+                plan = self._build_copy_plan(
+                    source_conn,
+                    request,
+                    target_conn=target_conn,
+                    source_index=self._load_session_index_from_path(package.session_index_path),
+                    dest_path_resolver=self._dest_rollout_path_for_import,
+                    allow_same_provider=True,
+                )
+        return self._public_plan(plan)
+
+    def copy_imported_package_threads(self, request: CopyRequest) -> dict[str, Any]:
+        package = self._require_loaded_package()
+        blocking = self.blocking_processes()
+        if blocking:
+            payload = {
+                "ok": False,
+                "blocked": True,
+                "errors": ["Close Codex and provider switcher processes before copying."],
+                "blocking_processes": blocking,
+                "package_path": str(package.package_path),
+            }
+            manifest_path = self._write_manifest(payload, request)
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        preflight = self.preview_imported_package_copy(request)
+        if not preflight["can_execute"]:
+            payload = {"ok": False, "blocked": False, **preflight, "package_path": str(package.package_path)}
+            manifest_path = self._write_manifest(payload, request)
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = self._backup_database()
+        copied_paths: list[Path] = []
+        session_index_snapshot: tuple[bool, str] | None = None
+        session_index_entries: list[dict[str, Any]] = []
+        manifest_payload: dict[str, Any] | None = None
+        source_index = self._load_session_index_from_path(package.session_index_path)
+
+        with closing(self._connect_path(package.db_path, read_only=True)) as source_conn:
+            with closing(self._connect(read_only=False)) as target_conn:
+                try:
+                    target_conn.execute("PRAGMA foreign_keys = ON")
+                    target_conn.execute("BEGIN IMMEDIATE")
+                    plan = self._build_copy_plan(
+                        source_conn,
+                        request,
+                        target_conn=target_conn,
+                        source_index=source_index,
+                        dest_path_resolver=self._dest_rollout_path_for_import,
+                        allow_same_provider=True,
+                    )
+                    if plan["errors"]:
+                        target_conn.rollback()
+                        manifest_payload = {
+                            "ok": False,
+                            "blocked": False,
+                            **self._public_plan(plan),
+                            "backup_path": str(backup_path),
+                            "package_path": str(package.package_path),
+                        }
+                    else:
+                        for item in plan["items"]:
+                            self._write_rollout_copy(
+                                Path(item["source_rollout_path"]),
+                                Path(item["dest_rollout_path"]),
+                                item["source_id"],
+                                plan["_id_map"],
+                                request.target_provider,
+                            )
+                            copied_paths.append(Path(item["dest_rollout_path"]))
+
+                        self._insert_thread_rows(target_conn, plan, request.target_provider)
+                        self._insert_spawn_edges_from_source(source_conn, target_conn, plan)
+                        self._insert_dynamic_tools_from_source(source_conn, target_conn, plan)
+                        session_index_snapshot = self._snapshot_session_index()
+                        session_index_entries = self._append_session_index_entries(
+                            plan,
+                            source_index=source_index,
+                            existing_index=self._load_session_index(),
+                        )
+                        target_conn.commit()
+
+                        manifest_payload = {
+                            "ok": True,
+                            "blocked": False,
+                            **self._public_plan(plan),
+                            "backup_path": str(backup_path),
+                            "package_path": str(package.package_path),
+                            "session_index_path": str(self.session_index_path),
+                            "session_index_entries": len(session_index_entries),
+                        }
+                except Exception as exc:
+                    target_conn.rollback()
+                    if session_index_snapshot is not None:
+                        self._restore_session_index(session_index_snapshot)
+                    for path in copied_paths:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    manifest_payload = {
+                        "ok": False,
+                        "blocked": False,
+                        "errors": [str(exc)],
+                        "items": [],
+                        "backup_path": str(backup_path),
+                        "package_path": str(package.package_path),
+                    }
+
+        manifest_path = self._write_manifest(manifest_payload, request)
+        manifest_payload["manifest_path"] = str(manifest_path)
+        return manifest_payload
+
     def _connect(self, *, read_only: bool) -> sqlite3.Connection:
+        return self._connect_path(self.db_path, read_only=read_only)
+
+    def _connect_path(self, db_path: Path, *, read_only: bool) -> sqlite3.Connection:
         if read_only:
-            uri = self.db_path.resolve().as_uri() + "?mode=ro"
+            uri = db_path.resolve().as_uri() + "?mode=ro"
             conn = sqlite3.connect(uri, uri=True)
         else:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _require_loaded_package(self) -> LoadedTransferPackage:
+        if self.loaded_package is None:
+            raise ValueError("Load a transfer package first")
+        return self.loaded_package
+
+    def _require_loaded_skill_package(self) -> LoadedSkillPackage:
+        if self.loaded_skill_package is None:
+            raise ValueError("Load a skills package first")
+        return self.loaded_skill_package
+
+    def _is_safe_skill_id(self, skill_id: str) -> bool:
+        if not skill_id or skill_id in {".", ".."}:
+            return False
+        return not any(part in skill_id for part in ("\\", "/", ":"))
+
+    def _list_skills_from_root(
+        self,
+        root: Path,
+        *,
+        search: str = "",
+        installed_root: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        if not root.exists():
+            return []
+        query = search.strip().lower()
+        skills = []
+        for skill_dir in sorted(root.iterdir(), key=lambda path: path.name.lower()):
+            if not skill_dir.is_dir() or not self._is_safe_skill_id(skill_dir.name):
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            summary = self._skill_summary(skill_dir, installed_root=installed_root)
+            haystack = " ".join(
+                str(summary.get(key) or "")
+                for key in ("id", "name", "description", "path")
+            ).lower()
+            if query and query not in haystack:
+                continue
+            skills.append(summary)
+        return skills
+
+    def _skill_summary(
+        self,
+        skill_dir: Path,
+        *,
+        installed_root: Path | None = None,
+    ) -> dict[str, Any]:
+        skill_md = skill_dir / "SKILL.md"
+        metadata = self._read_skill_metadata(skill_md)
+        files = [path for path in skill_dir.rglob("*") if path.is_file()]
+        size = 0
+        latest_mtime = 0.0
+        for path in files:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            size += stat.st_size
+            latest_mtime = max(latest_mtime, stat.st_mtime)
+        skill_id = skill_dir.name
+        installed_path = installed_root / skill_id if installed_root else None
+        return {
+            "id": skill_id,
+            "name": str(metadata.get("name") or skill_id),
+            "description": str(metadata.get("description") or ""),
+            "path": str(skill_dir),
+            "skill_md_path": str(skill_md),
+            "file_count": len(files),
+            "size": size,
+            "updated_at": datetime.fromtimestamp(latest_mtime, UTC).isoformat() if latest_mtime else None,
+            "installed": bool(installed_path and installed_path.exists()),
+        }
+
+    def _read_skill_metadata(self, skill_md: Path) -> dict[str, str]:
+        try:
+            lines = skill_md.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+        if not lines or lines[0].strip() != "---":
+            return {}
+        metadata: dict[str, str] = {}
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            metadata[key.strip()] = value.strip().strip('"').strip("'")
+        return metadata
+
+    def _skill_package_output_path(self, requested: str) -> Path:
+        if requested:
+            path = Path(requested).expanduser()
+        else:
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            path = self.skill_package_dir / f"codex-skills-package-{timestamp}.zip"
+        if path.suffix.lower() != ".zip":
+            path = path.with_suffix(".zip")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        counter = 1
+        candidate = path
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
+            counter += 1
+        return candidate
+
+    def _save_uploaded_package_file(
+        self,
+        filename: str,
+        content: bytes,
+        destination_dir: Path,
+        fallback_stem: str,
+    ) -> Path:
+        if not content:
+            raise ValueError("Uploaded package is empty")
+        original_name = Path(filename or f"{fallback_stem}.zip").name
+        if Path(original_name).suffix.lower() != ".zip":
+            raise ValueError("Uploaded package must be a .zip file")
+        stem_source = Path(original_name).stem or fallback_stem
+        stem = self._safe_package_segment(stem_source)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        path = destination_dir / f"{stem}.zip"
+        counter = 1
+        candidate = path
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
+            counter += 1
+        candidate.write_bytes(content)
+        return candidate
+
+    def _stage_skills_package(self, skill_ids: list[str], staging_dir: Path) -> dict[str, Any]:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        skills_root = staging_dir / SKILL_PACKAGE_DIRNAME
+        skills_root.mkdir(parents=True, exist_ok=True)
+        skills = []
+        for skill_id in skill_ids:
+            source_path = self.skills_root / skill_id
+            dest_path = skills_root / skill_id
+            self._copy_tree_no_symlinks(source_path, dest_path)
+            skill = self._skill_summary(source_path)
+            skills.append(
+                {
+                    "id": skill_id,
+                    "name": skill["name"],
+                    "description": skill["description"],
+                    "file_count": skill["file_count"],
+                    "size": skill["size"],
+                    "path": f"{SKILL_PACKAGE_DIRNAME}/{skill_id}",
+                }
+            )
+
+        manifest = {
+            "format": SKILL_PACKAGE_FORMAT,
+            "version": SKILL_PACKAGE_VERSION,
+            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "source_skills_root": str(self.skills_root),
+            "skill_count": len(skills),
+            "skills": skills,
+        }
+        (staging_dir / PACKAGE_MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return manifest
+
+    def _read_skill_package_manifest(self, package: zipfile.ZipFile) -> dict[str, Any]:
+        try:
+            raw = package.read(PACKAGE_MANIFEST_NAME)
+        except KeyError as exc:
+            raise ValueError(f"Package is missing {PACKAGE_MANIFEST_NAME}") from exc
+        manifest = json.loads(raw.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("Skills package manifest is not an object")
+        if manifest.get("format") != SKILL_PACKAGE_FORMAT:
+            raise ValueError("Unsupported skills package format")
+        if int(manifest.get("version") or 0) > SKILL_PACKAGE_VERSION:
+            raise ValueError("Skills package version is newer than this app supports")
+        if not isinstance(manifest.get("skills"), list):
+            raise ValueError("Skills package manifest is missing skills")
+        return manifest
+
+    def _new_skill_package_extract_dir(self, package_path: Path) -> Path:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        stem = self._safe_package_segment(package_path.stem)
+        return self.skill_package_import_dir / f"{stem}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+    def _copy_tree_no_symlinks(self, source_dir: Path, dest_dir: Path) -> None:
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise ValueError(f"Source directory not found: {source_dir}")
+        if dest_dir.exists():
+            raise FileExistsError(f"Destination already exists: {dest_dir}")
+        for path in source_dir.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(f"Symlinks are not supported in skill packages: {path}")
+        for path in source_dir.rglob("*"):
+            relative = path.relative_to(source_dir)
+            target = dest_dir / relative
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif path.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+
+    def _package_output_path(self, requested: str) -> Path:
+        if requested:
+            path = Path(requested).expanduser()
+        else:
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            path = self.package_dir / f"codex-session-package-{timestamp}.zip"
+        if path.suffix.lower() != ".zip":
+            path = path.with_suffix(".zip")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        counter = 1
+        candidate = path
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
+            counter += 1
+        return candidate
+
+    def _stage_transfer_package(
+        self,
+        conn: sqlite3.Connection,
+        plan: dict[str, Any],
+        request: ExportPackageRequest,
+        staging_dir: Path,
+    ) -> dict[str, Any]:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        rel_rollouts = self._copy_package_rollouts(staging_dir, plan)
+        self._write_package_database(conn, staging_dir / PACKAGE_DB_PATH, plan, rel_rollouts)
+        manifest = self._package_manifest(plan, request, rel_rollouts)
+        (staging_dir / PACKAGE_MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._write_package_session_index(staging_dir / SESSION_INDEX_FILENAME, plan)
+        return manifest
+
+    def _copy_package_rollouts(self, staging_dir: Path, plan: dict[str, Any]) -> dict[str, str]:
+        rel_rollouts: dict[str, str] = {}
+        used: set[str] = set()
+        for source_id in plan["_ordered_ids"]:
+            row = plan["_rows"][source_id]
+            source_path = Path(row["rollout_path"])
+            rel_path = self._package_rollout_relative_path(source_path, row, used)
+            dest_path = staging_dir / Path(*rel_path.parts)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, dest_path)
+            rel_rollouts[source_id] = rel_path.as_posix()
+        return rel_rollouts
+
+    def _package_rollout_relative_path(
+        self,
+        source_path: Path,
+        row: dict[str, Any],
+        used: set[str],
+    ) -> PurePosixPath:
+        try:
+            rel = source_path.resolve().relative_to(self.codex_home.resolve())
+            candidate = PurePosixPath(rel.as_posix())
+        except ValueError:
+            project = self._safe_package_segment(self._project_label(str(row.get("cwd") or "project")))
+            candidate = PurePosixPath("rollouts") / project / source_path.name
+        candidate = self._dedupe_package_path(candidate, used)
+        used.add(candidate.as_posix())
+        return candidate
+
+    def _dedupe_package_path(self, path: PurePosixPath, used: set[str]) -> PurePosixPath:
+        if path.as_posix() not in used:
+            return path
+        suffix = "".join(path.suffixes)
+        stem = path.name[: -len(suffix)] if suffix else path.name
+        parent = path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}-{counter}{suffix}"
+            if candidate.as_posix() not in used:
+                return candidate
+            counter += 1
+
+    def _safe_package_segment(self, value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+        return cleaned[:80] or "project"
+
+    def _write_package_database(
+        self,
+        source_conn: sqlite3.Connection,
+        db_path: Path,
+        plan: dict[str, Any],
+        rel_rollouts: dict[str, str],
+    ) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(db_path)) as package_conn:
+            package_conn.row_factory = sqlite3.Row
+            self._create_package_schema(source_conn, package_conn)
+            self._insert_package_threads(source_conn, package_conn, plan, rel_rollouts)
+            self._insert_package_spawn_edges(source_conn, package_conn, plan)
+            self._insert_package_dynamic_tools(source_conn, package_conn, plan)
+            package_conn.commit()
+
+    def _create_package_schema(
+        self,
+        source_conn: sqlite3.Connection,
+        package_conn: sqlite3.Connection,
+    ) -> None:
+        for table_name in PACKAGE_SCHEMA_TABLES:
+            row = source_conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if row and row["sql"]:
+                package_conn.execute(row["sql"])
+
+        index_rows = source_conn.execute(
+            f"""
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND sql IS NOT NULL
+              AND tbl_name IN ({",".join("?" for _ in PACKAGE_SCHEMA_TABLES)})
+            ORDER BY name
+            """,
+            list(PACKAGE_SCHEMA_TABLES),
+        ).fetchall()
+        for row in index_rows:
+            package_conn.execute(row["sql"])
+
+    def _insert_package_threads(
+        self,
+        source_conn: sqlite3.Connection,
+        package_conn: sqlite3.Connection,
+        plan: dict[str, Any],
+        rel_rollouts: dict[str, str],
+    ) -> None:
+        columns = self._table_columns(source_conn, "threads")
+        placeholders = ",".join("?" for _ in columns)
+        column_sql = ",".join(columns)
+        for source_id in plan["_ordered_ids"]:
+            row = dict(plan["_rows"][source_id])
+            row["rollout_path"] = rel_rollouts[source_id]
+            package_conn.execute(
+                f"INSERT INTO threads ({column_sql}) VALUES ({placeholders})",
+                [row.get(column) for column in columns],
+            )
+
+    def _insert_package_spawn_edges(
+        self,
+        source_conn: sqlite3.Connection,
+        package_conn: sqlite3.Connection,
+        plan: dict[str, Any],
+    ) -> None:
+        if not self._table_exists(source_conn, "thread_spawn_edges"):
+            return
+        selected = set(plan["_ordered_ids"])
+        rows = source_conn.execute(
+            """
+            SELECT parent_thread_id, child_thread_id, status
+            FROM thread_spawn_edges
+            ORDER BY parent_thread_id, child_thread_id
+            """
+        ).fetchall()
+        for row in rows:
+            if row["parent_thread_id"] in selected and row["child_thread_id"] in selected:
+                package_conn.execute(
+                    """
+                    INSERT INTO thread_spawn_edges
+                        (parent_thread_id, child_thread_id, status)
+                    VALUES (?, ?, ?)
+                    """,
+                    (row["parent_thread_id"], row["child_thread_id"], row["status"]),
+                )
+
+    def _insert_package_dynamic_tools(
+        self,
+        source_conn: sqlite3.Connection,
+        package_conn: sqlite3.Connection,
+        plan: dict[str, Any],
+    ) -> None:
+        if not self._table_exists(source_conn, "thread_dynamic_tools"):
+            return
+        columns = self._table_columns(source_conn, "thread_dynamic_tools")
+        placeholders = ",".join("?" for _ in columns)
+        column_sql = ",".join(columns)
+        for source_id in plan["_ordered_ids"]:
+            rows = source_conn.execute(
+                "SELECT * FROM thread_dynamic_tools WHERE thread_id = ? ORDER BY position",
+                (source_id,),
+            ).fetchall()
+            for source_row in rows:
+                row = dict(source_row)
+                package_conn.execute(
+                    f"INSERT INTO thread_dynamic_tools ({column_sql}) VALUES ({placeholders})",
+                    [row.get(column) for column in columns],
+                )
+
+    def _package_manifest(
+        self,
+        plan: dict[str, Any],
+        request: ExportPackageRequest,
+        rel_rollouts: dict[str, str],
+    ) -> dict[str, Any]:
+        source_index = self._load_session_index()
+        projects: dict[str, dict[str, Any]] = {}
+        providers: dict[str, int] = {}
+        for source_id in plan["_ordered_ids"]:
+            row = plan["_rows"][source_id]
+            provider = str(row["model_provider"])
+            providers[provider] = providers.get(provider, 0) + 1
+            cwd = str(row["cwd"])
+            normalized_cwd = self._normalize_windows_path(cwd)
+            project = projects.setdefault(
+                cwd,
+                {
+                    "cwd": cwd,
+                    "normalized_cwd": normalized_cwd,
+                    "label": self._project_label(normalized_cwd),
+                    "threads": [],
+                },
+            )
+            index_entry = source_index.get(source_id) or {}
+            thread_name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
+            project["threads"].append(
+                {
+                    "id": source_id,
+                    "title": row.get("title") or "",
+                    "thread_name": thread_name,
+                    "display_title": thread_name or row.get("title") or row.get("preview") or source_id,
+                    "model_provider": provider,
+                    "source": row.get("source"),
+                    "archived": bool(row.get("archived")),
+                    "rollout_path": rel_rollouts[source_id],
+                }
+            )
+
+        return {
+            "format": PACKAGE_FORMAT,
+            "version": PACKAGE_VERSION,
+            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "source_provider": request.source_provider,
+            "source_codex_home": str(self.codex_home),
+            "source_sqlite_home": str(self.sqlite_home),
+            "include_descendants": request.include_descendants,
+            "include_archived": request.include_archived,
+            "thread_count": len(plan["_ordered_ids"]),
+            "providers": providers,
+            "projects": sorted(
+                projects.values(),
+                key=lambda item: (str(item["label"]).lower(), str(item["normalized_cwd"]).lower()),
+            ),
+        }
+
+    def _export_items(self, plan: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+        project_by_thread = {
+            thread["id"]: project
+            for project in manifest["projects"]
+            for thread in project["threads"]
+        }
+        thread_by_id = {
+            thread["id"]: thread
+            for project in manifest["projects"]
+            for thread in project["threads"]
+        }
+        items = []
+        for source_id in plan["_ordered_ids"]:
+            row = plan["_rows"][source_id]
+            project = project_by_thread.get(source_id, {})
+            thread = thread_by_id.get(source_id, {})
+            items.append(
+                {
+                    "source_id": source_id,
+                    "display_title": thread.get("display_title") or row.get("title") or row.get("preview") or source_id,
+                    "source_provider": row.get("model_provider"),
+                    "cwd": row.get("cwd"),
+                    "project_label": project.get("label"),
+                }
+            )
+        return items
+
+    def _write_package_session_index(self, path: Path, plan: dict[str, Any]) -> None:
+        source_index = self._load_session_index()
+        entries = []
+        for source_id in plan["_ordered_ids"]:
+            row = plan["_rows"][source_id]
+            source_entry = source_index.get(source_id) or {}
+            thread_name = source_entry.get("thread_name") if isinstance(source_entry, dict) else None
+            updated_at = source_entry.get("updated_at") if isinstance(source_entry, dict) else None
+            entries.append(
+                {
+                    "id": source_id,
+                    "thread_name": thread_name or row.get("title") or row.get("preview") or source_id,
+                    "updated_at": updated_at or self._thread_row_updated_at_iso(row),
+                }
+            )
+        path.write_text(
+            "".join(compact_json(entry) + "\n" for entry in entries),
+            encoding="utf-8",
+        )
+
+    def _zip_directory(self, source_dir: Path, package_path: Path) -> None:
+        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as package:
+            for path in sorted(source_dir.rglob("*")):
+                if path.is_file():
+                    package.write(path, path.relative_to(source_dir).as_posix())
+
+    def _read_package_manifest(self, package: zipfile.ZipFile) -> dict[str, Any]:
+        try:
+            raw = package.read(PACKAGE_MANIFEST_NAME)
+        except KeyError as exc:
+            raise ValueError(f"Package is missing {PACKAGE_MANIFEST_NAME}") from exc
+        manifest = json.loads(raw.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("Package manifest is not an object")
+        if manifest.get("format") != PACKAGE_FORMAT:
+            raise ValueError("Unsupported package format")
+        if int(manifest.get("version") or 0) > PACKAGE_VERSION:
+            raise ValueError("Package version is newer than this app supports")
+        return manifest
+
+    def _safe_extract_zip(self, package: zipfile.ZipFile, extract_dir: Path) -> None:
+        extract_root = extract_dir.resolve()
+        extract_root.mkdir(parents=True, exist_ok=True)
+        for member in package.infolist():
+            name = member.filename
+            pure = PurePosixPath(name)
+            if (
+                "\\" in name
+                or pure.is_absolute()
+                or any(part in {"", ".", ".."} or ":" in part for part in pure.parts)
+            ):
+                raise ValueError(f"Unsafe package path: {name}")
+            target = (extract_root / Path(*pure.parts)).resolve()
+            if not target.is_relative_to(extract_root):
+                raise ValueError(f"Unsafe package path: {name}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with package.open(member) as source, target.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+
+    def _new_package_extract_dir(self, package_path: Path) -> Path:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        stem = self._safe_package_segment(package_path.stem)
+        return self.package_import_dir / f"{stem}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+    def _materialize_package_rollout_paths(self, db_path: Path, extract_dir: Path) -> None:
+        root = extract_dir.resolve()
+        with closing(self._connect_path(db_path, read_only=False)) as conn:
+            rows = conn.execute("SELECT id, rollout_path FROM threads").fetchall()
+            for row in rows:
+                pure = PurePosixPath(str(row["rollout_path"]).replace("\\", "/"))
+                if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+                    raise ValueError(f"Unsafe rollout path in package DB: {row['rollout_path']}")
+                absolute = (root / Path(*pure.parts)).resolve()
+                if not absolute.is_relative_to(root):
+                    raise ValueError(f"Unsafe rollout path in package DB: {row['rollout_path']}")
+                if not absolute.exists():
+                    raise ValueError(f"Package rollout file missing: {pure.as_posix()}")
+                conn.execute(
+                    "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                    (str(absolute), row["id"]),
+                )
+            conn.commit()
+
+    def _dest_rollout_path_for_import(self, row: dict[str, Any], target_id: str) -> Path:
+        source_path = Path(row["rollout_path"])
+        match = ROLLOUT_NAME_RE.match(source_path.name)
+        if not match:
+            raise ValueError(f"Unsupported rollout file name: {source_path.name}")
+        target_name = f"{match.group('prefix')}{target_id}{match.group('suffix')}"
+        parts = list(source_path.parts)
+        for root_name in ("archived_sessions", "sessions"):
+            if root_name in parts:
+                root_index = len(parts) - 1 - list(reversed(parts)).index(root_name)
+                relative_parts = parts[root_index:-1]
+                return self.codex_home.joinpath(*relative_parts, target_name)
+
+        root_name = "archived_sessions" if int(row.get("archived") or 0) else "sessions"
+        created_at = int(row.get("created_at") or datetime.now(UTC).timestamp())
+        created = datetime.fromtimestamp(created_at, UTC)
+        return self.codex_home / root_name / created.strftime("%Y") / created.strftime("%m") / created.strftime("%d") / target_name
+
 
     def _wal_files(self) -> list[dict[str, Any]]:
         files = []
@@ -1073,10 +2246,19 @@ class CodexSessionTransfer:
             redacted = pattern.sub("[redacted]", redacted)
         return redacted
 
-    def _build_copy_plan(self, conn: sqlite3.Connection, request: CopyRequest) -> dict[str, Any]:
+    def _build_copy_plan(
+        self,
+        conn: sqlite3.Connection,
+        request: CopyRequest,
+        *,
+        target_conn: sqlite3.Connection | None = None,
+        source_index: dict[str, dict[str, Any]] | None = None,
+        dest_path_resolver: Callable[[dict[str, Any], str], Path] | None = None,
+        allow_same_provider: bool = False,
+    ) -> dict[str, Any]:
         errors: list[str] = []
         warnings: list[str] = []
-        session_index = self._load_session_index()
+        session_index = source_index if source_index is not None else self._load_session_index()
         source_provider = request.source_provider.strip()
         target_provider = request.target_provider.strip()
         ordered_ids = self._dedupe(request.thread_ids)
@@ -1085,7 +2267,12 @@ class CodexSessionTransfer:
             errors.append("source_provider is required")
         if not target_provider:
             errors.append("target_provider is required")
-        if source_provider and target_provider and source_provider == target_provider:
+        if (
+            source_provider
+            and target_provider
+            and source_provider == target_provider
+            and not allow_same_provider
+        ):
             errors.append("source_provider and target_provider must be different")
         if not ordered_ids:
             errors.append("Select at least one thread")
@@ -1127,12 +2314,16 @@ class CodexSessionTransfer:
             elif not ROLLOUT_NAME_RE.match(rollout_path.name):
                 errors.append(f"Unsupported rollout file name for thread {thread_id}: {rollout_path.name}")
 
-        id_map = self._new_id_map(conn, final_ids)
+        id_map = self._new_id_map(target_conn or conn, final_ids)
         items = []
         for thread_id in final_ids:
             row = rows[thread_id]
             parent = self._parent_thread_id(conn, thread_id) or self._source_parent_id(row["source"])
-            dest_path = self._dest_rollout_path(Path(row["rollout_path"]), id_map[thread_id])
+            dest_path = (
+                dest_path_resolver(row, id_map[thread_id])
+                if dest_path_resolver
+                else self._dest_rollout_path(Path(row["rollout_path"]), id_map[thread_id])
+            )
             index_entry = session_index.get(thread_id) or {}
             thread_name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
             display_title = thread_name or row["title"] or row["preview"] or thread_id
@@ -1341,9 +2532,17 @@ class CodexSessionTransfer:
             )
 
     def _insert_spawn_edges(self, conn: sqlite3.Connection, plan: dict[str, Any]) -> None:
+        self._insert_spawn_edges_from_source(conn, conn, plan)
+
+    def _insert_spawn_edges_from_source(
+        self,
+        source_conn: sqlite3.Connection,
+        target_conn: sqlite3.Connection,
+        plan: dict[str, Any],
+    ) -> None:
         id_map = plan["_id_map"]
         for source_id in plan["_ordered_ids"]:
-            rows = conn.execute(
+            rows = source_conn.execute(
                 """
                 SELECT parent_thread_id, child_thread_id, status
                 FROM thread_spawn_edges
@@ -1355,7 +2554,7 @@ class CodexSessionTransfer:
                 parent_id = row["parent_thread_id"]
                 child_id = row["child_thread_id"]
                 if parent_id in id_map and child_id in id_map:
-                    conn.execute(
+                    target_conn.execute(
                         """
                         INSERT INTO thread_spawn_edges
                             (parent_thread_id, child_thread_id, status)
@@ -1365,21 +2564,31 @@ class CodexSessionTransfer:
                     )
 
     def _insert_dynamic_tools(self, conn: sqlite3.Connection, plan: dict[str, Any]) -> None:
-        if not self._table_exists(conn, "thread_dynamic_tools"):
+        self._insert_dynamic_tools_from_source(conn, conn, plan)
+
+    def _insert_dynamic_tools_from_source(
+        self,
+        source_conn: sqlite3.Connection,
+        target_conn: sqlite3.Connection,
+        plan: dict[str, Any],
+    ) -> None:
+        if not self._table_exists(source_conn, "thread_dynamic_tools"):
             return
-        columns = self._table_columns(conn, "thread_dynamic_tools")
+        if not self._table_exists(target_conn, "thread_dynamic_tools"):
+            return
+        columns = self._table_columns(target_conn, "thread_dynamic_tools")
         placeholders = ",".join("?" for _ in columns)
         column_sql = ",".join(columns)
         id_map = plan["_id_map"]
         for source_id in plan["_ordered_ids"]:
-            rows = conn.execute(
+            rows = source_conn.execute(
                 "SELECT * FROM thread_dynamic_tools WHERE thread_id = ? ORDER BY position",
                 (source_id,),
             ).fetchall()
             for source_row in rows:
                 row = dict(source_row)
                 row["thread_id"] = id_map[source_id]
-                conn.execute(
+                target_conn.execute(
                     f"INSERT INTO thread_dynamic_tools ({column_sql}) VALUES ({placeholders})",
                     [row.get(column) for column in columns],
                 )
@@ -1396,11 +2605,14 @@ class CodexSessionTransfer:
         return [row["name"] for row in rows]
 
     def _load_session_index(self) -> dict[str, dict[str, Any]]:
-        if not self.session_index_path.exists():
+        return self._load_session_index_from_path(self.session_index_path)
+
+    def _load_session_index_from_path(self, path: Path) -> dict[str, dict[str, Any]]:
+        if not path.exists():
             return {}
         entries: dict[str, dict[str, Any]] = {}
         try:
-            lines = self.session_index_path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return entries
         for line in lines:
@@ -1432,16 +2644,23 @@ class CodexSessionTransfer:
         except FileNotFoundError:
             pass
 
-    def _append_session_index_entries(self, plan: dict[str, Any]) -> list[dict[str, Any]]:
-        source_index = self._load_session_index()
-        existing_ids = set(source_index)
+    def _append_session_index_entries(
+        self,
+        plan: dict[str, Any],
+        *,
+        source_index: dict[str, dict[str, Any]] | None = None,
+        existing_index: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        source_entries = source_index if source_index is not None else self._load_session_index()
+        target_entries = existing_index if existing_index is not None else self._load_session_index()
+        existing_ids = set(target_entries)
         entries: list[dict[str, Any]] = []
         for source_id in plan["_ordered_ids"]:
             target_id = plan["_id_map"][source_id]
             if target_id in existing_ids:
                 continue
             row = plan["_rows"][source_id]
-            source_entry = source_index.get(source_id) or {}
+            source_entry = source_entries.get(source_id) or {}
             thread_name = source_entry.get("thread_name") if isinstance(source_entry, dict) else None
             updated_at = source_entry.get("updated_at") if isinstance(source_entry, dict) else None
             entries.append(
@@ -1638,6 +2857,20 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
             if parsed.path == "/api/session-stats":
                 self._send_json(transfer.session_stats())
                 return
+            if parsed.path == "/api/package-source":
+                self._send_json(transfer.package_status())
+                return
+            if parsed.path == "/api/skills":
+                query = parse_qs(parsed.query)
+                self._send_json(transfer.list_skills(search=query.get("search", [""])[0]))
+                return
+            if parsed.path == "/api/skills-package-source":
+                self._send_json(transfer.skills_package_status())
+                return
+            if parsed.path == "/api/package-skills":
+                query = parse_qs(parsed.query)
+                self._send_json(transfer.list_package_skills(search=query.get("search", [""])[0]))
+                return
             if parsed.path == "/api/threads":
                 query = parse_qs(parsed.query)
                 self._send_json(
@@ -1650,10 +2883,35 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                     )
                 )
                 return
+            if parsed.path == "/api/package-threads":
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    transfer.list_package_threads(
+                        source_provider=query.get("source_provider", [""])[0] or None,
+                        include_archived=parse_bool(query.get("include_archived", [""])[0]),
+                        search=query.get("search", [""])[0],
+                        cwd=query.get("cwd", [""])[0],
+                        source=query.get("source", [""])[0],
+                    )
+                )
+                return
             if parsed.path == "/api/thread-detail":
                 query = parse_qs(parsed.query)
                 self._send_json(
                     transfer.thread_detail(
+                        query.get("id", [""])[0],
+                        item_offset=parse_int(query.get("offset", [""])[0], 0),
+                        item_limit=parse_int(
+                            query.get("limit", [""])[0],
+                            DEFAULT_THREAD_DETAIL_LIMIT,
+                        ),
+                    )
+                )
+                return
+            if parsed.path == "/api/package-thread-detail":
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    transfer.package_thread_detail(
                         query.get("id", [""])[0],
                         item_offset=parse_int(query.get("offset", [""])[0], 0),
                         item_limit=parse_int(
@@ -1687,6 +2945,52 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                         return
                     self._send_json(transfer.repair_session_index_from_manifests())
                     return
+                if self.path == "/api/export-package":
+                    request = ExportPackageRequest.from_json(self._read_json())
+                    self._send_json(transfer.export_package(request))
+                    return
+                if self.path == "/api/load-package":
+                    data = self._read_json()
+                    self._send_json(transfer.load_transfer_package(Path(str(data.get("path", "")).strip())))
+                    return
+                if self.path == "/api/upload-package":
+                    self._send_json(
+                        transfer.load_uploaded_transfer_package(
+                            self._upload_filename("codex-session-package.zip"),
+                            self._read_binary(),
+                        )
+                    )
+                    return
+                if self.path == "/api/unload-package":
+                    self._send_json(transfer.unload_transfer_package())
+                    return
+                if self.path == "/api/export-skills-package":
+                    request = SkillPackageRequest.from_json(self._read_json())
+                    self._send_json(transfer.export_skills_package(request))
+                    return
+                if self.path == "/api/load-skills-package":
+                    data = self._read_json()
+                    self._send_json(transfer.load_skills_package(Path(str(data.get("path", "")).strip())))
+                    return
+                if self.path == "/api/upload-skills-package":
+                    self._send_json(
+                        transfer.load_uploaded_skills_package(
+                            self._upload_filename("codex-skills-package.zip"),
+                            self._read_binary(),
+                        )
+                    )
+                    return
+                if self.path == "/api/unload-skills-package":
+                    self._send_json(transfer.unload_skills_package())
+                    return
+                if self.path == "/api/preview-skill-import":
+                    request = SkillImportRequest.from_json(self._read_json())
+                    self._send_json(transfer.preview_import_skills(request))
+                    return
+                if self.path == "/api/import-skills":
+                    request = SkillImportRequest.from_json(self._read_json())
+                    self._send_json(transfer.import_skills(request))
+                    return
 
                 request = CopyRequest.from_json(self._read_json())
                 if self.path == "/api/preview-copy":
@@ -1694,6 +2998,12 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                     return
                 if self.path == "/api/copy":
                     self._send_json(transfer.copy_threads(request))
+                    return
+                if self.path == "/api/preview-package-copy":
+                    self._send_json(transfer.preview_imported_package_copy(request))
+                    return
+                if self.path == "/api/copy-package":
+                    self._send_json(transfer.copy_imported_package_threads(request))
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
             except ValueError as exc:
@@ -1713,6 +3023,14 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
             if not isinstance(parsed, dict):
                 raise ValueError("JSON body must be an object")
             return parsed
+
+        def _read_binary(self) -> bytes:
+            length = int(self.headers.get("Content-Length", "0"))
+            return self.rfile.read(length)
+
+        def _upload_filename(self, fallback: str) -> str:
+            value = self.headers.get("X-Package-Filename") or fallback
+            return unquote(value)
 
         def _has_action_header(self, action: str) -> bool:
             return self.headers.get("X-Codex-Session-Transfer-Action") == action
