@@ -868,6 +868,54 @@ requires_openai_auth = true
             index_entries[item["id"]] = item
         self.assertEqual(index_entries[target_id]["thread_name"], "Portable renamed")
 
+    def test_imported_package_copy_rewrites_cwd_for_target_project(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_cwd = Path("D:/Users/Administrator/Desktop/2025-CommercialOrder/OnGoingOrders/VideoCaption")
+        target_cwd = "D:\\Users\\hd\\Desktop\\2026-CommercialOrder\\OnGoingOrders\\VideoCaption"
+        self.add_thread(source_id, provider="ProviderA", title="Portable", cwd=source_cwd)
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+
+        target_codex_home = Path(self.temp.name) / "target-cwd" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        create_schema(target_sqlite_home / "state_5.sqlite")
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        loaded = target.load_transfer_package(Path(export["package_path"]))
+        self.assertTrue(loaded["ok"], loaded)
+
+        request = CopyRequest(
+            "ProviderA",
+            "ProviderA",
+            [source_id],
+            False,
+            True,
+            {str(source_cwd): target_cwd},
+        )
+        preview = target.preview_imported_package_copy(request)
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["items"][0]["source_cwd"], str(source_cwd))
+        self.assertEqual(preview["items"][0]["target_cwd"], target_cwd)
+        self.assertTrue(preview["items"][0]["cwd_rewritten"])
+
+        result = target.copy_imported_package_threads(request)
+        self.assertTrue(result["ok"], result)
+        target_id = result["items"][0]["target_id"]
+        with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
+            copied = conn.execute(
+                "SELECT cwd, rollout_path FROM threads WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(copied[0], target_cwd)
+        first_rollout_line = Path(copied[1]).read_text(encoding="utf-8").splitlines()[0]
+        rollout_payload = json.loads(first_rollout_line)["item"]["payload"]
+        self.assertEqual(rollout_payload["cwd"], target_cwd)
+
     def test_uploaded_package_file_is_saved_and_loaded_as_source(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         self.add_thread(source_id, provider="ProviderA", title="Portable")

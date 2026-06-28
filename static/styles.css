@@ -707,6 +707,18 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
   gap: 7px;
 }
 
+.cwd-rewrite-panel {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+}
+
+.cwd-rewrite-panel[hidden] {
+  display: none;
+}
+
 .skills-workbench {
   display: flex;
   min-height: 0;

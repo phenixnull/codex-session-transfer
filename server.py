@@ -60,18 +60,30 @@ class CopyRequest:
     thread_ids: list[str]
     include_descendants: bool
     include_archived: bool
+    cwd_map: dict[str, str] | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "CopyRequest":
         thread_ids = data.get("thread_ids", [])
         if not isinstance(thread_ids, list):
             raise ValueError("thread_ids must be a list")
+        cwd_map_raw = data.get("cwd_map", {})
+        if cwd_map_raw is None:
+            cwd_map_raw = {}
+        if not isinstance(cwd_map_raw, dict):
+            raise ValueError("cwd_map must be an object")
+        cwd_map = {
+            str(source).strip(): str(target).strip()
+            for source, target in cwd_map_raw.items()
+            if str(source).strip() and str(target).strip()
+        }
         return cls(
             source_provider=str(data.get("source_provider", "")).strip(),
             target_provider=str(data.get("target_provider", "")).strip(),
             thread_ids=[str(thread_id).strip() for thread_id in thread_ids if str(thread_id).strip()],
             include_descendants=bool(data.get("include_descendants", False)),
             include_archived=bool(data.get("include_archived", False)),
+            cwd_map=cwd_map,
         )
 
 
@@ -701,6 +713,7 @@ class CodexSessionTransfer:
                             item["source_id"],
                             plan["_id_map"],
                             request.target_provider,
+                            target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
                         )
                         copied_paths.append(Path(item["dest_rollout_path"]))
 
@@ -1241,6 +1254,7 @@ class CodexSessionTransfer:
                                 item["source_id"],
                                 plan["_id_map"],
                                 request.target_provider,
+                                target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
                             )
                             copied_paths.append(Path(item["dest_rollout_path"]))
 
@@ -1967,6 +1981,19 @@ class CodexSessionTransfer:
     def _normalize_windows_path(self, path: str) -> str:
         return path[4:] if path.startswith("\\\\?\\") else path
 
+    def _path_match_key(self, path: str) -> str:
+        normalized = self._normalize_windows_path(path).replace("/", "\\").rstrip("\\")
+        return normalized.casefold()
+
+    def _target_cwd_for_source(self, source_cwd: str, cwd_map: dict[str, str]) -> str:
+        if not cwd_map:
+            return source_cwd
+        source_key = self._path_match_key(source_cwd)
+        for mapped_source, mapped_target in cwd_map.items():
+            if self._path_match_key(mapped_source) == source_key:
+                return mapped_target
+        return source_cwd
+
     def _project_label(self, cwd: str) -> str:
         normalized = cwd.rstrip("\\/")
         if not normalized:
@@ -2262,6 +2289,7 @@ class CodexSessionTransfer:
         source_provider = request.source_provider.strip()
         target_provider = request.target_provider.strip()
         ordered_ids = self._dedupe(request.thread_ids)
+        cwd_map = dict(request.cwd_map or {})
 
         if not source_provider:
             errors.append("source_provider is required")
@@ -2316,9 +2344,13 @@ class CodexSessionTransfer:
 
         id_map = self._new_id_map(target_conn or conn, final_ids)
         items = []
+        cwd_by_source_id: dict[str, str] = {}
         for thread_id in final_ids:
             row = rows[thread_id]
             parent = self._parent_thread_id(conn, thread_id) or self._source_parent_id(row["source"])
+            source_cwd = str(row["cwd"])
+            target_cwd = self._target_cwd_for_source(source_cwd, cwd_map)
+            cwd_by_source_id[thread_id] = target_cwd
             dest_path = (
                 dest_path_resolver(row, id_map[thread_id])
                 if dest_path_resolver
@@ -2339,12 +2371,19 @@ class CodexSessionTransfer:
                     "target_provider": target_provider,
                     "source_rollout_path": row["rollout_path"],
                     "dest_rollout_path": str(dest_path),
+                    "source_cwd": source_cwd,
+                    "target_cwd": target_cwd,
+                    "cwd_rewritten": target_cwd != source_cwd,
                     "archived": bool(row["archived"]),
                     "parent_source_id": parent,
                     "parent_target_id": id_map.get(parent),
                     "child_count": self._child_count(conn, thread_id),
                 }
             )
+
+        rewritten_count = sum(1 for item in items if item["cwd_rewritten"])
+        if rewritten_count:
+            warnings.append(f"{rewritten_count} session cwd path(s) will be rewritten for the target project.")
 
         return {
             "can_execute": not errors and bool(items),
@@ -2358,6 +2397,8 @@ class CodexSessionTransfer:
             "_ordered_ids": final_ids,
             "_rows": rows,
             "_id_map": id_map,
+            "_cwd_map": cwd_map,
+            "_cwd_by_source_id": cwd_by_source_id,
         }
 
     def _empty_plan(
@@ -2375,6 +2416,8 @@ class CodexSessionTransfer:
             "_ordered_ids": [],
             "_rows": {},
             "_id_map": {},
+            "_cwd_map": dict(request.cwd_map or {}),
+            "_cwd_by_source_id": {},
         }
 
     def _append_descendants(
@@ -2471,6 +2514,8 @@ class CodexSessionTransfer:
         source_id: str,
         id_map: dict[str, str],
         target_provider: str,
+        *,
+        target_cwd: str | None = None,
     ) -> None:
         if dest_path.exists():
             raise FileExistsError(f"Destination rollout already exists: {dest_path}")
@@ -2481,6 +2526,8 @@ class CodexSessionTransfer:
         payload = self._session_meta_payload(first_line)
         payload["id"] = id_map[source_id]
         payload["model_provider"] = target_provider
+        if target_cwd:
+            payload["cwd"] = target_cwd
         self._remap_optional_meta_id(payload, "parent_thread_id", id_map)
         self._remap_optional_meta_id(payload, "forked_from_id", id_map)
         if "source" in payload:
@@ -2524,6 +2571,7 @@ class CodexSessionTransfer:
                 item["dest_rollout_path"] for item in plan["items"] if item["source_id"] == source_id
             )
             row["model_provider"] = target_provider
+            row["cwd"] = plan.get("_cwd_by_source_id", {}).get(source_id, row["cwd"])
             row["source"] = self._remap_source_text(str(row["source"]), plan["_id_map"])
             values = [row.get(column) for column in columns]
             conn.execute(

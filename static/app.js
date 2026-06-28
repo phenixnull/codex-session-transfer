@@ -24,6 +24,7 @@ const state = {
   skillPreview: null,
   copyResult: "",
   skillsResult: "",
+  cwdRewriteTouched: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -90,13 +91,68 @@ function targetProviderValue() {
 }
 
 function copyRequest() {
-  return {
+  const request = {
     source_provider: $("sourceProvider").value,
     target_provider: targetProviderValue(),
     thread_ids: Array.from(state.selected),
     include_descendants: $("includeDescendants").checked,
     include_archived: $("includeArchived").checked,
   };
+  const cwdMap = packageCwdMap();
+  if (Object.keys(cwdMap).length) request.cwd_map = cwdMap;
+  return request;
+}
+
+function packageCwdMap() {
+  if (!usingPackageSource()) return {};
+  const targetCwd = $("targetCwdInput")?.value.trim() || "";
+  if (!targetCwd) return {};
+
+  const selected = state.selected;
+  const cwdMap = {};
+  for (const project of state.packageSource?.manifest?.projects || []) {
+    const selectedInProject = (project.threads || []).some((thread) => selected.has(thread.id));
+    if (selectedInProject && project.cwd) cwdMap[project.cwd] = targetCwd;
+  }
+  for (const thread of state.sourceThreads || []) {
+    if (selected.has(thread.id) && thread.cwd) cwdMap[thread.cwd] = targetCwd;
+  }
+  return cwdMap;
+}
+
+function pathMatchKey(value) {
+  return String(value || "")
+    .replace(/^\\\\\?\\/, "")
+    .replaceAll("/", "\\")
+    .replace(/\\+$/, "")
+    .toLowerCase();
+}
+
+function packageProjectForSuggestion() {
+  if (!usingPackageSource()) return null;
+  const projects = state.packageSource?.manifest?.projects || [];
+  const selectedProject = $("projectFilter")?.value || "";
+  if (selectedProject) {
+    return projects.find((project) => project.cwd === selectedProject) || null;
+  }
+  return projects.length === 1 ? projects[0] : null;
+}
+
+function suggestedTargetCwd() {
+  const sourceProject = packageProjectForSuggestion();
+  if (!sourceProject) return "";
+  const localProjects = state.stats?.by_project || [];
+  const sourceKey = pathMatchKey(sourceProject.cwd);
+  const matches = localProjects.filter((project) => {
+    return project.label === sourceProject.label && pathMatchKey(project.cwd) !== sourceKey;
+  });
+  return matches.length === 1 ? matches[0].cwd : "";
+}
+
+function applySuggestedTargetCwd() {
+  const input = $("targetCwdInput");
+  if (!input || !usingPackageSource() || state.cwdRewriteTouched) return;
+  input.value = suggestedTargetCwd();
 }
 
 async function loadAll() {
@@ -286,6 +342,8 @@ function renderPackagePanel() {
   const loadButton = $("loadPackageButton");
   const unloadButton = $("unloadPackageButton");
   const pathInput = $("packagePathInput");
+  const rewritePanel = $("packageCwdRewritePanel");
+  const targetCwdInput = $("targetCwdInput");
   if (exportButton) {
     exportButton.disabled = state.mode !== "package" || loaded || state.selected.size === 0;
     exportButton.title = loaded
@@ -298,12 +356,16 @@ function renderPackagePanel() {
     loadButton.disabled = state.mode !== "package";
   }
   if (unloadButton) unloadButton.disabled = !loaded;
+  if (rewritePanel) rewritePanel.hidden = !loaded;
+  if (targetCwdInput) targetCwdInput.disabled = !loaded;
 
   if (!loaded) {
+    if (targetCwdInput && !state.cwdRewriteTouched) targetCwdInput.value = "";
     line.append(message("info", "Local source selected for package export."));
     return;
   }
 
+  applySuggestedTargetCwd();
   const manifest = state.packageSource.manifest || {};
   const packagePath = state.packageSource.package_path || "";
   const projectCount = manifest.projects?.length ?? 0;
@@ -1158,6 +1220,7 @@ function renderPreview(plan) {
       <strong>${escapeHtml(item.display_title || item.title || item.source_id)}</strong>
       <span>${escapeHtml(item.source_provider)} -> ${escapeHtml(item.target_provider)}</span>
       <code>${escapeHtml(item.source_id)} -> ${escapeHtml(item.target_id)}</code>
+      ${item.cwd_rewritten ? `<code>${escapeHtml(shortPath(item.source_cwd))} -> ${escapeHtml(shortPath(item.target_cwd))}</code>` : ""}
     `;
     items.append(node);
   }
@@ -1329,6 +1392,7 @@ async function loadPackageFromPath() {
   state.lastCopiedTargetIds.clear();
   state.activeSession = null;
   state.activeThreadDetail = null;
+  state.cwdRewriteTouched = false;
   ensureProviderSelection();
   renderAllShell();
   await loadThreadLists();
@@ -1354,6 +1418,7 @@ async function loadPackageFromFile(file) {
   state.lastCopiedTargetIds.clear();
   state.activeSession = null;
   state.activeThreadDetail = null;
+  state.cwdRewriteTouched = false;
   ensureProviderSelection();
   renderAllShell();
   await loadThreadLists();
@@ -1364,6 +1429,7 @@ async function unloadPackage() {
   const result = await api("/api/unload-package", { method: "POST", body: "{}" });
   state.packageSource = result;
   state.selected.clear();
+  state.cwdRewriteTouched = false;
   state.activeSession = null;
   state.activeThreadDetail = null;
   ensureProviderSelection();
@@ -1745,7 +1811,15 @@ function bindEvents() {
   $("includeArchived").addEventListener("change", loadThreadLists);
   $("includeDescendants").addEventListener("change", () => invalidatePreview());
   $("sourceFilter").addEventListener("change", loadThreadLists);
-  $("projectFilter").addEventListener("change", loadThreadLists);
+  $("projectFilter").addEventListener("change", () => {
+    applySuggestedTargetCwd();
+    invalidatePreview();
+    loadThreadLists();
+  });
+  $("targetCwdInput").addEventListener("input", () => {
+    state.cwdRewriteTouched = true;
+    invalidatePreview();
+  });
   $("previewButton").addEventListener("click", previewCopy);
   $("copyButton").addEventListener("click", executeCopy);
   $("sessionRenderToggleButton").addEventListener("click", () => setSessionRenderCollapsed(true));
