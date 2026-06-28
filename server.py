@@ -530,6 +530,9 @@ class CodexSessionTransfer:
         search: str = "",
         cwd: str = "",
         source: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        recent_limit: int = 0,
     ) -> list[dict[str, Any]]:
         with closing(self._connect(read_only=True)) as conn:
             return self._list_threads_from_connection(
@@ -540,6 +543,9 @@ class CodexSessionTransfer:
                 search=search,
                 cwd=cwd,
                 source=source,
+                date_from=date_from,
+                date_to=date_to,
+                recent_limit=recent_limit,
             )
 
     def _list_threads_from_connection(
@@ -552,9 +558,13 @@ class CodexSessionTransfer:
         search: str = "",
         cwd: str = "",
         source: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        recent_limit: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = ["1 = 1"]
         params: list[Any] = []
+        updated_expr = "COALESCE(updated_at_ms, updated_at * 1000)"
         if source_provider:
             clauses.append("model_provider = ?")
             params.append(source_provider)
@@ -572,13 +582,24 @@ class CodexSessionTransfer:
         if source:
             clauses.append("source = ?")
             params.append(source)
+        from_ms = self._date_start_ms(date_from)
+        if from_ms is not None:
+            clauses.append(f"{updated_expr} >= ?")
+            params.append(from_ms)
+        to_ms = self._date_start_ms(date_to)
+        if to_ms is not None:
+            clauses.append(f"{updated_expr} < ?")
+            params.append(to_ms + 24 * 60 * 60 * 1000)
 
         query = f"""
             SELECT *
             FROM threads
             WHERE {' AND '.join(clauses)}
-            ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC
+            ORDER BY {updated_expr} DESC, id DESC
         """
+        if recent_limit > 0:
+            query += "\nLIMIT ?"
+            params.append(recent_limit)
         rows = conn.execute(query, params).fetchall()
         return [self._thread_summary(conn, row, session_index) for row in rows]
 
@@ -1150,6 +1171,9 @@ class CodexSessionTransfer:
         search: str = "",
         cwd: str = "",
         source: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        recent_limit: int = 0,
     ) -> list[dict[str, Any]]:
         package = self._require_loaded_package()
         with closing(self._connect_path(package.db_path, read_only=True)) as conn:
@@ -1161,6 +1185,9 @@ class CodexSessionTransfer:
                 search=search,
                 cwd=cwd,
                 source=source,
+                date_from=date_from,
+                date_to=date_to,
+                recent_limit=recent_limit,
             )
 
     def package_thread_detail(
@@ -1980,6 +2007,16 @@ class CodexSessionTransfer:
 
     def _normalize_windows_path(self, path: str) -> str:
         return path[4:] if path.startswith("\\\\?\\") else path
+
+    def _date_start_ms(self, value: str) -> int | None:
+        clean = str(value or "").strip()
+        if not clean:
+            return None
+        try:
+            parsed = datetime.fromisoformat(clean).date()
+        except ValueError:
+            return None
+        return int(datetime(parsed.year, parsed.month, parsed.day, tzinfo=UTC).timestamp() * 1000)
 
     def _path_match_key(self, path: str) -> str:
         normalized = self._normalize_windows_path(path).replace("/", "\\").rstrip("\\")
@@ -2928,6 +2965,9 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                         search=query.get("search", [""])[0],
                         cwd=query.get("cwd", [""])[0],
                         source=query.get("source", [""])[0],
+                        date_from=query.get("date_from", [""])[0],
+                        date_to=query.get("date_to", [""])[0],
+                        recent_limit=max(0, parse_int(query.get("recent_limit", [""])[0], 0)),
                     )
                 )
                 return
@@ -2940,6 +2980,9 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                         search=query.get("search", [""])[0],
                         cwd=query.get("cwd", [""])[0],
                         source=query.get("source", [""])[0],
+                        date_from=query.get("date_from", [""])[0],
+                        date_to=query.get("date_to", [""])[0],
+                        recent_limit=max(0, parse_int(query.get("recent_limit", [""])[0], 0)),
                     )
                 )
                 return

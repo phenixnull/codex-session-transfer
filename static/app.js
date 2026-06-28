@@ -183,9 +183,17 @@ function threadQueryParams(provider, options = {}) {
     search: $("searchInput").value.trim(),
   });
   const omitSourceFilters = options.target && usingPackageSource();
+  appendSourceThreadFilters(params, { omitSourceFilters });
+  return params;
+}
+
+function appendSourceThreadFilters(params, { omitSourceFilters = false } = {}) {
+  const recentLimit = $("recentLimitFilter").value.trim();
   params.set("source", omitSourceFilters ? "" : $("sourceFilter").value);
   params.set("cwd", omitSourceFilters ? "" : $("projectFilter").value);
-  return params;
+  params.set("date_from", omitSourceFilters ? "" : $("dateFromFilter").value);
+  params.set("date_to", omitSourceFilters ? "" : $("dateToFilter").value);
+  params.set("recent_limit", omitSourceFilters ? "" : recentLimit);
 }
 
 async function loadThreadLists(options = {}) {
@@ -203,9 +211,8 @@ async function loadSourceThreads(options = {}) {
     source_provider: $("sourceProvider").value,
     include_archived: $("includeArchived").checked ? "true" : "false",
     search: $("searchInput").value.trim(),
-    source: $("sourceFilter").value,
-    cwd: $("projectFilter").value,
   });
+  appendSourceThreadFilters(params);
   state.sourceThreads = await api(`${sourceThreadsEndpoint()}?${params.toString()}`);
   renderSourceFilter();
   renderSourceThreads();
@@ -1808,6 +1815,9 @@ function bindEvents() {
     loadTargetThreads();
   });
   $("searchInput").addEventListener("input", debounce(loadThreadLists, 250));
+  $("dateFromFilter").addEventListener("change", loadThreadLists);
+  $("dateToFilter").addEventListener("change", loadThreadLists);
+  $("recentLimitFilter").addEventListener("input", debounce(loadThreadLists, 250));
   $("includeArchived").addEventListener("change", loadThreadLists);
   $("includeDescendants").addEventListener("change", () => invalidatePreview());
   $("sourceFilter").addEventListener("change", loadThreadLists);

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import zipfile
 from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 
 from server import (
@@ -158,14 +159,16 @@ def insert_thread(
     archived: bool = False,
     source: object = "cli",
     cwd: Path | None = None,
+    updated_at_ms: int = 1_781_000_100_000,
 ) -> None:
+    updated_at = updated_at_ms // 1000
     values = {
         "id": thread_id,
         "rollout_path": str(rollout_path),
         "created_at": 1_781_000_000,
-        "updated_at": 1_781_000_100,
+        "updated_at": updated_at,
         "created_at_ms": 1_781_000_000_000,
-        "updated_at_ms": 1_781_000_100_000,
+        "updated_at_ms": updated_at_ms,
         "source": source if isinstance(source, str) else compact_json(source),
         "thread_source": None,
         "agent_nickname": None,
@@ -228,6 +231,7 @@ class SessionTransferTests(unittest.TestCase):
         source: object = "cli",
         parent_thread_id: str | None = None,
         cwd: Path | None = None,
+        updated_at_ms: int = 1_781_000_100_000,
     ) -> Path:
         rollout_path = write_rollout(
             self.codex_home,
@@ -247,8 +251,12 @@ class SessionTransferTests(unittest.TestCase):
             archived=archived,
             source=source,
             cwd=cwd,
+            updated_at_ms=updated_at_ms,
         )
         return rollout_path
+
+    def updated_ms(self, year: int, month: int, day: int, hour: int = 12) -> int:
+        return int(datetime(year, month, day, hour, tzinfo=UTC).timestamp() * 1000)
 
     def write_session_index(self, thread_id: str, thread_name: str) -> None:
         self.codex_home.mkdir(parents=True, exist_ok=True)
@@ -299,6 +307,57 @@ class SessionTransferTests(unittest.TestCase):
         self.assertTrue(by_id[existing_id]["rollout_exists"])
         self.assertTrue(by_id[empty_preview_id]["hidden_empty_preview"])
         self.assertFalse(by_id[missing_id]["rollout_exists"])
+
+    def test_list_threads_filters_by_project_and_updated_date(self) -> None:
+        project = Path(self.temp.name) / "project-a"
+        other_project = Path(self.temp.name) / "project-b"
+        old_id = "11111111-1111-4111-8111-111111111111"
+        match_id = "22222222-2222-4222-8222-222222222222"
+        other_project_id = "33333333-3333-4333-8333-333333333333"
+        self.add_thread(old_id, title="Old", cwd=project, updated_at_ms=self.updated_ms(2026, 6, 13))
+        self.add_thread(match_id, title="Match", cwd=project, updated_at_ms=self.updated_ms(2026, 6, 14))
+        self.add_thread(
+            other_project_id,
+            title="Other project",
+            cwd=other_project,
+            updated_at_ms=self.updated_ms(2026, 6, 14),
+        )
+
+        threads = self.transfer.list_threads(
+            source_provider="ProviderA",
+            include_archived=True,
+            cwd=str(project),
+            date_from="2026-06-14",
+            date_to="2026-06-14",
+        )
+
+        self.assertEqual([thread["id"] for thread in threads], [match_id])
+
+    def test_list_threads_applies_recent_limit_after_project_filter(self) -> None:
+        project = Path(self.temp.name) / "project-a"
+        other_project = Path(self.temp.name) / "project-b"
+        older_id = "11111111-1111-4111-8111-111111111111"
+        newest_id = "22222222-2222-4222-8222-222222222222"
+        middle_id = "33333333-3333-4333-8333-333333333333"
+        other_project_id = "44444444-4444-4444-8444-444444444444"
+        self.add_thread(older_id, title="Older", cwd=project, updated_at_ms=self.updated_ms(2026, 6, 11))
+        self.add_thread(newest_id, title="Newest", cwd=project, updated_at_ms=self.updated_ms(2026, 6, 13))
+        self.add_thread(middle_id, title="Middle", cwd=project, updated_at_ms=self.updated_ms(2026, 6, 12))
+        self.add_thread(
+            other_project_id,
+            title="Other project",
+            cwd=other_project,
+            updated_at_ms=self.updated_ms(2026, 6, 15),
+        )
+
+        threads = self.transfer.list_threads(
+            source_provider="ProviderA",
+            include_archived=True,
+            cwd=str(project),
+            recent_limit=2,
+        )
+
+        self.assertEqual([thread["id"] for thread in threads], [newest_id, middle_id])
 
     def test_thread_detail_reads_rollout_as_renderable_session_items(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
