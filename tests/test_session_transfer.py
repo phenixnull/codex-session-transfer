@@ -161,18 +161,21 @@ def insert_thread(
     archived: bool = False,
     source: object = "cli",
     cwd: Path | None = None,
+    created_at_ms: int = 1_781_000_000_000,
     updated_at_ms: int = 1_781_000_100_000,
+    thread_source: str | None = None,
 ) -> None:
+    created_at = created_at_ms // 1000
     updated_at = updated_at_ms // 1000
     values = {
         "id": thread_id,
         "rollout_path": str(rollout_path),
-        "created_at": 1_781_000_000,
+        "created_at": created_at,
         "updated_at": updated_at,
-        "created_at_ms": 1_781_000_000_000,
+        "created_at_ms": created_at_ms,
         "updated_at_ms": updated_at_ms,
         "source": source if isinstance(source, str) else compact_json(source),
-        "thread_source": None,
+        "thread_source": thread_source,
         "agent_nickname": None,
         "agent_role": None,
         "agent_path": None,
@@ -265,7 +268,9 @@ class SessionTransferTests(unittest.TestCase):
         source: object = "cli",
         parent_thread_id: str | None = None,
         cwd: Path | None = None,
+        created_at_ms: int = 1_781_000_000_000,
         updated_at_ms: int = 1_781_000_100_000,
+        thread_source: str | None = None,
     ) -> Path:
         rollout_path = write_rollout(
             self.codex_home,
@@ -285,7 +290,9 @@ class SessionTransferTests(unittest.TestCase):
             archived=archived,
             source=source,
             cwd=cwd,
+            created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
+            thread_source=thread_source,
         )
         return rollout_path
 
@@ -1023,6 +1030,83 @@ requires_openai_auth = true
             item = json.loads(line)
             index_entries[item["id"]] = item
         self.assertEqual(index_entries[target_id]["thread_name"], "Portable renamed")
+
+    def test_project_filter_matches_normalized_windows_cwd_variants(self) -> None:
+        first_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        second_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        canonical_cwd = Path("D:/Users/hd/Desktop/2026-CommercialOrder/OnGoingOrders/Papers")
+        extended_cwd = Path("\\\\?\\D:\\Users\\hd\\Desktop\\2026-CommercialOrder\\OnGoingOrders\\Papers")
+        self.add_thread(first_id, title="Canonical", cwd=canonical_cwd)
+        self.add_thread(second_id, title="Extended", cwd=extended_cwd)
+
+        threads = self.transfer.list_threads(
+            source_provider="ProviderA",
+            cwd=str(canonical_cwd),
+        )
+
+        self.assertEqual({thread["id"] for thread in threads}, {first_id, second_id})
+
+    def test_imported_package_copy_refreshes_codex_sidebar_visibility_fields(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Portable",
+            source="exec",
+            thread_source="exec",
+            created_at_ms=1_700_000_000_000,
+            updated_at_ms=1_700_000_100_000,
+        )
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+
+        target_codex_home = Path(self.temp.name) / "target-visible" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        create_schema(target_sqlite_home / "state_5.sqlite")
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        self.assertTrue(target.load_transfer_package(Path(export["package_path"]))["ok"])
+
+        before_copy_ms = int(datetime.now(UTC).timestamp() * 1000)
+        result = target.copy_imported_package_threads(
+            CopyRequest("ProviderA", "ProviderA", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        target_id = result["items"][0]["target_id"]
+        with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
+            copied = conn.execute(
+                """
+                SELECT source, thread_source, created_at_ms, updated_at_ms, rollout_path
+                FROM threads
+                WHERE id = ?
+                """,
+                (target_id,),
+            ).fetchone()
+        self.assertIn(copied[0], {"cli", "vscode"})
+        self.assertEqual(copied[1], "user")
+        self.assertGreaterEqual(copied[2], before_copy_ms)
+        self.assertGreaterEqual(copied[3], before_copy_ms)
+        first_rollout_line = Path(copied[4]).read_text(encoding="utf-8").splitlines()[0]
+        rollout_payload = json.loads(first_rollout_line)["item"]["payload"]
+        self.assertEqual(rollout_payload["source"], copied[0])
+        index_entries = [
+            json.loads(line)
+            for line in (target_codex_home / "session_index.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        copied_index = next(entry for entry in index_entries if entry["id"] == target_id)
+        copied_index_ms = int(
+            datetime.fromisoformat(copied_index["updated_at"].replace("Z", "+00:00")).timestamp()
+            * 1000
+        )
+        self.assertGreaterEqual(copied_index_ms, before_copy_ms)
 
     def test_imported_package_copy_rewrites_cwd_for_target_project(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

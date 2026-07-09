@@ -47,6 +47,9 @@ SECRET_PATTERNS = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
 )
+CODEX_DEFAULT_SOURCE_KINDS = {"cli", "vscode"}
+DEFAULT_IMPORTED_SOURCE_KIND = "vscode"
+DEFAULT_IMPORTED_THREAD_SOURCE = "user"
 
 JSONValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 ProcessChecker = Callable[[], list[dict[str, Any]]]
@@ -620,8 +623,8 @@ class CodexSessionTransfer:
             pattern = f"%{search}%"
             params.extend([pattern, pattern, pattern, pattern])
         if cwd:
-            clauses.append("cwd = ?")
-            params.append(cwd)
+            clauses.append(f"{self._cwd_match_sql()} = ?")
+            params.append(self._path_match_key(cwd))
         if source:
             clauses.append("source = ?")
             params.append(source)
@@ -1323,6 +1326,7 @@ class CodexSessionTransfer:
                         dest_path_resolver=self._dest_rollout_path_for_import,
                         allow_same_provider=True,
                     )
+                    self._prepare_import_visibility_plan(plan)
                     if plan["errors"]:
                         target_conn.rollback()
                         manifest_payload = {
@@ -1341,6 +1345,9 @@ class CodexSessionTransfer:
                                 plan["_id_map"],
                                 request.target_provider,
                                 target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
+                                target_source=plan.get("_target_source_by_source_id", {}).get(
+                                    item["source_id"]
+                                ),
                             )
                             copied_paths.append(Path(item["dest_rollout_path"]))
 
@@ -2096,6 +2103,51 @@ class CodexSessionTransfer:
         normalized = self._normalize_windows_path(path).replace("/", "\\").rstrip("\\")
         return normalized.casefold()
 
+    @staticmethod
+    def _cwd_match_sql() -> str:
+        prefix = "char(92) || char(92) || '?' || char(92)"
+        normalized = (
+            "CASE WHEN substr(cwd, 1, 4) = "
+            f"{prefix} THEN substr(cwd, 5) ELSE cwd END"
+        )
+        return f"lower(rtrim(replace({normalized}, '/', char(92)), char(92)))"
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(datetime.now(UTC).timestamp() * 1000)
+
+    @staticmethod
+    def _ms_to_iso(value: int) -> str:
+        return datetime.fromtimestamp(value / 1000, UTC).isoformat().replace("+00:00", "Z")
+
+    def _imported_at_iso(self, plan: dict[str, Any]) -> str | None:
+        imported_at_ms = plan.get("_imported_at_ms")
+        if not imported_at_ms:
+            return None
+        return self._ms_to_iso(int(imported_at_ms))
+
+    def _prepare_import_visibility_plan(self, plan: dict[str, Any]) -> None:
+        if plan.get("_imported_at_ms") is None:
+            plan["_imported_at_ms"] = self._now_ms()
+        target_source_by_id: dict[str, str] = {}
+        target_thread_source_by_id: dict[str, str] = {}
+        for source_id in plan.get("_ordered_ids", []):
+            row = plan.get("_rows", {}).get(source_id) or {}
+            source_text = str(row.get("source") or "")
+            if self._source_parent_id(source_text):
+                continue
+            target_source_by_id[source_id] = self._codex_default_visible_source(source_text)
+            target_thread_source_by_id[source_id] = DEFAULT_IMPORTED_THREAD_SOURCE
+        plan["_target_source_by_source_id"] = target_source_by_id
+        plan["_target_thread_source_by_source_id"] = target_thread_source_by_id
+
+    @staticmethod
+    def _codex_default_visible_source(source: str) -> str:
+        clean = str(source or "").strip()
+        if clean in CODEX_DEFAULT_SOURCE_KINDS:
+            return clean
+        return DEFAULT_IMPORTED_SOURCE_KIND
+
     def _target_cwd_for_source(self, source_cwd: str, cwd_map: dict[str, str]) -> str:
         if not cwd_map:
             return source_cwd
@@ -2627,6 +2679,7 @@ class CodexSessionTransfer:
         target_provider: str,
         *,
         target_cwd: str | None = None,
+        target_source: str | None = None,
     ) -> None:
         if dest_path.exists():
             raise FileExistsError(f"Destination rollout already exists: {dest_path}")
@@ -2641,7 +2694,9 @@ class CodexSessionTransfer:
             payload["cwd"] = target_cwd
         self._remap_optional_meta_id(payload, "parent_thread_id", id_map)
         self._remap_optional_meta_id(payload, "forked_from_id", id_map)
-        if "source" in payload:
+        if target_source:
+            payload["source"] = target_source
+        elif "source" in payload:
             payload["source"] = self._remap_source_value(payload["source"], id_map)
 
         lines[0] = compact_json(first_line) + "\n"
@@ -2675,6 +2730,10 @@ class CodexSessionTransfer:
         columns = self._table_columns(conn, "threads")
         placeholders = ",".join("?" for _ in columns)
         column_sql = ",".join(columns)
+        imported_at_ms = plan.get("_imported_at_ms")
+        imported_at = int(imported_at_ms) // 1000 if imported_at_ms else None
+        target_source_by_id = plan.get("_target_source_by_source_id", {})
+        target_thread_source_by_id = plan.get("_target_thread_source_by_source_id", {})
         for source_id in plan["_ordered_ids"]:
             row = dict(plan["_rows"][source_id])
             row["id"] = plan["_id_map"][source_id]
@@ -2683,7 +2742,17 @@ class CodexSessionTransfer:
             )
             row["model_provider"] = target_provider
             row["cwd"] = plan.get("_cwd_by_source_id", {}).get(source_id, row["cwd"])
-            row["source"] = self._remap_source_text(str(row["source"]), plan["_id_map"])
+            if source_id in target_source_by_id:
+                row["source"] = target_source_by_id[source_id]
+            else:
+                row["source"] = self._remap_source_text(str(row["source"]), plan["_id_map"])
+            if source_id in target_thread_source_by_id:
+                row["thread_source"] = target_thread_source_by_id[source_id]
+            if imported_at is not None:
+                row["created_at"] = imported_at
+                row["updated_at"] = imported_at
+                row["created_at_ms"] = int(imported_at_ms)
+                row["updated_at_ms"] = int(imported_at_ms)
             values = [row.get(column) for column in columns]
             conn.execute(
                 f"INSERT INTO threads ({column_sql}) VALUES ({placeholders})",
@@ -2821,7 +2890,9 @@ class CodexSessionTransfer:
             row = plan["_rows"][source_id]
             source_entry = source_entries.get(source_id) or {}
             thread_name = source_entry.get("thread_name") if isinstance(source_entry, dict) else None
-            updated_at = source_entry.get("updated_at") if isinstance(source_entry, dict) else None
+            updated_at = self._imported_at_iso(plan) or (
+                source_entry.get("updated_at") if isinstance(source_entry, dict) else None
+            )
             entries.append(
                 {
                     "id": target_id,
