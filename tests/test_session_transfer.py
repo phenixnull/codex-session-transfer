@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ import zipfile
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from server import (
     CodexSessionTransfer,
@@ -219,6 +221,38 @@ class SessionTransferTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_default_sqlite_home_prefers_newer_root_state_database(self) -> None:
+        codex_home = Path(self.temp.name) / "detected-root" / ".codex"
+        legacy_db = codex_home / "sqlite" / "state_5.sqlite"
+        root_db = codex_home / "state_5.sqlite"
+        create_schema(legacy_db)
+        create_schema(root_db)
+        os.utime(legacy_db, (1_000, 1_000))
+        os.utime(root_db, (2_000, 2_000))
+
+        with patch.dict(os.environ, {"CODEX_SQLITE_HOME": ""}):
+            transfer = CodexSessionTransfer(
+                codex_home=codex_home,
+                provider_switch_home=self.switch_home,
+                process_checker=lambda: [],
+            )
+
+        self.assertEqual(transfer.db_path, root_db)
+
+    def test_default_sqlite_home_keeps_legacy_state_database_when_it_is_the_only_one(self) -> None:
+        codex_home = Path(self.temp.name) / "detected-legacy" / ".codex"
+        legacy_db = codex_home / "sqlite" / "state_5.sqlite"
+        create_schema(legacy_db)
+
+        with patch.dict(os.environ, {"CODEX_SQLITE_HOME": ""}):
+            transfer = CodexSessionTransfer(
+                codex_home=codex_home,
+                provider_switch_home=self.switch_home,
+                process_checker=lambda: [],
+            )
+
+        self.assertEqual(transfer.db_path, legacy_db)
 
     def add_thread(
         self,

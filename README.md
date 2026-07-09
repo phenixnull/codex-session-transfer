@@ -51,7 +51,7 @@ The server resolves Codex data from the current user at runtime:
 | Data | Default |
 | --- | --- |
 | Codex home | `CODEX_HOME` or `~/.codex` |
-| SQLite home | `CODEX_SQLITE_HOME` or `~/.codex/sqlite` |
+| SQLite home | `CODEX_SQLITE_HOME`, otherwise the newest `state_5.sqlite` under `~/.codex` or `~/.codex/sqlite` |
 | Session database | `state_5.sqlite` |
 | Session index | `~/.codex/session_index.jsonl` |
 | Transfer packages | `~/.codex/session-transfer/packages` |

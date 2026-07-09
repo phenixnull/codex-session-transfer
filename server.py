@@ -242,8 +242,13 @@ class CodexSessionTransfer:
     ) -> None:
         default_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         self.codex_home = Path(codex_home or default_home)
-        default_sqlite_home = Path(os.environ.get("CODEX_SQLITE_HOME", self.codex_home / "sqlite"))
-        self.sqlite_home = Path(sqlite_home or default_sqlite_home)
+        env_sqlite_home = os.environ.get("CODEX_SQLITE_HOME")
+        if sqlite_home is not None:
+            self.sqlite_home = Path(sqlite_home)
+        elif env_sqlite_home:
+            self.sqlite_home = Path(env_sqlite_home)
+        else:
+            self.sqlite_home = self._detect_sqlite_home(self.codex_home)
         self.db_path = self.sqlite_home / STATE_DB_FILENAME
         default_switch_home = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
         self.provider_switch_home = Path(
@@ -260,6 +265,31 @@ class CodexSessionTransfer:
         self.process_terminator = process_terminator or default_process_terminator
         self.loaded_package: LoadedTransferPackage | None = None
         self.loaded_skill_package: LoadedSkillPackage | None = None
+
+    @classmethod
+    def _detect_sqlite_home(cls, codex_home: Path) -> Path:
+        legacy_home = codex_home / "sqlite"
+        candidates = [codex_home, legacy_home]
+        existing = [home for home in candidates if (home / STATE_DB_FILENAME).exists()]
+        if not existing:
+            return legacy_home
+        return max(
+            existing,
+            key=lambda home: (
+                cls._state_db_activity_score(home / STATE_DB_FILENAME),
+                1 if home == codex_home else 0,
+            ),
+        )
+
+    @staticmethod
+    def _state_db_activity_score(db_path: Path) -> float:
+        if not db_path.exists():
+            return -1.0
+        score = db_path.stat().st_mtime
+        wal_path = Path(str(db_path) + "-wal")
+        if wal_path.exists() and wal_path.stat().st_size > 0:
+            score = max(score, wal_path.stat().st_mtime)
+        return score
 
     def status(self) -> dict[str, Any]:
         integrity = "missing"
