@@ -1052,6 +1052,7 @@ requires_openai_auth = true
             source_id,
             provider="ProviderA",
             title="Portable",
+            archived=True,
             source="exec",
             thread_source="exec",
             created_at_ms=1_700_000_000_000,
@@ -1082,7 +1083,7 @@ requires_openai_auth = true
         with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
             copied = conn.execute(
                 """
-                SELECT source, thread_source, created_at_ms, updated_at_ms, rollout_path
+                SELECT source, thread_source, created_at_ms, updated_at_ms, rollout_path, archived, archived_at
                 FROM threads
                 WHERE id = ?
                 """,
@@ -1092,6 +1093,13 @@ requires_openai_auth = true
         self.assertEqual(copied[1], "user")
         self.assertGreaterEqual(copied[2], before_copy_ms)
         self.assertGreaterEqual(copied[3], before_copy_ms)
+        self.assertEqual(copied[5], 0)
+        self.assertIsNone(copied[6])
+        rollout_path = Path(copied[4])
+        self.assertIn("sessions", rollout_path.parts)
+        self.assertNotIn("archived_sessions", rollout_path.parts)
+        visible_threads = target.list_threads(source_provider="ProviderA")
+        self.assertIn(target_id, {thread["id"] for thread in visible_threads})
         first_rollout_line = Path(copied[4]).read_text(encoding="utf-8").splitlines()[0]
         rollout_payload = json.loads(first_rollout_line)["item"]["payload"]
         self.assertEqual(rollout_payload["source"], copied[0])

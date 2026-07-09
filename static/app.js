@@ -52,6 +52,16 @@ function currentSourceStats() {
   return usingPackageSource() ? state.packageSource.session_stats || {} : state.stats;
 }
 
+function includeArchivedChecked() {
+  return Boolean($("includeArchived")?.checked);
+}
+
+function visibleThreadCount(item) {
+  const total = Number(item?.total ?? 0);
+  const active = Number(item?.active ?? total);
+  return includeArchivedChecked() ? total : active;
+}
+
 function sourceThreadsEndpoint() {
   return usingPackageSource() ? "/api/package-threads" : "/api/threads";
 }
@@ -601,7 +611,7 @@ function renderSourceProviders() {
   for (const provider of providers) {
     const option = document.createElement("option");
     option.value = provider.model_provider;
-    option.textContent = `${provider.model_provider} (${provider.total})`;
+    option.textContent = `${provider.model_provider} (${visibleThreadCount(provider)})`;
     option.title = providerTooltip(provider, currentSourceStats());
     select.append(option);
   }
@@ -729,7 +739,7 @@ function renderProjectFilter() {
   const current = select.value;
   select.replaceChildren(new Option("All projects", ""));
   for (const project of currentSourceStats()?.by_project || []) {
-    const label = `${project.label} (${project.total})`;
+    const label = `${project.label} (${visibleThreadCount(project)})`;
     const option = new Option(label, project.cwd);
     option.title = project.normalized_cwd || project.cwd;
     select.append(option);
@@ -1798,9 +1808,20 @@ function setPage(page) {
 
 function shortPath(value) {
   if (!value) return "";
-  const parts = value.split(/[\\/]/);
+  const text = String(value);
+  const separator = text.includes("\\") ? "\\" : "/";
+  const parts = text.split(/[\\/]/);
   if (parts.length <= 3) return value;
-  return `${parts[0]}\\...\\${parts.slice(-2).join("\\")}`;
+  const tail = parts.slice(-2).join(separator);
+  if (separator === "/" && text.startsWith("/")) {
+    return `/${parts[1]}/.../${tail}`;
+  }
+  if (separator === "\\" && text.startsWith("\\\\")) {
+    const compact = parts.filter(Boolean);
+    if (compact.length <= 3) return value;
+    return `\\\\${compact[0]}\\...\\${compact.slice(-2).join("\\")}`;
+  }
+  return `${parts[0]}${separator}...${separator}${tail}`;
 }
 
 function escapeHtml(value) {

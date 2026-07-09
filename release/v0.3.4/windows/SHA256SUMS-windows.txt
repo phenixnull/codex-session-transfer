@@ -1,0 +1,3 @@
+52feee7c96717a57b14892e45801af789755f1434cad79f77b38d5ad4730acdd  Codex.Session.Transfer-0.3.4-Portable-x64.exe
+d23f6442d06fa003bb459e0c7990b7788a4cd27ed7ef1c541dff79329ec62be2  Codex.Session.Transfer-0.3.4-Setup-x64.exe
+a71aaed367a2cd3a24eb24f72fa795d08a9134de45c66002373fca3161dcd454  latest.yml

@@ -1995,12 +1995,12 @@ class CodexSessionTransfer:
             if root_name in parts:
                 root_index = len(parts) - 1 - list(reversed(parts)).index(root_name)
                 relative_parts = parts[root_index:-1]
+                relative_parts[0] = "sessions"
                 return self.codex_home.joinpath(*relative_parts, target_name)
 
-        root_name = "archived_sessions" if int(row.get("archived") or 0) else "sessions"
         created_at = int(row.get("created_at") or datetime.now(UTC).timestamp())
         created = datetime.fromtimestamp(created_at, UTC)
-        return self.codex_home / root_name / created.strftime("%Y") / created.strftime("%m") / created.strftime("%d") / target_name
+        return self.codex_home / "sessions" / created.strftime("%Y") / created.strftime("%m") / created.strftime("%d") / target_name
 
 
     def _wal_files(self) -> list[dict[str, Any]]:
@@ -2129,6 +2129,7 @@ class CodexSessionTransfer:
     def _prepare_import_visibility_plan(self, plan: dict[str, Any]) -> None:
         if plan.get("_imported_at_ms") is None:
             plan["_imported_at_ms"] = self._now_ms()
+        plan["_unarchive_imported_threads"] = True
         target_source_by_id: dict[str, str] = {}
         target_thread_source_by_id: dict[str, str] = {}
         for source_id in plan.get("_ordered_ids", []):
@@ -2742,6 +2743,9 @@ class CodexSessionTransfer:
             )
             row["model_provider"] = target_provider
             row["cwd"] = plan.get("_cwd_by_source_id", {}).get(source_id, row["cwd"])
+            if plan.get("_unarchive_imported_threads"):
+                row["archived"] = 0
+                row["archived_at"] = None
             if source_id in target_source_by_id:
                 row["source"] = target_source_by_id[source_id]
             else:
