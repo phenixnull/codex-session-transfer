@@ -30,6 +30,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const CUSTOM_TARGET = "__custom__";
 const SESSION_RENDER_PAGE_SIZE = 80;
+const EXPORT_DIR_STORAGE_KEY = "codex-session-transfer.exportDir";
 
 function usingPackageSource() {
   return state.mode === "package" && Boolean(state.packageSource?.loaded);
@@ -126,6 +127,78 @@ function pathMatchKey(value) {
     .replaceAll("/", "\\")
     .replace(/\\+$/, "")
     .toLowerCase();
+}
+
+function storageGet(key) {
+  try {
+    return window.localStorage.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function storageSet(key, value) {
+  try {
+    if (value) window.localStorage.setItem(key, value);
+    else window.localStorage.removeItem(key);
+  } catch {
+    // Ignore unavailable local storage.
+  }
+}
+
+function displayPath(value) {
+  return String(value || "").replace(/^\\\\\?\\/, "");
+}
+
+function appendPath(base, child) {
+  const clean = displayPath(base).replace(/[\\/]+$/, "");
+  if (!clean) return "";
+  const separator = clean.includes("\\") ? "\\" : "/";
+  return `${clean}${separator}${child}`;
+}
+
+function selectedProjectCwd() {
+  return $("projectFilter")?.value || "";
+}
+
+function singleSelectedThreadCwd() {
+  const selectedCwds = Array.from(new Set(
+    state.sourceThreads
+      .filter((thread) => state.selected.has(thread.id))
+      .map((thread) => thread.cwd)
+      .filter(Boolean)
+      .map(displayPath),
+  ));
+  return selectedCwds.length === 1 ? selectedCwds[0] : "";
+}
+
+function inferredExportDir() {
+  const cwd = selectedProjectCwd() || singleSelectedThreadCwd();
+  return appendPath(cwd, "exported");
+}
+
+function currentExportDir() {
+  return storageGet(EXPORT_DIR_STORAGE_KEY) || inferredExportDir();
+}
+
+function syncExportDirInput() {
+  const input = $("exportDirInput");
+  if (!input || document.activeElement === input) return;
+  const value = currentExportDir();
+  input.value = value;
+  input.title = value;
+}
+
+async function openPath(path) {
+  if (!path) return null;
+  const result = await api("/api/open-path", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  if (!result?.ok) {
+    throw new Error((result?.errors || ["Folder was not opened"]).join("; "));
+  }
+  return result;
 }
 
 function packageProjectForSuggestion() {
@@ -344,6 +417,7 @@ function renderPackagePanel() {
   const line = $("packageStatusLine");
   if (!line) return;
   line.replaceChildren();
+  syncExportDirInput();
   const loaded = Boolean(state.packageSource?.loaded);
   const exportButton = $("exportPackageButton");
   const loadButton = $("loadPackageButton");
@@ -696,6 +770,7 @@ function renderSourceThreads() {
       if (checkbox.checked) state.selected.add(thread.id);
       else state.selected.delete(thread.id);
       renderSelectionState();
+      renderPackagePanel();
       invalidatePreview();
     });
     selectCell.append(checkbox);
@@ -1358,17 +1433,24 @@ async function exportPackage() {
       thread_ids: Array.from(state.selected),
       include_descendants: $("includeDescendants").checked,
       include_archived: $("includeArchived").checked,
+      output_path: $("exportDirInput")?.value.trim() || inferredExportDir(),
     }),
   });
+  let openWarning = "";
   if (result.ok && result.package_path) {
     $("packagePathInput").value = result.package_path;
+    try {
+      await openPath(result.package_path);
+    } catch (error) {
+      openWarning = ` Folder was not opened: ${error.message}`;
+    }
   }
   renderPackagePanel();
   setCopyResult(
     result.ok
-      ? `Exported ${result.thread_count || 0} session(s) from ${result.project_count || 0} project(s). Package: ${result.package_path}`
+      ? `Exported ${result.thread_count || 0} session(s) from ${result.project_count || 0} project(s). Package: ${result.package_path}${openWarning}`
       : `Export failed. ${(result.errors || []).join("; ")}`,
-    result.ok ? "success" : "error",
+    result.ok && !openWarning ? "success" : "error",
   );
 }
 
@@ -1757,6 +1839,11 @@ function bindEvents() {
       loadPackageFromPath().catch((error) => setCopyResult(error.message, "error"));
     }
   });
+  $("exportDirInput").addEventListener("input", (event) => {
+    storageSet(EXPORT_DIR_STORAGE_KEY, event.target.value.trim());
+    event.target.title = event.target.value.trim();
+  });
+  $("exportDirInput").addEventListener("blur", syncExportDirInput);
   $("exportSkillsPackageButton").addEventListener("click", () => {
     exportSkillsPackage().catch((error) => setSkillsResult(error.message, "error"));
   });
@@ -1823,6 +1910,7 @@ function bindEvents() {
   $("sourceFilter").addEventListener("change", loadThreadLists);
   $("projectFilter").addEventListener("change", () => {
     applySuggestedTargetCwd();
+    renderPackagePanel();
     invalidatePreview();
     loadThreadLists();
   });
@@ -1841,6 +1929,7 @@ function bindEvents() {
       state.selected.clear();
     }
     renderSourceThreads();
+    renderPackagePanel();
     invalidatePreview();
   });
   $("skillsSelectAll").addEventListener("change", (event) => {

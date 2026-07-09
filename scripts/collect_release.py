@@ -24,10 +24,10 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def artifact_patterns(platform: str) -> list[str]:
+def artifact_patterns(platform: str, version: str) -> list[str]:
     if platform == "win":
-        return ["*.exe", "latest.yml"]
-    return ["*.dmg", "*.zip", "latest-mac.yml"]
+        return [f"*{version}*.exe", "latest.yml"]
+    return [f"*{version}*.dmg", f"*{version}*.zip", "latest-mac.yml"]
 
 
 def release_name(source_name: str) -> str:
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
 
     copied: list[Path] = []
     copied_pairs: list[tuple[Path, Path]] = []
-    for pattern in artifact_patterns(args.platform):
+    for pattern in artifact_patterns(args.platform, version):
         for source in sorted(OUTPUT_DIR.glob(pattern)):
             target = dest / release_name(source.name)
             shutil.copy2(source, target)

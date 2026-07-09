@@ -51,6 +51,7 @@ SECRET_PATTERNS = (
 JSONValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 ProcessChecker = Callable[[], list[dict[str, Any]]]
 ProcessTerminator = Callable[[int], dict[str, Any]]
+PathOpener = Callable[[Path], None]
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,16 @@ def default_process_terminator(pid: int) -> dict[str, Any]:
     return {"ok": True, "pid": pid, "message": "SIGTERM sent"}
 
 
+def default_path_opener(path: Path) -> None:
+    if os.name == "nt":
+        os.startfile(path)  # type: ignore[attr-defined]
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+        return
+    subprocess.Popen(["xdg-open", str(path)])
+
+
 class CodexSessionTransfer:
     def __init__(
         self,
@@ -239,6 +250,7 @@ class CodexSessionTransfer:
         provider_switch_home: Path | None = None,
         process_checker: ProcessChecker | None = None,
         process_terminator: ProcessTerminator | None = None,
+        path_opener: PathOpener | None = None,
     ) -> None:
         default_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         self.codex_home = Path(codex_home or default_home)
@@ -263,6 +275,7 @@ class CodexSessionTransfer:
         self.session_index_path = self.codex_home / SESSION_INDEX_FILENAME
         self.process_checker = process_checker or default_process_checker
         self.process_terminator = process_terminator or default_process_terminator
+        self.path_opener = path_opener or default_path_opener
         self.loaded_package: LoadedTransferPackage | None = None
         self.loaded_skill_package: LoadedSkillPackage | None = None
 
@@ -1094,7 +1107,10 @@ class CodexSessionTransfer:
                     "items": plan["items"],
                 }
 
-            package_path = self._package_output_path(request.output_path)
+            package_path = self._package_output_path(
+                request.output_path,
+                default_dir=self._default_export_dir(plan),
+            )
             try:
                 with tempfile.TemporaryDirectory() as tmp:
                     staging_dir = Path(tmp)
@@ -1120,6 +1136,19 @@ class CodexSessionTransfer:
             "include_archived": request.include_archived,
             "items": self._export_items(plan, manifest),
         }
+
+    def open_path(self, path: Path) -> dict[str, Any]:
+        if str(path).strip() in {"", "."}:
+            return {"ok": False, "errors": ["Path is required"]}
+        target = Path(path).expanduser()
+        if not target.exists():
+            return {"ok": False, "errors": [f"Path not found: {target}"]}
+        opened_path = target.parent if target.is_file() else target
+        try:
+            self.path_opener(opened_path)
+        except Exception as exc:
+            return {"ok": False, "errors": [str(exc)], "opened_path": str(opened_path)}
+        return {"ok": True, "opened_path": str(opened_path)}
 
     def load_transfer_package(self, package_path: Path) -> dict[str, Any]:
         path = Path(package_path).expanduser()
@@ -1573,12 +1602,13 @@ class CodexSessionTransfer:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
 
-    def _package_output_path(self, requested: str) -> Path:
+    def _package_output_path(self, requested: str, *, default_dir: Path | None = None) -> Path:
         if requested:
             path = Path(requested).expanduser()
+            if path.suffix.lower() != ".zip":
+                path = path / self._package_filename()
         else:
-            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            path = self.package_dir / f"codex-session-package-{timestamp}.zip"
+            path = (default_dir or self.package_dir) / self._package_filename()
         if path.suffix.lower() != ".zip":
             path = path.with_suffix(".zip")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1588,6 +1618,20 @@ class CodexSessionTransfer:
             candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
             counter += 1
         return candidate
+
+    def _package_filename(self) -> str:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        return f"codex-session-package-{timestamp}.zip"
+
+    def _default_export_dir(self, plan: dict[str, Any]) -> Path | None:
+        cwd_values = {
+            str(item.get("source_cwd") or "").strip()
+            for item in plan.get("items", [])
+            if str(item.get("source_cwd") or "").strip()
+        }
+        if len(cwd_values) != 1:
+            return None
+        return Path(next(iter(cwd_values))).expanduser() / "exported"
 
     def _stage_transfer_package(
         self,
@@ -3069,6 +3113,10 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                 if self.path == "/api/export-package":
                     request = ExportPackageRequest.from_json(self._read_json())
                     self._send_json(transfer.export_package(request))
+                    return
+                if self.path == "/api/open-path":
+                    data = self._read_json()
+                    self._send_json(transfer.open_path(Path(str(data.get("path", "")).strip())))
                     return
                 if self.path == "/api/load-package":
                     data = self._read_json()

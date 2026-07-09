@@ -697,6 +697,10 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
   min-width: 0;
 }
 
+.export-dir-field {
+  min-width: 0;
+}
+
 .file-input {
   display: none;
 }

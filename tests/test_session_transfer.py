@@ -912,6 +912,69 @@ requires_openai_auth = true
         self.assertTrue(any(name.startswith("sessions/") and first_id in name for name in names))
         self.assertTrue(any(name.startswith("sessions/") and second_id in name for name in names))
 
+    def test_export_package_defaults_to_selected_project_exported_directory(self) -> None:
+        thread_id = "11111111-1111-4111-8111-111111111111"
+        project = Path(self.temp.name) / "paper-project"
+        self.add_thread(thread_id, title="Paper", cwd=project)
+
+        result = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [thread_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        package_path = Path(result["package_path"])
+        self.assertTrue(package_path.exists())
+        self.assertEqual(package_path.parent, project / "exported")
+        self.assertTrue(package_path.name.startswith("codex-session-package-"))
+
+    def test_export_package_writes_inside_requested_export_directory(self) -> None:
+        thread_id = "11111111-1111-4111-8111-111111111111"
+        project = Path(self.temp.name) / "paper-project"
+        export_dir = Path(self.temp.name) / "custom-export"
+        self.add_thread(thread_id, title="Paper", cwd=project)
+
+        result = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [thread_id], False, True, str(export_dir))
+        )
+
+        self.assertTrue(result["ok"], result)
+        package_path = Path(result["package_path"])
+        self.assertTrue(package_path.exists())
+        self.assertEqual(package_path.parent, export_dir)
+        self.assertTrue(package_path.name.startswith("codex-session-package-"))
+
+    def test_open_path_reveals_parent_directory_for_file(self) -> None:
+        opened: list[Path] = []
+        transfer = CodexSessionTransfer(
+            codex_home=self.codex_home,
+            sqlite_home=self.sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+            path_opener=lambda path: opened.append(path),
+        )
+        directory = Path(self.temp.name) / "exports"
+        package_path = directory / "package.zip"
+        directory.mkdir()
+        package_path.write_text("zip", encoding="utf-8")
+
+        result = transfer.open_path(package_path)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(opened, [directory])
+        self.assertEqual(Path(result["opened_path"]), directory)
+
+    def test_open_path_rejects_missing_paths(self) -> None:
+        result = self.transfer.open_path(Path(self.temp.name) / "missing.zip")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Path not found", result["errors"][0])
+
+    def test_open_path_rejects_empty_path(self) -> None:
+        result = self.transfer.open_path(Path(""))
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Path is required", result["errors"][0])
+
     def test_imported_package_can_copy_into_target_machine_with_same_provider(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         self.add_thread(source_id, provider="ProviderA", title="Portable")
