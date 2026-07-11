@@ -50,11 +50,39 @@ SECRET_PATTERNS = (
 CODEX_DEFAULT_SOURCE_KINDS = {"cli", "vscode"}
 DEFAULT_IMPORTED_SOURCE_KIND = "vscode"
 DEFAULT_IMPORTED_THREAD_SOURCE = "user"
+WORKSPACE_MAPPING_MODES = {"preserve_projects", "single_workspace"}
 
 JSONValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 ProcessChecker = Callable[[], list[dict[str, Any]]]
 ProcessTerminator = Callable[[int], dict[str, Any]]
 PathOpener = Callable[[Path], None]
+
+
+@dataclass(frozen=True)
+class WorkspaceMapping:
+    mode: str
+    target_root: str
+    overrides: dict[str, str]
+
+    @classmethod
+    def from_json(cls, data: Any) -> "WorkspaceMapping":
+        if not isinstance(data, dict):
+            raise ValueError("workspace_mapping must be an object")
+        mode = str(data.get("mode", "")).strip()
+        if mode not in WORKSPACE_MAPPING_MODES:
+            raise ValueError("workspace_mapping.mode is invalid")
+        target_root = str(data.get("target_root", "")).strip()
+        if not target_root or not Path(target_root).is_absolute():
+            raise ValueError("workspace_mapping.target_root must be an absolute path")
+        overrides_raw = data.get("overrides", {})
+        if not isinstance(overrides_raw, dict):
+            raise ValueError("workspace_mapping.overrides must be an object")
+        overrides = {
+            str(source).strip(): str(target).strip()
+            for source, target in overrides_raw.items()
+            if str(source).strip() and str(target).strip()
+        }
+        return cls(mode=mode, target_root=target_root, overrides=overrides)
 
 
 @dataclass(frozen=True)
@@ -65,6 +93,7 @@ class CopyRequest:
     include_descendants: bool
     include_archived: bool
     cwd_map: dict[str, str] | None = None
+    workspace_mapping: WorkspaceMapping | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "CopyRequest":
@@ -81,6 +110,14 @@ class CopyRequest:
             for source, target in cwd_map_raw.items()
             if str(source).strip() and str(target).strip()
         }
+        workspace_mapping_raw = data.get("workspace_mapping")
+        workspace_mapping = (
+            WorkspaceMapping.from_json(workspace_mapping_raw)
+            if workspace_mapping_raw is not None
+            else None
+        )
+        if cwd_map and workspace_mapping is not None:
+            raise ValueError("cwd_map and workspace_mapping cannot be used together")
         return cls(
             source_provider=str(data.get("source_provider", "")).strip(),
             target_provider=str(data.get("target_provider", "")).strip(),
@@ -88,6 +125,7 @@ class CopyRequest:
             include_descendants=bool(data.get("include_descendants", False)),
             include_archived=bool(data.get("include_archived", False)),
             cwd_map=cwd_map,
+            workspace_mapping=workspace_mapping,
         )
 
 
@@ -2103,6 +2141,12 @@ class CodexSessionTransfer:
         normalized = self._normalize_windows_path(path).replace("/", "\\").rstrip("\\")
         return normalized.casefold()
 
+    def _source_path_match_key(self, path: str) -> tuple[str, str]:
+        normalized = self._normalize_windows_path(str(path)).rstrip("\\/")
+        if re.match(r"^[A-Za-z]:[\\/]", normalized) or normalized.startswith("\\\\"):
+            return "windows", normalized.replace("/", "\\").casefold()
+        return "posix", str(PurePosixPath(normalized.replace("\\", "/")))
+
     @staticmethod
     def _cwd_match_sql() -> str:
         prefix = "char(92) || char(92) || '?' || char(92)"
@@ -2152,18 +2196,124 @@ class CodexSessionTransfer:
     def _target_cwd_for_source(self, source_cwd: str, cwd_map: dict[str, str]) -> str:
         if not cwd_map:
             return source_cwd
-        source_key = self._path_match_key(source_cwd)
+        source_key = self._source_path_match_key(source_cwd)
         for mapped_source, mapped_target in cwd_map.items():
-            if self._path_match_key(mapped_source) == source_key:
+            if self._source_path_match_key(mapped_source) == source_key:
                 return mapped_target
         return source_cwd
 
     def _project_label(self, cwd: str) -> str:
-        normalized = cwd.rstrip("\\/")
+        normalized = self._normalize_windows_path(str(cwd)).rstrip("\\/")
         if not normalized:
             return cwd
-        name = Path(normalized).name
+        name = re.split(r"[\\/]", normalized)[-1]
         return name or normalized
+
+    def _validate_target_directory(
+        self,
+        value: str,
+        label: str,
+        errors: list[str],
+    ) -> Path | None:
+        target = Path(value)
+        if not target.is_absolute():
+            errors.append(f"{label} must be an absolute directory path: {value}")
+        elif not target.exists():
+            errors.append(f"{label} directory does not exist: {value}")
+        elif not target.is_dir():
+            errors.append(f"{label} is not a directory: {value}")
+        else:
+            return target
+        return None
+
+    @staticmethod
+    def _target_path_match_key(value: str) -> str:
+        return os.path.normcase(os.path.normpath(value))
+
+    def _resolve_workspace_cwds(
+        self,
+        rows: dict[str, dict[str, Any]],
+        final_ids: list[str],
+        mapping: WorkspaceMapping,
+        errors: list[str],
+    ) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        if mapping.mode not in WORKSPACE_MAPPING_MODES:
+            errors.append(f"Unsupported workspace mapping mode: {mapping.mode}")
+
+        target_root = self._validate_target_directory(
+            mapping.target_root,
+            "Target workspace",
+            errors,
+        )
+        root_path = target_root or Path(mapping.target_root)
+        normalized_overrides = {
+            self._source_path_match_key(source): target
+            for source, target in mapping.overrides.items()
+        }
+
+        source_counts: dict[tuple[str, str], int] = {}
+        source_values: dict[tuple[str, str], str] = {}
+        source_order: list[tuple[str, str]] = []
+        for thread_id in final_ids:
+            source_cwd = str(rows[thread_id].get("cwd") or "").strip()
+            if not source_cwd:
+                errors.append(f"Thread {thread_id} has no source cwd")
+                continue
+            source_key = self._source_path_match_key(source_cwd)
+            if source_key not in source_counts:
+                source_counts[source_key] = 0
+                source_values[source_key] = source_cwd
+                source_order.append(source_key)
+            source_counts[source_key] += 1
+
+        targets_by_source: dict[tuple[str, str], str] = {}
+        summaries: list[dict[str, Any]] = []
+        target_sources: dict[str, list[str]] = {}
+        for source_key in source_order:
+            source_cwd = source_values[source_key]
+            override = normalized_overrides.get(source_key)
+            if override:
+                target_cwd = override
+            elif mapping.mode == "single_workspace":
+                target_cwd = str(root_path)
+            else:
+                target_cwd = str(root_path / self._project_label(source_cwd))
+
+            self._validate_target_directory(
+                target_cwd,
+                f"Target for {source_cwd}",
+                errors,
+            )
+            targets_by_source[source_key] = target_cwd
+            target_key = self._target_path_match_key(target_cwd)
+            target_sources.setdefault(target_key, []).append(source_cwd)
+            summaries.append(
+                {
+                    "source_cwd": source_cwd,
+                    "target_cwd": target_cwd,
+                    "project_label": self._project_label(source_cwd),
+                    "session_count": source_counts[source_key],
+                    "overridden": override is not None,
+                }
+            )
+
+        if mapping.mode == "preserve_projects":
+            for target_key, sources in target_sources.items():
+                if len(sources) > 1:
+                    errors.append(
+                        "Multiple source projects resolve to the same target directory "
+                        f"{target_key}: {', '.join(sources)}. Add a project override."
+                    )
+
+        cwd_by_source_id = {}
+        for thread_id in final_ids:
+            source_cwd = str(rows[thread_id].get("cwd") or "").strip()
+            if source_cwd:
+                cwd_by_source_id[thread_id] = targets_by_source.get(
+                    self._source_path_match_key(source_cwd),
+                    source_cwd,
+                )
+        return cwd_by_source_id, summaries
 
     def _thread_summary(
         self,
@@ -2506,15 +2656,27 @@ class CodexSessionTransfer:
             elif not ROLLOUT_NAME_RE.match(rollout_path.name):
                 errors.append(f"Unsupported rollout file name for thread {thread_id}: {rollout_path.name}")
 
+        workspace_mappings: list[dict[str, Any]] = []
+        if request.workspace_mapping is not None:
+            cwd_by_source_id, workspace_mappings = self._resolve_workspace_cwds(
+                rows,
+                final_ids,
+                request.workspace_mapping,
+                errors,
+            )
+        else:
+            cwd_by_source_id = {
+                thread_id: self._target_cwd_for_source(str(rows[thread_id]["cwd"]), cwd_map)
+                for thread_id in final_ids
+            }
+
         id_map = self._new_id_map(target_conn or conn, final_ids)
         items = []
-        cwd_by_source_id: dict[str, str] = {}
         for thread_id in final_ids:
             row = rows[thread_id]
             parent = self._parent_thread_id(conn, thread_id) or self._source_parent_id(row["source"])
             source_cwd = str(row["cwd"])
-            target_cwd = self._target_cwd_for_source(source_cwd, cwd_map)
-            cwd_by_source_id[thread_id] = target_cwd
+            target_cwd = cwd_by_source_id.get(thread_id, source_cwd)
             dest_path = (
                 dest_path_resolver(row, id_map[thread_id])
                 if dest_path_resolver
@@ -2554,6 +2716,7 @@ class CodexSessionTransfer:
             "errors": errors,
             "warnings": warnings,
             "items": items,
+            "workspace_mappings": workspace_mappings,
             "source_provider": source_provider,
             "target_provider": target_provider,
             "include_descendants": request.include_descendants,
@@ -2573,6 +2736,7 @@ class CodexSessionTransfer:
             "errors": errors,
             "warnings": warnings,
             "items": [],
+            "workspace_mappings": [],
             "source_provider": request.source_provider,
             "target_provider": request.target_provider,
             "include_descendants": request.include_descendants,
@@ -2690,6 +2854,8 @@ class CodexSessionTransfer:
         first_line = json.loads(lines[0])
         payload = self._session_meta_payload(first_line)
         payload["id"] = id_map[source_id]
+        if "session_id" in payload:
+            payload["session_id"] = id_map[source_id]
         payload["model_provider"] = target_provider
         if target_cwd:
             payload["cwd"] = target_cwd

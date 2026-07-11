@@ -11,6 +11,7 @@ server.out.log
 server.err.log
 
 output/
+.playwright-cli/
 repos/
 tmp/
 .worktrees/

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -38,8 +38,8 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
     height: 920,
-    minWidth: 980,
-    minHeight: 760,
+    minWidth: 720,
+    minHeight: 480,
     title: "Codex Session Transfer",
     backgroundColor: "#1c1917",
     icon: iconPath(),
@@ -61,6 +61,14 @@ function createWindow() {
 
   win.loadURL(APP_URL);
 }
+
+ipcMain.handle("codex-session-transfer:choose-directory", async (event) => {
+  const parent = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(parent, {
+    properties: ["openDirectory"],
+  });
+  return result.canceled ? null : result.filePaths[0] || null;
+});
 
 async function waitForServer() {
   for (let i = 0; i < 60; i += 1) {

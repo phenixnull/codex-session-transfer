@@ -24,7 +24,9 @@ const state = {
   skillPreview: null,
   copyResult: "",
   skillsResult: "",
-  cwdRewriteTouched: false,
+  workspaceMode: "preserve_projects",
+  workspaceTargetRoot: "",
+  workspaceOverrides: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -109,34 +111,41 @@ function copyRequest() {
     include_descendants: $("includeDescendants").checked,
     include_archived: $("includeArchived").checked,
   };
-  const cwdMap = packageCwdMap();
-  if (Object.keys(cwdMap).length) request.cwd_map = cwdMap;
+  const workspaceMapping = packageWorkspaceMapping();
+  if (workspaceMapping) request.workspace_mapping = workspaceMapping;
   return request;
 }
 
-function packageCwdMap() {
-  if (!usingPackageSource()) return {};
-  const targetCwd = $("targetCwdInput")?.value.trim() || "";
-  if (!targetCwd) return {};
-
-  const selected = state.selected;
-  const cwdMap = {};
-  for (const project of state.packageSource?.manifest?.projects || []) {
-    const selectedInProject = (project.threads || []).some((thread) => selected.has(thread.id));
-    if (selectedInProject && project.cwd) cwdMap[project.cwd] = targetCwd;
-  }
-  for (const thread of state.sourceThreads || []) {
-    if (selected.has(thread.id) && thread.cwd) cwdMap[thread.cwd] = targetCwd;
-  }
-  return cwdMap;
+function selectedPackageProjects() {
+  if (!usingPackageSource()) return [];
+  return window.WorkspaceMapping.selectedProjects(
+    state.packageSource?.manifest,
+    state.selected,
+  );
 }
 
-function pathMatchKey(value) {
-  return String(value || "")
-    .replace(/^\\\\\?\\/, "")
-    .replaceAll("/", "\\")
-    .replace(/\\+$/, "")
-    .toLowerCase();
+function effectiveWorkspaceMappings() {
+  return window.WorkspaceMapping.effectiveMappings(
+    selectedPackageProjects(),
+    state.workspaceTargetRoot,
+    state.workspaceMode,
+    state.workspaceOverrides,
+  );
+}
+
+function packageWorkspaceMapping() {
+  if (!usingPackageSource() || !state.workspaceTargetRoot.trim()) return null;
+  return window.WorkspaceMapping.requestPayload(
+    state.workspaceMode,
+    state.workspaceTargetRoot,
+    effectiveWorkspaceMappings(),
+  );
+}
+
+function resetWorkspaceMappingState() {
+  state.workspaceMode = "preserve_projects";
+  state.workspaceTargetRoot = "";
+  state.workspaceOverrides = {};
 }
 
 function storageGet(key) {
@@ -209,33 +218,6 @@ async function openPath(path) {
     throw new Error((result?.errors || ["Folder was not opened"]).join("; "));
   }
   return result;
-}
-
-function packageProjectForSuggestion() {
-  if (!usingPackageSource()) return null;
-  const projects = state.packageSource?.manifest?.projects || [];
-  const selectedProject = $("projectFilter")?.value || "";
-  if (selectedProject) {
-    return projects.find((project) => project.cwd === selectedProject) || null;
-  }
-  return projects.length === 1 ? projects[0] : null;
-}
-
-function suggestedTargetCwd() {
-  const sourceProject = packageProjectForSuggestion();
-  if (!sourceProject) return "";
-  const localProjects = state.stats?.by_project || [];
-  const sourceKey = pathMatchKey(sourceProject.cwd);
-  const matches = localProjects.filter((project) => {
-    return project.label === sourceProject.label && pathMatchKey(project.cwd) !== sourceKey;
-  });
-  return matches.length === 1 ? matches[0].cwd : "";
-}
-
-function applySuggestedTargetCwd() {
-  const input = $("targetCwdInput");
-  if (!input || !usingPackageSource() || state.cwdRewriteTouched) return;
-  input.value = suggestedTargetCwd();
 }
 
 async function loadAll() {
@@ -434,7 +416,9 @@ function renderPackagePanel() {
   const unloadButton = $("unloadPackageButton");
   const pathInput = $("packagePathInput");
   const rewritePanel = $("packageCwdRewritePanel");
-  const targetCwdInput = $("targetCwdInput");
+  const modeSelect = $("workspaceModeSelect");
+  const targetRootInput = $("workspaceTargetRoot");
+  const pickerButton = $("chooseWorkspaceDirectoryButton");
   if (exportButton) {
     exportButton.disabled = state.mode !== "package" || loaded || state.selected.size === 0;
     exportButton.title = loaded
@@ -448,15 +432,26 @@ function renderPackagePanel() {
   }
   if (unloadButton) unloadButton.disabled = !loaded;
   if (rewritePanel) rewritePanel.hidden = !loaded;
-  if (targetCwdInput) targetCwdInput.disabled = !loaded;
+  if (modeSelect) {
+    modeSelect.disabled = !loaded;
+    modeSelect.value = state.workspaceMode;
+  }
+  if (targetRootInput) {
+    targetRootInput.disabled = !loaded;
+    if (document.activeElement !== targetRootInput) targetRootInput.value = state.workspaceTargetRoot;
+  }
+  if (pickerButton) {
+    pickerButton.hidden = !window.codexDesktop?.chooseDirectory;
+    pickerButton.disabled = !loaded;
+  }
 
   if (!loaded) {
-    if (targetCwdInput && !state.cwdRewriteTouched) targetCwdInput.value = "";
+    renderWorkspaceMappingList();
     line.append(message("info", "Local source selected for package export."));
     return;
   }
 
-  applySuggestedTargetCwd();
+  renderWorkspaceMappingList();
   const manifest = state.packageSource.manifest || {};
   const packagePath = state.packageSource.package_path || "";
   const projectCount = manifest.projects?.length ?? 0;
@@ -465,6 +460,76 @@ function renderPackagePanel() {
     statusPill("Package", packagePath ? shortPath(packagePath) : "Loaded", true),
     statusPill("Contents", `${threadCount} sessions / ${projectCount} projects`, true),
   );
+}
+
+function renderWorkspaceMappingList() {
+  const list = $("workspaceMappingList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!usingPackageSource()) return;
+
+  const mappings = effectiveWorkspaceMappings();
+  if (!mappings.length) {
+    list.append(message("info", "Select sessions to preview their workspace destinations."));
+    return;
+  }
+
+  const duplicates = new Set(window.WorkspaceMapping.duplicateTargets(mappings));
+  for (const entry of mappings) {
+    const row = document.createElement("div");
+    row.className = "workspace-mapping-row";
+
+    const paths = document.createElement("div");
+    paths.className = "workspace-mapping-paths";
+    const label = document.createElement("strong");
+    label.textContent = entry.project.label || window.WorkspaceMapping.projectLabel(entry.sourceCwd);
+    const source = document.createElement("code");
+    source.textContent = displayPath(entry.sourceCwd);
+    source.title = displayPath(entry.sourceCwd);
+    const target = document.createElement("code");
+    target.className = "workspace-target-path";
+    target.textContent = entry.targetCwd ? displayPath(entry.targetCwd) : "Package path unchanged";
+    target.title = entry.targetCwd ? displayPath(entry.targetCwd) : "";
+    paths.append(label, source, target);
+
+    const overrideField = document.createElement("label");
+    overrideField.className = "field workspace-override-field";
+    overrideField.textContent = "Project override";
+    const overrideInput = document.createElement("input");
+    overrideInput.value = state.workspaceOverrides[entry.sourceCwd] || "";
+    overrideInput.placeholder = "Use computed target";
+    overrideInput.dataset.sourceCwd = entry.sourceCwd;
+    overrideInput.addEventListener("input", () => {
+      const value = overrideInput.value.trim();
+      if (value) state.workspaceOverrides[entry.sourceCwd] = value;
+      else delete state.workspaceOverrides[entry.sourceCwd];
+      target.textContent = displayPath(
+        value || window.WorkspaceMapping.computedTarget(
+          state.workspaceTargetRoot,
+          entry.sourceCwd,
+          state.workspaceMode,
+        ),
+      ) || "Package path unchanged";
+      invalidatePreview();
+    });
+    overrideInput.addEventListener("change", renderWorkspaceMappingList);
+    overrideField.append(overrideInput);
+    row.append(paths, overrideField);
+    list.append(row);
+  }
+
+  if (state.workspaceMode === "preserve_projects" && duplicates.size) {
+    list.prepend(message("error", "Multiple projects resolve to the same target. Add a project override."));
+  }
+}
+
+async function chooseWorkspaceDirectory() {
+  const selectedPath = await window.codexDesktop?.chooseDirectory();
+  if (!selectedPath) return;
+  state.workspaceTargetRoot = selectedPath;
+  $("workspaceTargetRoot").value = selectedPath;
+  renderWorkspaceMappingList();
+  invalidatePreview();
 }
 
 function renderSkillsPackagePanel() {
@@ -1305,6 +1370,16 @@ function renderPreview(plan) {
   for (const warning of plan.warnings || []) {
     messages.append(message("warn", warning));
   }
+  for (const mapping of plan.workspace_mappings || []) {
+    const node = document.createElement("div");
+    node.className = "preview-item workspace-preview-item";
+    node.innerHTML = `
+      <strong>${escapeHtml(mapping.project_label || "Workspace")}</strong>
+      <span>${escapeHtml(`${mapping.session_count || 0} session(s)`)}</span>
+      <code>${escapeHtml(shortPath(mapping.source_cwd))} -> ${escapeHtml(shortPath(mapping.target_cwd))}</code>
+    `;
+    items.append(node);
+  }
   for (const item of plan.items || []) {
     const node = document.createElement("div");
     node.className = "preview-item";
@@ -1491,7 +1566,7 @@ async function loadPackageFromPath() {
   state.lastCopiedTargetIds.clear();
   state.activeSession = null;
   state.activeThreadDetail = null;
-  state.cwdRewriteTouched = false;
+  resetWorkspaceMappingState();
   ensureProviderSelection();
   renderAllShell();
   await loadThreadLists();
@@ -1517,7 +1592,7 @@ async function loadPackageFromFile(file) {
   state.lastCopiedTargetIds.clear();
   state.activeSession = null;
   state.activeThreadDetail = null;
-  state.cwdRewriteTouched = false;
+  resetWorkspaceMappingState();
   ensureProviderSelection();
   renderAllShell();
   await loadThreadLists();
@@ -1528,7 +1603,7 @@ async function unloadPackage() {
   const result = await api("/api/unload-package", { method: "POST", body: "{}" });
   state.packageSource = result;
   state.selected.clear();
-  state.cwdRewriteTouched = false;
+  resetWorkspaceMappingState();
   state.activeSession = null;
   state.activeThreadDetail = null;
   ensureProviderSelection();
@@ -1930,14 +2005,22 @@ function bindEvents() {
   $("includeDescendants").addEventListener("change", () => invalidatePreview());
   $("sourceFilter").addEventListener("change", loadThreadLists);
   $("projectFilter").addEventListener("change", () => {
-    applySuggestedTargetCwd();
     renderPackagePanel();
     invalidatePreview();
     loadThreadLists();
   });
-  $("targetCwdInput").addEventListener("input", () => {
-    state.cwdRewriteTouched = true;
+  $("workspaceModeSelect").addEventListener("change", (event) => {
+    state.workspaceMode = event.target.value;
+    renderWorkspaceMappingList();
     invalidatePreview();
+  });
+  $("workspaceTargetRoot").addEventListener("input", (event) => {
+    state.workspaceTargetRoot = event.target.value;
+    renderWorkspaceMappingList();
+    invalidatePreview();
+  });
+  $("chooseWorkspaceDirectoryButton").addEventListener("click", () => {
+    chooseWorkspaceDirectory().catch((error) => setCopyResult(error.message, "error"));
   });
   $("previewButton").addEventListener("click", previewCopy);
   $("copyButton").addEventListener("click", executeCopy);

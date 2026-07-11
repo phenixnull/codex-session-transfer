@@ -145,10 +145,28 @@
                 </label>
                 <div id="packageStatusLine" class="package-status-line"></div>
                 <div id="packageCwdRewritePanel" class="cwd-rewrite-panel" hidden>
-                  <label class="field cwd-rewrite-field">
-                    Target project path
-                    <input id="targetCwdInput" placeholder="Leave blank to preserve package paths">
-                  </label>
+                  <div class="workspace-settings">
+                    <label class="field workspace-mode-field">
+                      Workspace layout
+                      <select id="workspaceModeSelect">
+                        <option value="preserve_projects">Preserve projects</option>
+                        <option value="single_workspace">Single workspace</option>
+                      </select>
+                    </label>
+                    <div class="workspace-root-field">
+                      <label class="field">
+                        Target workspace root
+                        <input id="workspaceTargetRoot" placeholder="Leave blank to keep package paths">
+                      </label>
+                      <button id="chooseWorkspaceDirectoryButton" class="icon-button workspace-picker" type="button" title="Choose target workspace folder" aria-label="Choose target workspace folder">
+                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M3 7h6l2 2h10v10H3z"></path>
+                          <path d="M3 7V5h7l2 2"></path>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                  <div id="workspaceMappingList" class="workspace-mapping-list" aria-live="polite"></div>
                 </div>
               </section>
 
@@ -457,6 +475,7 @@
       </section>
     </main>
 
+    <script src="./workspace-mapping.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>
