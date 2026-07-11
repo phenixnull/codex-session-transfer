@@ -15,6 +15,7 @@ from server import (
     ExportPackageRequest,
     SkillImportRequest,
     SkillPackageRequest,
+    WorkspaceMapping,
 )
 
 
@@ -257,6 +258,71 @@ class SessionTransferTests(unittest.TestCase):
 
         self.assertEqual(transfer.db_path, legacy_db)
 
+    def test_copy_request_parses_workspace_mapping(self) -> None:
+        target_root = Path(self.temp.name) / "target-root"
+        source_cwd = "C:\\old\\ProjectA"
+        target_project = target_root / "ProjectA-renamed"
+
+        request = CopyRequest.from_json(
+            {
+                "source_provider": "ProviderA",
+                "target_provider": "ProviderB",
+                "thread_ids": ["thread-a"],
+                "workspace_mapping": {
+                    "mode": "preserve_projects",
+                    "target_root": str(target_root),
+                    "overrides": {source_cwd: str(target_project)},
+                },
+            }
+        )
+
+        self.assertIsNotNone(request.workspace_mapping)
+        self.assertEqual(request.workspace_mapping.mode, "preserve_projects")
+        self.assertEqual(request.workspace_mapping.target_root, str(target_root))
+        self.assertEqual(
+            request.workspace_mapping.overrides,
+            {source_cwd: str(target_project)},
+        )
+
+    def test_copy_request_rejects_invalid_workspace_mapping_shapes(self) -> None:
+        base = {
+            "source_provider": "ProviderA",
+            "target_provider": "ProviderB",
+            "thread_ids": ["thread-a"],
+        }
+
+        invalid_mappings = [
+            "not-an-object",
+            {"mode": "unknown", "target_root": str(Path(self.temp.name))},
+            {
+                "mode": "preserve_projects",
+                "target_root": str(Path(self.temp.name)),
+                "overrides": [],
+            },
+            {"mode": "single_workspace", "target_root": "relative/path"},
+        ]
+        for workspace_mapping in invalid_mappings:
+            with self.subTest(workspace_mapping=workspace_mapping):
+                with self.assertRaises(ValueError):
+                    CopyRequest.from_json({**base, "workspace_mapping": workspace_mapping})
+
+    def test_copy_request_rejects_legacy_and_workspace_mapping_together(self) -> None:
+        target_root = Path(self.temp.name) / "target-root"
+
+        with self.assertRaises(ValueError):
+            CopyRequest.from_json(
+                {
+                    "source_provider": "ProviderA",
+                    "target_provider": "ProviderB",
+                    "thread_ids": ["thread-a"],
+                    "cwd_map": {"C:\\old\\ProjectA": str(target_root / "ProjectA")},
+                    "workspace_mapping": {
+                        "mode": "preserve_projects",
+                        "target_root": str(target_root),
+                    },
+                }
+            )
+
     def add_thread(
         self,
         thread_id: str,
@@ -295,6 +361,24 @@ class SessionTransferTests(unittest.TestCase):
             thread_source=thread_source,
         )
         return rollout_path
+
+    def loaded_package_target(
+        self,
+        package_path: Path,
+        name: str,
+    ) -> tuple[CodexSessionTransfer, Path]:
+        target_codex_home = Path(self.temp.name) / name / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        create_schema(target_sqlite_home / "state_5.sqlite")
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        loaded = target.load_transfer_package(package_path)
+        self.assertTrue(loaded["ok"], loaded)
+        return target, target_sqlite_home
 
     def updated_ms(self, year: int, month: int, day: int, hour: int = 12) -> int:
         return int(datetime(year, month, day, hour, tzinfo=UTC).timestamp() * 1000)
@@ -1163,6 +1247,222 @@ requires_openai_auth = true
         first_rollout_line = Path(copied[1]).read_text(encoding="utf-8").splitlines()[0]
         rollout_payload = json.loads(first_rollout_line)["item"]["payload"]
         self.assertEqual(rollout_payload["cwd"], target_cwd)
+
+    def test_imported_package_preview_preserves_projects_under_target_root(self) -> None:
+        first_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        second_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        first_cwd = Path("C:/source/ProjectA")
+        second_cwd = Path("D:/source/ProjectB")
+        self.add_thread(first_id, cwd=first_cwd)
+        self.add_thread(second_id, cwd=second_cwd)
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [first_id, second_id], False, True)
+        )
+        target, _ = self.loaded_package_target(Path(export["package_path"]), "preserve-target")
+        target_root = Path(self.temp.name) / "workspaces"
+        (target_root / "ProjectA").mkdir(parents=True)
+        (target_root / "ProjectB").mkdir()
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                [first_id, second_id],
+                False,
+                True,
+                workspace_mapping=WorkspaceMapping(
+                    "preserve_projects",
+                    str(target_root),
+                    {},
+                ),
+            )
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        targets = {item["source_cwd"]: item["target_cwd"] for item in preview["items"]}
+        self.assertEqual(targets[str(first_cwd)], str(target_root / "ProjectA"))
+        self.assertEqual(targets[str(second_cwd)], str(target_root / "ProjectB"))
+        self.assertEqual(len(preview["workspace_mappings"]), 2)
+
+    def test_imported_package_preview_maps_projects_to_single_workspace(self) -> None:
+        first_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        second_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        self.add_thread(first_id, cwd=Path("C:/source/ProjectA"))
+        self.add_thread(second_id, cwd=Path("D:/source/ProjectB"))
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [first_id, second_id], False, True)
+        )
+        target, _ = self.loaded_package_target(Path(export["package_path"]), "single-target")
+        target_workspace = Path(self.temp.name) / "single-workspace"
+        target_workspace.mkdir()
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                [first_id, second_id],
+                False,
+                True,
+                workspace_mapping=WorkspaceMapping(
+                    "single_workspace",
+                    str(target_workspace),
+                    {},
+                ),
+            )
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(
+            {item["target_cwd"] for item in preview["items"]},
+            {str(target_workspace)},
+        )
+
+    def test_imported_package_preview_applies_project_override(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_cwd = Path("C:/source/ProjectA")
+        self.add_thread(source_id, cwd=source_cwd)
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+        target, _ = self.loaded_package_target(Path(export["package_path"]), "override-target")
+        target_root = Path(self.temp.name) / "override-root"
+        override = Path(self.temp.name) / "renamed-project"
+        target_root.mkdir()
+        override.mkdir()
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                [source_id],
+                False,
+                True,
+                workspace_mapping=WorkspaceMapping(
+                    "preserve_projects",
+                    str(target_root),
+                    {str(source_cwd): str(override)},
+                ),
+            )
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["items"][0]["target_cwd"], str(override))
+
+    def test_imported_package_preview_rejects_duplicate_preserved_project_names(self) -> None:
+        first_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        second_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        self.add_thread(first_id, cwd=Path("C:/source-one/Same"))
+        self.add_thread(second_id, cwd=Path("D:/source-two/Same"))
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [first_id, second_id], False, True)
+        )
+        target, _ = self.loaded_package_target(Path(export["package_path"]), "duplicate-target")
+        target_root = Path(self.temp.name) / "duplicate-root"
+        (target_root / "Same").mkdir(parents=True)
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                [first_id, second_id],
+                False,
+                True,
+                workspace_mapping=WorkspaceMapping(
+                    "preserve_projects",
+                    str(target_root),
+                    {},
+                ),
+            )
+        )
+
+        self.assertFalse(preview["can_execute"])
+        self.assertIn("same target", " ".join(preview["errors"]).lower())
+
+    def test_imported_package_preview_maps_descendant_with_different_cwd(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        child_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        parent_cwd = Path("C:/source/ParentProject")
+        child_cwd = Path("C:/source/ChildWorktree")
+        self.add_thread(parent_id, cwd=parent_cwd)
+        self.add_thread(
+            child_id,
+            cwd=child_cwd,
+            parent_thread_id=parent_id,
+            source={"subagent": {"thread_spawn": {"parent_thread_id": parent_id}}},
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO thread_spawn_edges VALUES (?, ?, ?)",
+                (parent_id, child_id, "open"),
+            )
+            conn.commit()
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [parent_id], True, True)
+        )
+        target, _ = self.loaded_package_target(Path(export["package_path"]), "descendant-target")
+        target_root = Path(self.temp.name) / "descendant-root"
+        (target_root / "ParentProject").mkdir(parents=True)
+        (target_root / "ChildWorktree").mkdir()
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                [parent_id],
+                True,
+                True,
+                workspace_mapping=WorkspaceMapping(
+                    "preserve_projects",
+                    str(target_root),
+                    {},
+                ),
+            )
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        targets = {item["source_id"]: item["target_cwd"] for item in preview["items"]}
+        self.assertEqual(targets[parent_id], str(target_root / "ParentProject"))
+        self.assertEqual(targets[child_id], str(target_root / "ChildWorktree"))
+
+    def test_imported_package_preview_rejects_invalid_target_directories(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, cwd=Path("C:/source/ProjectA"))
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+        target, _ = self.loaded_package_target(Path(export["package_path"]), "invalid-target")
+        missing = Path(self.temp.name) / "missing-workspace"
+        file_target = Path(self.temp.name) / "workspace-file"
+        file_target.write_text("not a directory", encoding="utf-8")
+
+        for invalid_target in (missing, file_target):
+            with self.subTest(invalid_target=invalid_target):
+                preview = target.preview_imported_package_copy(
+                    CopyRequest(
+                        "ProviderA",
+                        "ProviderA",
+                        [source_id],
+                        False,
+                        True,
+                        workspace_mapping=WorkspaceMapping(
+                            "single_workspace",
+                            str(invalid_target),
+                            {},
+                        ),
+                    )
+                )
+                self.assertFalse(preview["can_execute"])
+                self.assertIn("directory", " ".join(preview["errors"]).lower())
+
+    def test_source_path_matching_is_windows_aware_without_folding_posix_case(self) -> None:
+        self.assertEqual(
+            self.transfer._source_path_match_key("\\\\?\\C:\\Work\\Repo\\"),
+            self.transfer._source_path_match_key("c:/work/repo"),
+        )
+        self.assertNotEqual(
+            self.transfer._source_path_match_key("/Work/Repo"),
+            self.transfer._source_path_match_key("/work/repo"),
+        )
 
     def test_uploaded_package_file_is_saved_and_loaded_as_source(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
