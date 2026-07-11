@@ -13,6 +13,7 @@ server.err.log
 output/
 repos/
 tmp/
+.worktrees/
 dist/
 build/
 coverage/
