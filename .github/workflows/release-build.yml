@@ -50,10 +50,15 @@ jobs:
       - name: Build packaged app
         run: npm run ${{ matrix.npm_script }}
 
+      - name: Resolve release directory
+        id: release_dir
+        shell: bash
+        run: echo "path=release/v$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
+
       - uses: actions/upload-artifact@v4
         with:
           name: codex-session-transfer-${{ matrix.platform }}
-          path: release/v*/**
+          path: ${{ steps.release_dir.outputs.path }}/**
           if-no-files-found: error
 
   github-release:
