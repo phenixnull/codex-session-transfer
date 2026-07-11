@@ -29,6 +29,8 @@ assert.equal(mapping.projectLabel('C:\\old\\ProjectA\\'), 'ProjectA');
 assert.equal(mapping.projectLabel('/Users/source/ProjectB/'), 'ProjectB');
 assert.equal(mapping.joinPath('D:\\CodexWork\\', 'ProjectA'), 'D:\\CodexWork\\ProjectA');
 assert.equal(mapping.joinPath('/Users/target/', 'ProjectB'), '/Users/target/ProjectB');
+assert.equal(mapping.joinPath('D:\\', 'ProjectA'), 'D:\\ProjectA');
+assert.equal(mapping.joinPath('/', 'ProjectB'), '/ProjectB');
 
 assert.equal(
   mapping.computedTarget('D:\\CodexWork', 'C:\\old\\ProjectA', 'preserve_projects'),
@@ -66,6 +68,39 @@ assert.deepEqual(
     { sourceCwd: '/two/Same', targetCwd: '/target/same' },
   ]),
   [],
+);
+
+assert.deepEqual(
+  mapping.requestPayload('preserve_projects', 'D:\\CodexWork\\', effective),
+  {
+    mode: 'preserve_projects',
+    target_root: 'D:\\CodexWork',
+    overrides: { 'C:\\old\\ProjectA': 'D:\\Renamed\\ProjectA' },
+  },
+);
+assert.deepEqual(
+  mapping.requestPayload('single_workspace', '/Users/target/', []),
+  {
+    mode: 'single_workspace',
+    target_root: '/Users/target',
+    overrides: {},
+  },
+);
+assert.deepEqual(
+  mapping.requestPayload('single_workspace', 'D:\\', []),
+  {
+    mode: 'single_workspace',
+    target_root: 'D:\\',
+    overrides: {},
+  },
+);
+assert.deepEqual(
+  mapping.requestPayload('single_workspace', '/', []),
+  {
+    mode: 'single_workspace',
+    target_root: '/',
+    overrides: {},
+  },
 );
 
 console.log('workspace mapping tests passed');

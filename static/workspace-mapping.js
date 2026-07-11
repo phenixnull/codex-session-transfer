@@ -4,7 +4,11 @@
   if (root) root.WorkspaceMapping = api;
 })(typeof globalThis === 'object' ? globalThis : this, function workspaceMappingFactory() {
   function cleanPath(value) {
-    return String(value || '').replace(/^\\\\\?\\/, '').replace(/[\\/]+$/, '');
+    const clean = String(value || '').replace(/^\\\\\?\\/, '');
+    const driveRoot = clean.match(/^([A-Za-z]:)([\\/]+)$/);
+    if (driveRoot) return `${driveRoot[1]}${driveRoot[2][0]}`;
+    if (/^\/+$/u.test(clean)) return '/';
+    return clean.replace(/[\\/]+$/, '');
   }
 
   function isWindowsPath(value) {
@@ -36,7 +40,8 @@
     const cleanChild = String(child || '').replace(/^[\\/]+/, '');
     if (!cleanBase) return cleanChild;
     const separator = isWindowsPath(cleanBase) ? '\\' : '/';
-    return `${cleanBase}${separator}${cleanChild}`;
+    const joinBase = cleanBase === '/' ? '' : cleanBase.replace(/[\\/]+$/, '');
+    return `${joinBase}${separator}${cleanChild}`;
   }
 
   function selectedProjects(manifest, selectedIds) {
@@ -80,12 +85,27 @@
     return Array.from(duplicates);
   }
 
+  function requestPayload(mode, targetRoot, mappings) {
+    const overrides = {};
+    for (const entry of mappings || []) {
+      if (entry.overridden && entry.sourceCwd && entry.targetCwd) {
+        overrides[entry.sourceCwd] = entry.targetCwd;
+      }
+    }
+    return {
+      mode,
+      target_root: cleanPath(targetRoot),
+      overrides,
+    };
+  }
+
   return {
     computedTarget,
     duplicateTargets,
     effectiveMappings,
     joinPath,
     projectLabel,
+    requestPayload,
     selectedProjects,
   };
 });

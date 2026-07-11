@@ -723,6 +723,80 @@ html[data-platform="win32"][data-shell="electron"] .titlebar {
   display: none;
 }
 
+.workspace-settings {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.38fr) minmax(280px, 1fr);
+  gap: 10px;
+  align-items: end;
+  min-width: 0;
+}
+
+.workspace-root-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 7px;
+  align-items: end;
+  min-width: 0;
+}
+
+.workspace-picker {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  place-items: center;
+}
+
+.workspace-picker .button-icon {
+  margin: 0;
+}
+
+.workspace-mapping-list {
+  display: grid;
+  max-height: 230px;
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+
+.workspace-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.62fr);
+  gap: 12px;
+  align-items: end;
+  min-width: 0;
+  border-top: 1px solid var(--border-subtle);
+  padding: 9px 0;
+}
+
+.workspace-mapping-paths {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.workspace-mapping-paths strong {
+  color: var(--foreground-strong);
+  font-size: 12px;
+}
+
+.workspace-mapping-paths code,
+.workspace-preview-item code {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-mapping-paths .workspace-target-path {
+  color: color-mix(in oklch, var(--success) 72%, var(--foreground));
+}
+
 .skills-workbench {
   display: flex;
   min-height: 0;
@@ -1621,6 +1695,19 @@ td p {
   }
 }
 
+@media (min-width: 1241px) {
+  .main-surface {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-gutter: stable;
+  }
+
+  #sessionTransferGrid {
+    min-height: 240px;
+    flex: 1 0 240px;
+  }
+}
+
 @media (max-width: 1240px) {
   body {
     overflow: auto;
@@ -1664,7 +1751,8 @@ td p {
   }
 
   .transfer-list-panel {
-    max-height: none;
+    min-height: 320px;
+    max-height: min(720px, 70dvh);
   }
 }
 
@@ -1717,6 +1805,11 @@ td p {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .workspace-settings,
+  .workspace-mapping-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .skill-option-row {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1762,6 +1855,16 @@ td p {
   .package-actions,
   .mode-switch {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-root-field {
+    grid-template-columns: minmax(0, 1fr) 44px;
+  }
+
+  .workspace-picker {
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
   }
 
   .table-wrap {
