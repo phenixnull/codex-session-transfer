@@ -2854,6 +2854,8 @@ class CodexSessionTransfer:
         first_line = json.loads(lines[0])
         payload = self._session_meta_payload(first_line)
         payload["id"] = id_map[source_id]
+        if "session_id" in payload:
+            payload["session_id"] = id_map[source_id]
         payload["model_provider"] = target_provider
         if target_cwd:
             payload["cwd"] = target_cwd

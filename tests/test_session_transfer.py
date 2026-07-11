@@ -1464,6 +1464,122 @@ requires_openai_auth = true
             self.transfer._source_path_match_key("/work/repo"),
         )
 
+    def test_imported_package_copy_updates_modern_session_identity_and_current_cwd(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_cwd = Path("C:/source/ModernProject")
+        source_rollout = self.add_thread(source_id, cwd=source_cwd)
+        lines = source_rollout.read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        first["item"]["payload"]["session_id"] = source_id
+        historical_turn = {
+            "timestamp": "2026-06-13T10:05:00Z",
+            "item": {
+                "type": "turn_context",
+                "payload": {"cwd": str(source_cwd), "model": "gpt-test"},
+            },
+        }
+        source_rollout.write_text(
+            "\n".join([compact_json(first), *lines[1:], compact_json(historical_turn)]) + "\n",
+            encoding="utf-8",
+        )
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+        target, target_sqlite_home = self.loaded_package_target(
+            Path(export["package_path"]),
+            "modern-target",
+        )
+        target_workspace = Path(self.temp.name) / "modern-workspace"
+        target_workspace.mkdir()
+
+        result = target.copy_imported_package_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                [source_id],
+                False,
+                True,
+                workspace_mapping=WorkspaceMapping(
+                    "single_workspace",
+                    str(target_workspace),
+                    {},
+                ),
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        item = result["items"][0]
+        target_id = item["target_id"]
+        copied_lines = Path(item["dest_rollout_path"]).read_text(encoding="utf-8").splitlines()
+        copied_meta = json.loads(copied_lines[0])["item"]["payload"]
+        self.assertEqual(copied_meta["id"], target_id)
+        self.assertEqual(copied_meta["session_id"], target_id)
+        self.assertEqual(copied_meta["cwd"], str(target_workspace))
+        self.assertEqual(copied_meta["model_provider"], "ProviderA")
+        self.assertEqual(json.loads(copied_lines[-1]), historical_turn)
+        with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
+            row = conn.execute(
+                "SELECT cwd, rollout_path FROM threads WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(row[0], str(target_workspace))
+        self.assertEqual(row[1], item["dest_rollout_path"])
+        index_entry = json.loads(
+            (target.codex_home / "session_index.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+        )
+        self.assertEqual(set(index_entry), {"id", "thread_name", "updated_at"})
+
+    def test_imported_package_copy_rolls_back_index_database_and_rollout_on_failure(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, cwd=Path("C:/source/RollbackProject"))
+        self.write_session_index(source_id, "Rollback source")
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+        target, target_sqlite_home = self.loaded_package_target(
+            Path(export["package_path"]),
+            "rollback-target",
+        )
+        target_workspace = Path(self.temp.name) / "rollback-workspace"
+        target_workspace.mkdir()
+        target.session_index_path.parent.mkdir(parents=True, exist_ok=True)
+        original_index = compact_json(
+            {
+                "id": "existing",
+                "thread_name": "Existing",
+                "updated_at": "2026-06-13T10:30:00Z",
+            }
+        ) + "\n"
+        target.session_index_path.write_text(original_index, encoding="utf-8")
+        append_entries = target._append_session_index_entries
+
+        def append_then_fail(*args, **kwargs):
+            append_entries(*args, **kwargs)
+            raise RuntimeError("forced post-index failure")
+
+        with patch.object(target, "_append_session_index_entries", side_effect=append_then_fail):
+            result = target.copy_imported_package_threads(
+                CopyRequest(
+                    "ProviderA",
+                    "ProviderA",
+                    [source_id],
+                    False,
+                    True,
+                    workspace_mapping=WorkspaceMapping(
+                        "single_workspace",
+                        str(target_workspace),
+                        {},
+                    ),
+                )
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("forced post-index failure", " ".join(result["errors"]))
+        self.assertEqual(target.session_index_path.read_text(encoding="utf-8"), original_index)
+        with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 0)
+        self.assertEqual(list((target.codex_home / "sessions").rglob("*.jsonl")), [])
+
     def test_uploaded_package_file_is_saved_and_loaded_as_source(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         self.add_thread(source_id, provider="ProviderA", title="Portable")
