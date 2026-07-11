@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml"><img alt="Release Build" src="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml/badge.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.2-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.0-blue">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-39-47848f">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12%2B-3776ab">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-24292f">
@@ -19,7 +19,8 @@ Codex Session Transfer gives you a focused UI for inspecting local Codex provide
 ## Highlights
 
 - **Provider-aware session migration** - copy sessions between detected model providers without hand-editing the SQLite store.
-- **Cross-machine transfer packages** - export selected sessions into a zip package, reveal the exported folder automatically, load the package on another machine, preview, then import.
+- **Cross-machine transfer packages** - export selected sessions into a zip package, load it on another machine, and map sessions into existing custom Codex workspaces before import.
+- **Responsive compact layout** - scroll the main workbench on short desktop displays and use bounded session lists on narrow screens.
 - **Skills migration** - export, load, preview, and import Codex skills with overwrite control.
 - **Preview-first workflow** - inspect planned writes before copying sessions or importing skills.
 - **Local safety checks** - show database integrity, WAL files, blocking Codex processes, and session index status before write operations.
@@ -43,6 +44,18 @@ npm run server
 ```
 
 Then open `http://127.0.0.1:8765` in a browser.
+
+## Cross-Machine Workspace Mapping
+
+After loading a session package, select the sessions to import and choose how their source projects map onto the destination machine:
+
+- **Preserve projects** maps each source project to `<target root>/<source project name>`.
+- **Single workspace** maps every selected source project to the target root itself.
+- **Project override** replaces the computed destination for one source project when names collide or a project belongs elsewhere.
+
+The Electron app provides a native folder picker. Browser users can type the absolute target path. Every target directory must already exist and must be a directory; preview reports missing paths and same-name collisions before import.
+
+Workspace mapping updates the imported session's current Codex identity and working-directory metadata consistently in SQLite and rollout metadata. It does not copy repositories, project files, or dependencies, and it does not rewrite historical message text, command records, tool output, or earlier turn-context paths.
 
 ## Data Locations
 
@@ -78,7 +91,8 @@ Release assets are collected under `release/v*/`. The GitHub Actions workflow pa
 ## Test
 
 ```bash
-python -m unittest tests.test_session_transfer
+npm test
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ## Project Layout
