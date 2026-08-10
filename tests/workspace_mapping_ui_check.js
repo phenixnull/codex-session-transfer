@@ -13,11 +13,13 @@ for (const id of [
   'workspaceTargetRoot',
   'chooseWorkspaceDirectoryButton',
   'workspaceMappingList',
+  'overwriteSessions',
 ]) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `missing mapping control ${id}`);
 }
 
 assert.match(app, /request\.workspace_mapping\s*=/);
+assert.match(app, /overwrite:\s*usingPackageSource\(\)/);
 assert.match(app, /window\.codexDesktop\?\.chooseDirectory/);
 assert.match(main, /ipcMain\.handle\(["']codex-session-transfer:choose-directory["']/);
 assert.match(main, /properties:\s*\[["']openDirectory["']\]/);

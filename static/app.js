@@ -110,6 +110,7 @@ function copyRequest() {
     thread_ids: Array.from(state.selected),
     include_descendants: $("includeDescendants").checked,
     include_archived: $("includeArchived").checked,
+    overwrite: usingPackageSource() && Boolean($("overwriteSessions")?.checked),
   };
   const workspaceMapping = packageWorkspaceMapping();
   if (workspaceMapping) request.workspace_mapping = workspaceMapping;
@@ -337,7 +338,7 @@ function preferredSourceProvider(currentValue) {
 }
 
 function preferredTargetProvider(currentValue, sourceValue) {
-  const options = state.targetProviders;
+  const options = targetProviderOptions();
   const current = options.find((provider) => provider.value === currentValue);
   if (current && current.value !== sourceValue) return current.value;
 
@@ -358,6 +359,7 @@ function renderAllShell() {
   renderProviders();
   renderTargetProviders();
   renderLiveTargetPanel();
+  renderOverwriteSessionsControl();
   renderProjectFilter();
   renderPackagePanel();
   renderSkillsPackagePanel();
@@ -720,7 +722,7 @@ function renderTargetProviders() {
   const current = select.value;
   select.replaceChildren();
 
-  for (const provider of state.targetProviders) {
+  for (const provider of targetProviderOptions()) {
     const option = new Option(targetProviderLabel(provider), provider.value);
     option.title = targetProviderTooltip(provider);
     select.append(option);
@@ -731,6 +733,24 @@ function renderTargetProviders() {
     select.value = preferred;
   }
   updateCustomTargetVisibility();
+}
+
+function targetProviderOptions() {
+  const providers = state.targetProviders.map((provider) => ({ ...provider }));
+  if (!usingPackageSource()) return providers;
+
+  for (const source of currentSourceProviders()) {
+    const value = source.model_provider;
+    if (!value || providers.some((provider) => provider.value === value)) continue;
+    providers.push({
+      value,
+      label: value,
+      sources: ["package_source"],
+      session_total: 0,
+      current: false,
+    });
+  }
+  return providers;
 }
 
 function targetProviderLabel(provider) {
@@ -751,6 +771,7 @@ function targetProviderTooltip(provider) {
   if (provider.sources?.includes("codex_plus_preset")) details.push("From Codex++ preset");
   if (provider.sources?.includes("codex_plus_override")) details.push("From Codex++ override");
   if (provider.sources?.includes("session_db")) details.push("Present in session DB");
+  if (provider.sources?.includes("package_source")) details.push("Present in package source");
   return details.join(" | ");
 }
 
@@ -786,6 +807,18 @@ function renderLiveTargetPanel() {
   if (current.error) {
     panel.append(message("error", current.error));
   }
+}
+
+function renderOverwriteSessionsControl() {
+  const checkbox = $("overwriteSessions");
+  const label = $("overwriteSessionsLabel");
+  if (!checkbox || !label) return;
+  const enabled = usingPackageSource();
+  checkbox.disabled = !enabled;
+  if (!enabled) checkbox.checked = false;
+  label.title = enabled
+    ? "Replace destination sessions with matching package session IDs."
+    : "Load a session package to enable overwrite imports.";
 }
 
 function liveTargetField(label, value) {
@@ -1387,6 +1420,7 @@ function renderPreview(plan) {
       <strong>${escapeHtml(item.display_title || item.title || item.source_id)}</strong>
       <span>${escapeHtml(item.source_provider)} -> ${escapeHtml(item.target_provider)}</span>
       <code>${escapeHtml(item.source_id)} -> ${escapeHtml(item.target_id)}</code>
+      ${item.overwritten ? `<span class="badge warn">Overwrite existing</span>` : ""}
       ${item.cwd_rewritten ? `<code>${escapeHtml(shortPath(item.source_cwd))} -> ${escapeHtml(shortPath(item.target_cwd))}</code>` : ""}
     `;
     items.append(node);
@@ -1421,7 +1455,10 @@ async function executeCopy() {
   if (!count) return;
   const target = targetProviderValue();
   const action = usingPackageSource() ? "Import" : "Copy";
-  const confirmed = window.confirm(`${action} ${count} session(s) to ${target}?`);
+  const overwriteNotice = usingPackageSource() && $("overwriteSessions")?.checked
+    ? " Matching session IDs will be overwritten."
+    : "";
+  const confirmed = window.confirm(`${action} ${count} session(s) to ${target}?${overwriteNotice}`);
   if (!confirmed) return;
   $("copyButton").disabled = true;
   setCopyResult(`${action}ing...`, "info");
@@ -1433,7 +1470,7 @@ async function executeCopy() {
   state.preview = result;
   renderPreview(result);
   const resultText = result.ok
-    ? `${usingPackageSource() ? "Imported" : "Copied"} ${result.items?.length || 0} session(s). Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
+    ? `${usingPackageSource() ? "Imported" : "Copied"} ${result.items?.length || 0} session(s).${result.overwrite ? ` Overwrote ${(result.items || []).filter((item) => item.overwritten).length} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
     : `Not ${usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
   await loadStatus();
   renderAllShell();
@@ -1834,9 +1871,6 @@ function copyDisabledReasons(blocked) {
   if (!target) {
     reasons.push("Choose a target provider.");
   }
-  if (!usingPackageSource() && source && target && source === target) {
-    reasons.push("Source and target must be different.");
-  }
   if (!state.preview) {
     reasons.push("Run Preview first.");
   } else if (state.preview.errors?.length) {
@@ -1997,6 +2031,7 @@ function bindEvents() {
     invalidatePreview();
     loadTargetThreads();
   });
+  $("overwriteSessions").addEventListener("change", () => invalidatePreview());
   $("searchInput").addEventListener("input", debounce(loadThreadLists, 250));
   $("dateFromFilter").addEventListener("change", loadThreadLists);
   $("dateToFilter").addEventListener("change", loadThreadLists);
@@ -2072,6 +2107,7 @@ function renderFileRuntimeNotice() {
     "sourceProvider",
     "targetProviderSelect",
     "targetProviderCustom",
+    "overwriteSessions",
     "searchInput",
     "sourceFilter",
     "projectFilter",

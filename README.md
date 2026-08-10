@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml"><img alt="Release Build" src="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml/badge.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.1-blue">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-39-47848f">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12%2B-3776ab">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-24292f">
@@ -18,11 +18,11 @@ Codex Session Transfer gives you a focused UI for inspecting local Codex provide
 
 ## Highlights
 
-- **Provider-aware session migration** - copy sessions between detected model providers without hand-editing the SQLite store.
+- **Provider-aware session migration** - copy sessions between detected model providers, including copies within one provider, without hand-editing the SQLite store.
 - **Cross-machine transfer packages** - export selected sessions into a zip package, load it on another machine, and map sessions into existing custom Codex workspaces before import.
 - **Responsive compact layout** - scroll the main workbench on short desktop displays and use bounded session lists on narrow screens.
 - **Skills migration** - export, load, preview, and import Codex skills with overwrite control.
-- **Preview-first workflow** - inspect planned writes before copying sessions or importing skills.
+- **Preview-first workflow** - inspect planned writes before copying sessions, overwriting matching package sessions, or importing skills.
 - **Local safety checks** - show database integrity, WAL files, blocking Codex processes, and session index status before write operations.
 - **Desktop packaging** - build Windows and macOS desktop artifacts with Electron Builder and the included release workflow.
 

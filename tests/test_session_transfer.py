@@ -722,6 +722,29 @@ class SessionTransferTests(unittest.TestCase):
         self.assertEqual(payload["id"], item["target_id"])
         self.assertEqual(payload["model_provider"], "ProviderB")
 
+    def test_copy_single_thread_allows_same_provider(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(thread_id, title="Same provider source")
+
+        preview = self.transfer.preview_copy(
+            CopyRequest("ProviderA", "ProviderA", [thread_id], False, True)
+        )
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["items"][0]["source_provider"], "ProviderA")
+        self.assertEqual(preview["items"][0]["target_provider"], "ProviderA")
+
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderA", [thread_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotEqual(result["items"][0]["source_id"], result["items"][0]["target_id"])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            provider_count = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = 'ProviderA'"
+            ).fetchone()[0]
+        self.assertEqual(provider_count, 2)
+
     def test_copy_preserves_session_index_renamed_thread_name(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         self.add_thread(thread_id, title="Database title")
@@ -1114,6 +1137,91 @@ requires_openai_auth = true
             item = json.loads(line)
             index_entries[item["id"]] = item
         self.assertEqual(index_entries[target_id]["thread_name"], "Portable renamed")
+
+    def test_imported_package_can_overwrite_matching_session_id(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, provider="ProviderA", title="Portable source")
+        self.write_session_index(source_id, "Portable source name")
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+
+        target_codex_home = Path(self.temp.name) / "overwrite-target" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        target_db = target_sqlite_home / "state_5.sqlite"
+        create_schema(target_db)
+        old_rollout = write_rollout(
+            target_codex_home,
+            source_id,
+            "ProviderA",
+            entries=[{"item": {"type": "old_event", "payload": {"old": True}}}],
+        )
+        insert_thread(
+            target_db,
+            thread_id=source_id,
+            rollout_path=old_rollout,
+            provider="ProviderA",
+            title="Existing target",
+        )
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        target.session_index_path.parent.mkdir(parents=True, exist_ok=True)
+        target.session_index_path.write_text(
+            compact_json(
+                {
+                    "id": source_id,
+                    "thread_name": "Existing target name",
+                    "updated_at": "2026-06-13T10:30:00Z",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertTrue(target.load_transfer_package(Path(export["package_path"]))["ok"])
+        request = CopyRequest(
+            "ProviderA",
+            "ProviderA",
+            [source_id],
+            False,
+            True,
+            overwrite=True,
+        )
+        preview = target.preview_imported_package_copy(request)
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertTrue(preview["overwrite"])
+        self.assertEqual(preview["items"][0]["target_id"], source_id)
+        self.assertTrue(preview["items"][0]["overwritten"])
+
+        result = target.copy_imported_package_threads(request)
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["items"][0]["overwritten"])
+        self.assertEqual(result["items"][0]["target_id"], source_id)
+        with closing(sqlite3.connect(target_db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 1)
+            row = conn.execute(
+                "SELECT title, model_provider, rollout_path FROM threads WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "Portable source")
+        self.assertEqual(row[1], "ProviderA")
+        copied_rollout = Path(row[2])
+        self.assertTrue(copied_rollout.exists())
+        self.assertNotIn('"old":true', copied_rollout.read_text(encoding="utf-8"))
+
+        index_entries = [
+            json.loads(line)
+            for line in target.session_index_path.read_text(encoding="utf-8").splitlines()
+        ]
+        matching_entries = [entry for entry in index_entries if entry["id"] == source_id]
+        self.assertEqual(len(matching_entries), 1)
+        self.assertEqual(matching_entries[0]["thread_name"], "Portable source name")
+        self.assertEqual(list(target.manifest_dir.glob("overwrite-*")), [])
 
     def test_project_filter_matches_normalized_windows_cwd_variants(self) -> None:
         first_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

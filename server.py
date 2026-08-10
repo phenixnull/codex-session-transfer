@@ -94,6 +94,7 @@ class CopyRequest:
     include_archived: bool
     cwd_map: dict[str, str] | None = None
     workspace_mapping: WorkspaceMapping | None = None
+    overwrite: bool = False
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "CopyRequest":
@@ -126,6 +127,7 @@ class CopyRequest:
             include_archived=bool(data.get("include_archived", False)),
             cwd_map=cwd_map,
             workspace_mapping=workspace_mapping,
+            overwrite=bool(data.get("overwrite", False)),
         )
 
 
@@ -793,6 +795,8 @@ class CodexSessionTransfer:
         self.manifest_dir.mkdir(parents=True, exist_ok=True)
         backup_path = self._backup_database()
         copied_paths: list[Path] = []
+        rollout_backups: list[tuple[Path, Path]] = []
+        overwrite_paths: set[Path] = set()
         session_index_snapshot: tuple[bool, str] | None = None
         session_index_entries: list[dict[str, Any]] = []
         manifest_payload: dict[str, Any] | None = None
@@ -1317,7 +1321,6 @@ class CodexSessionTransfer:
                     target_conn=target_conn,
                     source_index=self._load_session_index_from_path(package.session_index_path),
                     dest_path_resolver=self._dest_rollout_path_for_import,
-                    allow_same_provider=True,
                 )
         return self._public_plan(plan)
 
@@ -1362,7 +1365,6 @@ class CodexSessionTransfer:
                         target_conn=target_conn,
                         source_index=source_index,
                         dest_path_resolver=self._dest_rollout_path_for_import,
-                        allow_same_provider=True,
                     )
                     self._prepare_import_visibility_plan(plan)
                     if plan["errors"]:
@@ -1375,10 +1377,18 @@ class CodexSessionTransfer:
                             "package_path": str(package.package_path),
                         }
                     else:
+                        rollout_backups = self._prepare_import_overwrite(target_conn, plan)
+                        overwrite_paths = {path for path, _ in rollout_backups}
+                        if request.overwrite:
+                            target_index_ids = set(self._load_session_index())
+                            plan["_overwrite_session_index_ids"] = set(
+                                plan.get("_overwrite_session_index_ids", set())
+                            ) | target_index_ids.intersection(plan["_id_map"].values())
                         for item in plan["items"]:
+                            destination_path = Path(item["dest_rollout_path"])
                             self._write_rollout_copy(
                                 Path(item["source_rollout_path"]),
-                                Path(item["dest_rollout_path"]),
+                                destination_path,
                                 item["source_id"],
                                 plan["_id_map"],
                                 request.target_provider,
@@ -1386,8 +1396,9 @@ class CodexSessionTransfer:
                                 target_source=plan.get("_target_source_by_source_id", {}).get(
                                     item["source_id"]
                                 ),
+                                overwrite=destination_path in overwrite_paths,
                             )
-                            copied_paths.append(Path(item["dest_rollout_path"]))
+                            copied_paths.append(destination_path)
 
                         self._insert_thread_rows(target_conn, plan, request.target_provider)
                         self._insert_spawn_edges_from_source(source_conn, target_conn, plan)
@@ -1399,6 +1410,10 @@ class CodexSessionTransfer:
                             existing_index=self._load_session_index(),
                         )
                         target_conn.commit()
+                        self._discard_rollout_backups(
+                            rollout_backups,
+                            {Path(item["dest_rollout_path"]) for item in plan["items"]},
+                        )
 
                         manifest_payload = {
                             "ok": True,
@@ -1414,8 +1429,16 @@ class CodexSessionTransfer:
                     if session_index_snapshot is not None:
                         self._restore_session_index(session_index_snapshot)
                     for path in copied_paths:
+                        if path in overwrite_paths:
+                            continue
                         try:
                             path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    self._restore_rollout_backups(rollout_backups)
+                    for _, backup in rollout_backups:
+                        try:
+                            backup.unlink()
                         except FileNotFoundError:
                             pass
                     manifest_payload = {
@@ -2186,6 +2209,82 @@ class CodexSessionTransfer:
         plan["_target_source_by_source_id"] = target_source_by_id
         plan["_target_thread_source_by_source_id"] = target_thread_source_by_id
 
+    def _prepare_import_overwrite(
+        self,
+        conn: sqlite3.Connection,
+        plan: dict[str, Any],
+    ) -> list[tuple[Path, Path]]:
+        overwritten_ids = sorted(plan.get("_overwritten_ids", set()))
+        if not plan.get("overwrite") or not overwritten_ids:
+            return []
+
+        target_rows = self._threads_by_ids(conn, overwritten_ids)
+        backups: list[tuple[Path, Path]] = []
+        try:
+            for row in target_rows.values():
+                rollout_path = Path(str(row["rollout_path"]))
+                if not rollout_path.exists():
+                    continue
+                backup_path = self.manifest_dir / (
+                    f"overwrite-{uuid.uuid4().hex}-{rollout_path.name}"
+                )
+                shutil.copy2(rollout_path, backup_path)
+                backups.append((rollout_path, backup_path))
+
+            placeholders = ",".join("?" for _ in overwritten_ids)
+            if self._table_exists(conn, "thread_spawn_edges"):
+                conn.execute(
+                    "DELETE FROM thread_spawn_edges "
+                    f"WHERE parent_thread_id IN ({placeholders}) "
+                    f"OR child_thread_id IN ({placeholders})",
+                    overwritten_ids + overwritten_ids,
+                )
+            if self._table_exists(conn, "thread_dynamic_tools"):
+                conn.execute(
+                    "DELETE FROM thread_dynamic_tools "
+                    f"WHERE thread_id IN ({placeholders})",
+                    overwritten_ids,
+                )
+            conn.execute(
+                f"DELETE FROM threads WHERE id IN ({placeholders})",
+                overwritten_ids,
+            )
+        except Exception:
+            self._restore_rollout_backups(backups)
+            for _, backup_path in backups:
+                try:
+                    backup_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+        return backups
+
+    def _restore_rollout_backups(self, backups: list[tuple[Path, Path]]) -> None:
+        for original_path, backup_path in backups:
+            try:
+                if backup_path.exists():
+                    original_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(backup_path, original_path)
+            except OSError:
+                pass
+
+    def _discard_rollout_backups(
+        self,
+        backups: list[tuple[Path, Path]],
+        destination_paths: set[Path],
+    ) -> None:
+        for original_path, backup_path in backups:
+            if original_path not in destination_paths:
+                try:
+                    original_path.unlink()
+                except OSError:
+                    pass
+            try:
+                backup_path.unlink()
+            except OSError:
+                pass
+
     @staticmethod
     def _codex_default_visible_source(source: str) -> str:
         clean = str(source or "").strip()
@@ -2595,7 +2694,6 @@ class CodexSessionTransfer:
         target_conn: sqlite3.Connection | None = None,
         source_index: dict[str, dict[str, Any]] | None = None,
         dest_path_resolver: Callable[[dict[str, Any], str], Path] | None = None,
-        allow_same_provider: bool = False,
     ) -> dict[str, Any]:
         errors: list[str] = []
         warnings: list[str] = []
@@ -2609,13 +2707,8 @@ class CodexSessionTransfer:
             errors.append("source_provider is required")
         if not target_provider:
             errors.append("target_provider is required")
-        if (
-            source_provider
-            and target_provider
-            and source_provider == target_provider
-            and not allow_same_provider
-        ):
-            errors.append("source_provider and target_provider must be different")
+        if request.overwrite and target_conn is None:
+            errors.append("overwrite is only supported when importing a session package")
         if not ordered_ids:
             errors.append("Select at least one thread")
         if errors:
@@ -2670,7 +2763,16 @@ class CodexSessionTransfer:
                 for thread_id in final_ids
             }
 
-        id_map = self._new_id_map(target_conn or conn, final_ids)
+        target_database = target_conn or conn
+        overwritten_ids = set()
+        preserve_source_ids = request.overwrite and target_conn is not None
+        if preserve_source_ids:
+            overwritten_ids = self._existing_thread_ids(target_database, final_ids)
+        id_map = self._new_id_map(
+            target_database,
+            final_ids,
+            preserve_source_ids=preserve_source_ids,
+        )
         items = []
         for thread_id in final_ids:
             row = rows[thread_id]
@@ -2704,6 +2806,7 @@ class CodexSessionTransfer:
                     "parent_source_id": parent,
                     "parent_target_id": id_map.get(parent),
                     "child_count": self._child_count(conn, thread_id),
+                    "overwritten": thread_id in overwritten_ids,
                 }
             )
 
@@ -2719,6 +2822,7 @@ class CodexSessionTransfer:
             "workspace_mappings": workspace_mappings,
             "source_provider": source_provider,
             "target_provider": target_provider,
+            "overwrite": bool(request.overwrite),
             "include_descendants": request.include_descendants,
             "include_archived": request.include_archived,
             "_ordered_ids": final_ids,
@@ -2726,6 +2830,8 @@ class CodexSessionTransfer:
             "_id_map": id_map,
             "_cwd_map": cwd_map,
             "_cwd_by_source_id": cwd_by_source_id,
+            "_overwritten_ids": overwritten_ids,
+            "_overwrite_session_index_ids": set(overwritten_ids),
         }
 
     def _empty_plan(
@@ -2739,6 +2845,7 @@ class CodexSessionTransfer:
             "workspace_mappings": [],
             "source_provider": request.source_provider,
             "target_provider": request.target_provider,
+            "overwrite": bool(request.overwrite),
             "include_descendants": request.include_descendants,
             "include_archived": request.include_archived,
             "_ordered_ids": [],
@@ -2746,6 +2853,8 @@ class CodexSessionTransfer:
             "_id_map": {},
             "_cwd_map": dict(request.cwd_map or {}),
             "_cwd_by_source_id": {},
+            "_overwritten_ids": set(),
+            "_overwrite_session_index_ids": set(),
         }
 
     def _append_descendants(
@@ -2816,10 +2925,29 @@ class CodexSessionTransfer:
             ).fetchone()[0]
         )
 
-    def _new_id_map(self, conn: sqlite3.Connection, thread_ids: list[str]) -> dict[str, str]:
+    def _existing_thread_ids(self, conn: sqlite3.Connection, thread_ids: list[str]) -> set[str]:
+        if not thread_ids:
+            return set()
+        placeholders = ",".join("?" for _ in thread_ids)
+        rows = conn.execute(
+            f"SELECT id FROM threads WHERE id IN ({placeholders})",
+            thread_ids,
+        ).fetchall()
+        return {str(row["id"]) for row in rows}
+
+    def _new_id_map(
+        self,
+        conn: sqlite3.Connection,
+        thread_ids: list[str],
+        *,
+        preserve_source_ids: bool = False,
+    ) -> dict[str, str]:
         id_map: dict[str, str] = {}
         generated: set[str] = set()
         for thread_id in thread_ids:
+            if preserve_source_ids:
+                id_map[thread_id] = thread_id
+                continue
             while True:
                 candidate = str(uuid.uuid4())
                 exists = conn.execute("SELECT 1 FROM threads WHERE id = ?", (candidate,)).fetchone()
@@ -2845,8 +2973,9 @@ class CodexSessionTransfer:
         *,
         target_cwd: str | None = None,
         target_source: str | None = None,
+        overwrite: bool = False,
     ) -> None:
-        if dest_path.exists():
+        if dest_path.exists() and not overwrite:
             raise FileExistsError(f"Destination rollout already exists: {dest_path}")
         lines = source_path.read_text(encoding="utf-8").splitlines(keepends=True)
         if not lines:
@@ -3052,10 +3181,11 @@ class CodexSessionTransfer:
         source_entries = source_index if source_index is not None else self._load_session_index()
         target_entries = existing_index if existing_index is not None else self._load_session_index()
         existing_ids = set(target_entries)
+        overwrite_ids = set(plan.get("_overwrite_session_index_ids", set()))
         entries: list[dict[str, Any]] = []
         for source_id in plan["_ordered_ids"]:
             target_id = plan["_id_map"][source_id]
-            if target_id in existing_ids:
+            if target_id in existing_ids and target_id not in overwrite_ids:
                 continue
             row = plan["_rows"][source_id]
             source_entry = source_entries.get(source_id) or {}
@@ -3074,8 +3204,43 @@ class CodexSessionTransfer:
         if not entries:
             return []
 
-        self._write_session_index_entries(entries)
+        if overwrite_ids:
+            self._replace_session_index_entries(entries)
+        else:
+            self._write_session_index_entries(entries)
         return entries
+
+    def _replace_session_index_entries(self, entries: list[dict[str, Any]]) -> None:
+        replacements = {str(entry["id"]): entry for entry in entries}
+        lines: list[str] = []
+        replaced: set[str] = set()
+        if self.session_index_path.exists():
+            for line in self.session_index_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    parsed = None
+                thread_id = parsed.get("id") if isinstance(parsed, dict) else None
+                if thread_id in replacements:
+                    thread_id = str(thread_id)
+                    if thread_id in replaced:
+                        continue
+                    lines.append(json.dumps(replacements[thread_id], ensure_ascii=False, separators=(",", ":")))
+                    replaced.add(thread_id)
+                    continue
+                lines.append(line)
+
+        for entry in entries:
+            thread_id = str(entry["id"])
+            if thread_id not in replaced:
+                lines.append(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+                replaced.add(thread_id)
+
+        self.session_index_path.parent.mkdir(parents=True, exist_ok=True)
+        self.session_index_path.write_text(
+            "\n".join(lines) + ("\n" if lines else ""),
+            encoding="utf-8",
+        )
 
     def _write_session_index_entries(self, entries: list[dict[str, Any]]) -> None:
         if not entries:
@@ -3136,6 +3301,7 @@ class CodexSessionTransfer:
             "state_db_path": str(self.db_path),
             "include_descendants": request.include_descendants,
             "include_archived": request.include_archived,
+            "overwrite": request.overwrite,
             **self._manifest_safe_payload(payload),
         }
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

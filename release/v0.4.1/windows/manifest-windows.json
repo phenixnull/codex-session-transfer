@@ -1,0 +1,22 @@
+{
+  "version": "0.4.1",
+  "platform": "win",
+  "built_at": "2026-08-10T04:20:31.048926Z",
+  "artifacts": [
+    {
+      "file": "Codex.Session.Transfer-0.4.1-Portable-x64.exe",
+      "sha256": "78f277c5fba782392dcfe25283206ea7dee4d45281287c221ddde7daadd0554c",
+      "bytes": 102719132
+    },
+    {
+      "file": "Codex.Session.Transfer-0.4.1-Setup-x64.exe",
+      "sha256": "73110fb2838662c759ca860c064ea025c99c92e41bb2a71a4b581e8f942b0547",
+      "bytes": 102972933
+    },
+    {
+      "file": "latest.yml",
+      "sha256": "8e1e8f02264b7d88e2fb426e99dbe4eae01a7bcf2a65bd6388263f2ae64e88a3",
+      "bytes": 389
+    }
+  ]
+}
