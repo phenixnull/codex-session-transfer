@@ -1,0 +1,2 @@
+baa68d06e0665a584fa328870e2f75723e705d122b8c6a6cff29653eeb43fb8e  Codex.Session.Transfer-0.4.2-Portable-x64.exe
+e6f379c77234ba48250901a77846b91e9a863e8699894615fb436da6fc0d2a50  Codex.Session.Transfer-0.4.2-Setup-x64.exe

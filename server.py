@@ -442,6 +442,11 @@ class CodexSessionTransfer:
             result["provider_name"] = provider_info.get("name")
             result["base_url"] = provider_info.get("base_url")
             result["wire_api"] = provider_info.get("wire_api")
+        elif provider_id:
+            result["error"] = (
+                f"Model provider '{provider_id}' is not defined in config.toml. "
+                "Add a matching [model_providers.<id>] section or select a configured provider."
+            )
         return result
 
     def list_target_providers(self) -> list[dict[str, Any]]:
@@ -815,23 +820,35 @@ class CodexSessionTransfer:
                         "backup_path": str(backup_path),
                     }
                 else:
+                    rollout_backups = self._prepare_import_overwrite(conn, plan)
+                    overwrite_paths = {path for path, _ in rollout_backups}
+                    if request.overwrite:
+                        target_index_ids = set(self._load_session_index())
+                        plan["_overwrite_session_index_ids"] = set(
+                            plan.get("_overwrite_session_index_ids", set())
+                        ) | target_index_ids.intersection(plan["_id_map"].values())
                     for item in plan["items"]:
                         self._write_rollout_copy(
                             Path(item["source_rollout_path"]),
                             Path(item["dest_rollout_path"]),
                             item["source_id"],
                             plan["_id_map"],
-                            request.target_provider,
+                            plan["target_provider"],
                             target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
+                            overwrite=Path(item["dest_rollout_path"]) in overwrite_paths,
                         )
                         copied_paths.append(Path(item["dest_rollout_path"]))
 
-                    self._insert_thread_rows(conn, plan, request.target_provider)
+                    self._insert_thread_rows(conn, plan, plan["target_provider"])
                     self._insert_spawn_edges(conn, plan)
                     self._insert_dynamic_tools(conn, plan)
                     session_index_snapshot = self._snapshot_session_index()
                     session_index_entries = self._append_session_index_entries(plan)
                     conn.commit()
+                    self._discard_rollout_backups(
+                        rollout_backups,
+                        {Path(item["dest_rollout_path"]) for item in plan["items"]},
+                    )
 
                     manifest_payload = {
                         "ok": True,
@@ -846,8 +863,16 @@ class CodexSessionTransfer:
                 if session_index_snapshot is not None:
                     self._restore_session_index(session_index_snapshot)
                 for path in copied_paths:
+                    if path in overwrite_paths:
+                        continue
                     try:
                         path.unlink()
+                    except FileNotFoundError:
+                        pass
+                self._restore_rollout_backups(rollout_backups)
+                for _, backup in rollout_backups:
+                    try:
+                        backup.unlink()
                     except FileNotFoundError:
                         pass
                 manifest_payload = {
@@ -1391,7 +1416,7 @@ class CodexSessionTransfer:
                                 destination_path,
                                 item["source_id"],
                                 plan["_id_map"],
-                                request.target_provider,
+                                plan["target_provider"],
                                 target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
                                 target_source=plan.get("_target_source_by_source_id", {}).get(
                                     item["source_id"]
@@ -1400,7 +1425,7 @@ class CodexSessionTransfer:
                             )
                             copied_paths.append(destination_path)
 
-                        self._insert_thread_rows(target_conn, plan, request.target_provider)
+                        self._insert_thread_rows(target_conn, plan, plan["target_provider"])
                         self._insert_spawn_edges_from_source(source_conn, target_conn, plan)
                         self._insert_dynamic_tools_from_source(source_conn, target_conn, plan)
                         session_index_snapshot = self._snapshot_session_index()
@@ -2147,6 +2172,66 @@ class CodexSessionTransfer:
             )
         return results
 
+    def _configured_provider_aliases(self) -> dict[str, str]:
+        """Return unambiguous provider-name -> provider-id aliases from config.toml."""
+        config_path = self.codex_home / "config.toml"
+        if not config_path.exists():
+            return {}
+        try:
+            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return {}
+        providers = data.get("model_providers") or {}
+        if not isinstance(providers, dict):
+            return {}
+
+        aliases: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for provider_id, provider_info in providers.items():
+            if not isinstance(provider_info, dict):
+                continue
+            name = str(provider_info.get("name") or "").strip()
+            if not name:
+                continue
+            key = name.casefold()
+            value = str(provider_id)
+            previous = aliases.get(key)
+            if previous is not None and previous != value:
+                ambiguous.add(key)
+            else:
+                aliases[key] = value
+        return {key: value for key, value in aliases.items() if key not in ambiguous}
+
+    def _resolve_target_provider(self, requested: str) -> tuple[str, str | None]:
+        """Resolve a target label to a provider ID without changing config/auth files."""
+        clean = str(requested or "").strip()
+        if not clean:
+            return clean, None
+
+        current = self.current_config()
+        configured_ids = {
+            str(value)
+            for value in current.get("configured_provider_ids", [])
+            if str(value).strip()
+        }
+        preset_ids = {
+            str(provider.get("value") or "")
+            for provider in self._codex_plus_preset_providers()
+            if str(provider.get("value") or "").strip()
+        }
+        # An exact configured/preset ID is authoritative. Only fall back to a
+        # display-name alias when no real provider ID matches the request.
+        if clean in configured_ids or clean in preset_ids:
+            return clean, None
+
+        alias = self._configured_provider_aliases().get(clean.casefold())
+        if alias and alias != clean:
+            return (
+                alias,
+                f"Target provider '{clean}' matched the configured provider name; using provider id '{alias}'.",
+            )
+        return clean, None
+
     def _normalize_windows_path(self, path: str) -> str:
         return path[4:] if path.startswith("\\\\?\\") else path
 
@@ -2700,6 +2785,7 @@ class CodexSessionTransfer:
         session_index = source_index if source_index is not None else self._load_session_index()
         source_provider = request.source_provider.strip()
         target_provider = request.target_provider.strip()
+        target_provider, target_provider_warning = self._resolve_target_provider(target_provider)
         ordered_ids = self._dedupe(request.thread_ids)
         cwd_map = dict(request.cwd_map or {})
 
@@ -2707,12 +2793,12 @@ class CodexSessionTransfer:
             errors.append("source_provider is required")
         if not target_provider:
             errors.append("target_provider is required")
-        if request.overwrite and target_conn is None:
-            errors.append("overwrite is only supported when importing a session package")
         if not ordered_ids:
             errors.append("Select at least one thread")
         if errors:
             return self._empty_plan(request, errors, warnings)
+        if target_provider_warning:
+            warnings.append(target_provider_warning)
 
         rows = self._threads_by_ids(conn, ordered_ids)
         for thread_id in ordered_ids:
@@ -2764,15 +2850,30 @@ class CodexSessionTransfer:
             }
 
         target_database = target_conn or conn
-        overwritten_ids = set()
-        preserve_source_ids = request.overwrite and target_conn is not None
-        if preserve_source_ids:
-            overwritten_ids = self._existing_thread_ids(target_database, final_ids)
-        id_map = self._new_id_map(
-            target_database,
-            final_ids,
-            preserve_source_ids=preserve_source_ids,
-        )
+        overwritten_ids: set[str] = set()
+        overwrite_matches: dict[str, dict[str, Any]] = {}
+        if request.overwrite:
+            overwrite_matches, match_warnings = self._match_overwrite_targets(
+                target_database,
+                rows,
+                final_ids,
+                source_provider,
+                target_provider,
+                source_index=session_index,
+                target_index=self._load_session_index(),
+            )
+            overwritten_ids = {item["id"] for item in overwrite_matches.values()}
+            warnings.extend(match_warnings)
+
+        id_map: dict[str, str] = {}
+        unmatched_ids: list[str] = []
+        for thread_id in final_ids:
+            target = overwrite_matches.get(thread_id)
+            if target:
+                id_map[thread_id] = target["id"]
+            else:
+                unmatched_ids.append(thread_id)
+        id_map.update(self._new_id_map(target_database, unmatched_ids))
         items = []
         for thread_id in final_ids:
             row = rows[thread_id]
@@ -2806,7 +2907,12 @@ class CodexSessionTransfer:
                     "parent_source_id": parent,
                     "parent_target_id": id_map.get(parent),
                     "child_count": self._child_count(conn, thread_id),
-                    "overwritten": thread_id in overwritten_ids,
+                    "overwritten": id_map[thread_id] in overwritten_ids,
+                    "overwrite_match": (
+                        overwrite_matches[thread_id].get("match")
+                        if thread_id in overwrite_matches
+                        else None
+                    ),
                 }
             )
 
@@ -2956,6 +3062,161 @@ class CodexSessionTransfer:
                     id_map[thread_id] = candidate
                     break
         return id_map
+
+    def _match_overwrite_targets(
+        self,
+        conn: sqlite3.Connection,
+        rows: dict[str, dict[str, Any]],
+        source_ids: list[str],
+        source_provider: str,
+        target_provider: str,
+        *,
+        source_index: dict[str, dict[str, Any]],
+        target_index: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        """Find destination sessions that represent the same conversation.
+
+        Provider switches can create a new thread id while retaining the same
+        project and conversation identity. Exact ids therefore win, followed
+        by increasingly conservative metadata matches. Ambiguous matches are
+        left untouched instead of risking an unrelated overwrite.
+        """
+        target_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM threads WHERE model_provider = ?",
+                (target_provider,),
+            ).fetchall()
+        ]
+        by_id = {str(row["id"]): row for row in target_rows}
+        used_targets: set[str] = set()
+        matches: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+
+        def text_key(value: Any) -> str:
+            return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+        def identity(row: dict[str, Any], index: dict[str, dict[str, Any]]) -> tuple[str, str, str]:
+            thread_id = str(row.get("id") or "")
+            index_entry = index.get(thread_id) or {}
+            name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
+            title = text_key(name or row.get("title"))
+            first_message = text_key(row.get("first_user_message"))
+            cwd = self._path_match_key(str(row.get("cwd") or ""))
+            return cwd, title, first_message
+
+        source_identities = {
+            source_id: identity(rows[source_id], source_index)
+            for source_id in source_ids
+            if source_id in rows
+        }
+        target_identities = {
+            str(row["id"]): identity(row, target_index)
+            for row in target_rows
+        }
+        historical_candidates = self._historical_overwrite_candidates(
+            source_ids,
+            source_provider,
+            target_provider,
+            set(by_id),
+        )
+
+        for source_id in source_ids:
+            source_identity = source_identities.get(source_id)
+            if source_identity is None:
+                continue
+
+            exact = by_id.get(source_id)
+            if exact is not None and str(exact["id"]) not in used_targets:
+                matches[source_id] = {"id": str(exact["id"]), "match": "session id"}
+                used_targets.add(str(exact["id"]))
+                continue
+
+            history = historical_candidates.get(source_id, set()) - used_targets
+            if len(history) == 1:
+                target_id = next(iter(history))
+                matches[source_id] = {"id": target_id, "match": "previous transfer"}
+                used_targets.add(target_id)
+                continue
+            if len(history) > 1:
+                warnings.append(
+                    f"Did not overwrite thread {source_id}: previous transfers identify multiple target sessions."
+                )
+                continue
+
+            cwd, title, first_message = source_identity
+            predicates: list[tuple[str, Callable[[tuple[str, str, str]], bool]]] = []
+            if cwd and title and first_message:
+                predicates.append(
+                    (
+                        "project, title, first message",
+                        lambda item: item[0] == cwd and item[1] == title and item[2] == first_message,
+                    )
+                )
+            if cwd and first_message:
+                predicates.append(
+                    ("project and first message", lambda item: item[0] == cwd and item[2] == first_message)
+                )
+            if cwd and title:
+                predicates.append(
+                    ("project and title", lambda item: item[0] == cwd and item[1] == title)
+                )
+
+            selected: tuple[str, str] | None = None
+            for label, predicate in predicates:
+                candidates = [
+                    target_id
+                    for target_id, target_identity in target_identities.items()
+                    if target_id not in used_targets and predicate(target_identity)
+                ]
+                if len(candidates) == 1:
+                    selected = (candidates[0], label)
+                    break
+                if len(candidates) > 1:
+                    warnings.append(
+                        f"Did not overwrite thread {source_id}: {label} matched multiple target sessions."
+                    )
+                    break
+
+            if selected:
+                target_id, label = selected
+                matches[source_id] = {"id": target_id, "match": label}
+                used_targets.add(target_id)
+
+        return matches, warnings
+
+    def _historical_overwrite_candidates(
+        self,
+        source_ids: list[str],
+        source_provider: str,
+        target_provider: str,
+        target_ids: set[str],
+    ) -> dict[str, set[str]]:
+        candidates = {source_id: set() for source_id in source_ids}
+        source_id_set = set(source_ids)
+        for manifest_path in self.manifest_dir.glob("copy-*.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not manifest.get("ok"):
+                continue
+            manifest_source = str(manifest.get("source_provider") or "")
+            manifest_target = str(manifest.get("target_provider") or "")
+            forward = manifest_source == source_provider and manifest_target == target_provider
+            reverse = manifest_source == target_provider and manifest_target == source_provider
+            if not forward and not reverse:
+                continue
+            for item in manifest.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                recorded_source = str(item.get("source_id") or "")
+                recorded_target = str(item.get("target_id") or "")
+                if forward and recorded_source in source_id_set and recorded_target in target_ids:
+                    candidates[recorded_source].add(recorded_target)
+                if reverse and recorded_target in source_id_set and recorded_source in target_ids:
+                    candidates[recorded_target].add(recorded_source)
+        return candidates
 
     def _dest_rollout_path(self, source_path: Path, target_id: str) -> Path:
         match = ROLLOUT_NAME_RE.match(source_path.name)

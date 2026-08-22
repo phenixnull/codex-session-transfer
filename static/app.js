@@ -110,7 +110,7 @@ function copyRequest() {
     thread_ids: Array.from(state.selected),
     include_descendants: $("includeDescendants").checked,
     include_archived: $("includeArchived").checked,
-    overwrite: usingPackageSource() && Boolean($("overwriteSessions")?.checked),
+    overwrite: Boolean($("overwriteSessions")?.checked),
   };
   const workspaceMapping = packageWorkspaceMapping();
   if (workspaceMapping) request.workspace_mapping = workspaceMapping;
@@ -813,12 +813,8 @@ function renderOverwriteSessionsControl() {
   const checkbox = $("overwriteSessions");
   const label = $("overwriteSessionsLabel");
   if (!checkbox || !label) return;
-  const enabled = usingPackageSource();
-  checkbox.disabled = !enabled;
-  if (!enabled) checkbox.checked = false;
-  label.title = enabled
-    ? "Replace destination sessions with matching package session IDs."
-    : "Load a session package to enable overwrite imports.";
+  checkbox.disabled = false;
+  label.title = "Replace destination sessions matched by session ID or project and conversation identity.";
 }
 
 function liveTargetField(label, value) {
@@ -1421,6 +1417,7 @@ function renderPreview(plan) {
       <span>${escapeHtml(item.source_provider)} -> ${escapeHtml(item.target_provider)}</span>
       <code>${escapeHtml(item.source_id)} -> ${escapeHtml(item.target_id)}</code>
       ${item.overwritten ? `<span class="badge warn">Overwrite existing</span>` : ""}
+      ${item.overwrite_match ? `<span>Matched by ${escapeHtml(item.overwrite_match)}</span>` : ""}
       ${item.cwd_rewritten ? `<code>${escapeHtml(shortPath(item.source_cwd))} -> ${escapeHtml(shortPath(item.target_cwd))}</code>` : ""}
     `;
     items.append(node);
@@ -1455,8 +1452,8 @@ async function executeCopy() {
   if (!count) return;
   const target = targetProviderValue();
   const action = usingPackageSource() ? "Import" : "Copy";
-  const overwriteNotice = usingPackageSource() && $("overwriteSessions")?.checked
-    ? " Matching session IDs will be overwritten."
+  const overwriteNotice = $("overwriteSessions")?.checked
+    ? " Matching destination conversations will be overwritten."
     : "";
   const confirmed = window.confirm(`${action} ${count} session(s) to ${target}?${overwriteNotice}`);
   if (!confirmed) return;

@@ -165,6 +165,7 @@ def insert_thread(
     created_at_ms: int = 1_781_000_000_000,
     updated_at_ms: int = 1_781_000_100_000,
     thread_source: str | None = None,
+    first_user_message: str = "hello",
 ) -> None:
     created_at = created_at_ms // 1000
     updated_at = updated_at_ms // 1000
@@ -190,7 +191,7 @@ def insert_thread(
         "sandbox_policy": "read-only",
         "approval_mode": "on-request",
         "tokens_used": 12,
-        "first_user_message": "hello",
+        "first_user_message": first_user_message,
         "archived": 1 if archived else 0,
         "archived_at": 1_781_000_200 if archived else None,
         "git_sha": None,
@@ -337,6 +338,7 @@ class SessionTransferTests(unittest.TestCase):
         created_at_ms: int = 1_781_000_000_000,
         updated_at_ms: int = 1_781_000_100_000,
         thread_source: str | None = None,
+        first_user_message: str = "hello",
     ) -> Path:
         rollout_path = write_rollout(
             self.codex_home,
@@ -359,6 +361,7 @@ class SessionTransferTests(unittest.TestCase):
             created_at_ms=created_at_ms,
             updated_at_ms=updated_at_ms,
             thread_source=thread_source,
+            first_user_message=first_user_message,
         )
         return rollout_path
 
@@ -745,6 +748,160 @@ class SessionTransferTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(provider_count, 2)
 
+    def test_local_copy_overwrite_replaces_matching_conversation_after_provider_switch(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        destination_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        project = Path(self.temp.name) / "shared-project"
+        self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Current conversation",
+            preview="Newest transcript",
+            cwd=project,
+            first_user_message="Keep this thread in sync",
+        )
+        destination_rollout = write_rollout(
+            self.codex_home,
+            destination_id,
+            "ProviderB",
+            entries=[{"item": {"type": "old_event", "payload": {"old": True}}}],
+        )
+        insert_thread(
+            self.db_path,
+            thread_id=destination_id,
+            rollout_path=destination_rollout,
+            provider="ProviderB",
+            title="Current conversation",
+            cwd=project,
+            first_user_message="Keep this thread in sync",
+        )
+
+        preview = self.transfer.preview_copy(
+            CopyRequest("ProviderA", "ProviderB", [source_id], False, True, overwrite=True)
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        item = preview["items"][0]
+        self.assertEqual(item["target_id"], destination_id)
+        self.assertTrue(item["overwritten"])
+        self.assertEqual(item["overwrite_match"], "project, title, first message")
+
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderB", [source_id], False, True, overwrite=True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT id, title, model_provider, rollout_path FROM threads WHERE model_provider = 'ProviderB'"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], destination_id)
+        self.assertEqual(rows[0][1], "Current conversation")
+        self.assertNotIn('"old":true', Path(rows[0][3]).read_text(encoding="utf-8"))
+
+    def test_local_copy_overwrite_preserves_thread_section_and_project(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        destination_id = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
+        project = Path(self.temp.name) / "shared-project"
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.executescript(
+                """
+                ALTER TABLE threads ADD COLUMN thread_section_id TEXT;
+                ALTER TABLE threads ADD COLUMN section_position INTEGER;
+                ALTER TABLE threads ADD COLUMN section_entered_at_ms INTEGER;
+                ALTER TABLE threads ADD COLUMN project_id TEXT;
+                CREATE TABLE thread_sections (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    appearance TEXT NOT NULL
+                );
+                CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                INSERT INTO thread_sections VALUES ('source-section', 'Source', 'blue');
+                INSERT INTO thread_sections VALUES ('destination-section', 'Destination', 'red');
+                INSERT INTO projects VALUES ('source-project', 'Source project');
+                INSERT INTO projects VALUES ('destination-project', 'Destination project');
+                """
+            )
+            conn.commit()
+
+        self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Current conversation",
+            cwd=project,
+            first_user_message="Keep this thread in sync",
+        )
+        self.add_thread(
+            destination_id,
+            provider="ProviderB",
+            title="Current conversation",
+            cwd=project,
+            first_user_message="Keep this thread in sync",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                """
+                UPDATE threads
+                SET thread_section_id = ?, section_position = ?, section_entered_at_ms = ?, project_id = ?
+                WHERE id = ?
+                """,
+                ("source-section", 4, 123456, "source-project", source_id),
+            )
+            conn.execute(
+                """
+                UPDATE threads
+                SET thread_section_id = ?, section_position = ?, section_entered_at_ms = ?, project_id = ?
+                WHERE id = ?
+                """,
+                ("destination-section", 9, 789012, "destination-project", destination_id),
+            )
+            conn.commit()
+
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderB", [source_id], False, True, overwrite=True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT thread_section_id, section_position, section_entered_at_ms, project_id
+                FROM threads WHERE id = ?
+                """,
+                (destination_id,),
+            ).fetchone()
+        self.assertEqual(row, ("source-section", 4, 123456, "source-project"))
+
+    def test_local_copy_overwrite_uses_previous_transfer_when_conversation_metadata_changes(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Original conversation",
+            first_user_message="Original prompt",
+        )
+        first_copy = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderB", [source_id], False, True)
+        )
+        self.assertTrue(first_copy["ok"], first_copy)
+        switched_id = first_copy["items"][0]["target_id"]
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE threads SET title = ?, first_user_message = ? WHERE id = ?",
+                ("Renamed after switching", "Changed metadata", switched_id),
+            )
+            conn.commit()
+
+        preview = self.transfer.preview_copy(
+            CopyRequest("ProviderB", "ProviderA", [switched_id], False, True, overwrite=True)
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["items"][0]["target_id"], source_id)
+        self.assertTrue(preview["items"][0]["overwritten"])
+        self.assertEqual(preview["items"][0]["overwrite_match"], "previous transfer")
+
     def test_copy_preserves_session_index_renamed_thread_name(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         self.add_thread(thread_id, title="Database title")
@@ -968,6 +1125,66 @@ requires_openai_auth = true
         self.assertEqual(by_value["Fucheers"]["preset_id"], "fucheers-newapi")
         self.assertNotIn("authText", json.dumps(providers))
         self.assertNotIn("secret-not-returned", json.dumps(providers))
+
+    def test_current_config_reports_unknown_model_provider_id(self) -> None:
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "Fucheers"
+
+[model_providers.custom]
+name = "Fucheers"
+base_url = "https://www.fucheers.top/v1"
+wire_api = "responses"
+""",
+            encoding="utf-8",
+        )
+
+        current = self.transfer.current_config()
+
+        self.assertEqual(current["model_provider"], "Fucheers")
+        self.assertEqual(current["configured_provider_ids"], ["custom"])
+        self.assertIn("not defined", current["error"])
+
+    def test_copy_maps_provider_display_name_to_configured_provider_id(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, provider="ProviderA", title="Migrated")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "Fucheers"
+base_url = "https://www.fucheers.top/v1"
+wire_api = "responses"
+""",
+            encoding="utf-8",
+        )
+
+        preview = self.transfer.preview_copy(
+            CopyRequest("ProviderA", "Fucheers", [source_id], False, True)
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["target_provider"], "custom")
+        self.assertIn("using provider id 'custom'", preview["warnings"][0])
+
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "Fucheers", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        target_id = result["items"][0]["target_id"]
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            provider = conn.execute(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(provider[0], "custom")
+        copied_meta = json.loads(Path(provider[1]).read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(copied_meta["item"]["payload"]["model_provider"], "custom")
 
     def test_session_stats_group_by_project_and_provider(self) -> None:
         first = self.add_thread(
