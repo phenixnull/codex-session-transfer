@@ -754,9 +754,13 @@ function targetProviderOptions() {
 }
 
 function targetProviderLabel(provider) {
-  const bits = [provider.label || provider.value];
+  const configuredName = String(provider.provider_name || "").trim();
+  const display = configuredName && configuredName !== provider.value
+    ? `${provider.value} (${configuredName})`
+    : provider.value;
+  const bits = [display];
   if (provider.current) bits.push("live");
-  if (provider.session_total) bits.push(`${provider.session_total}`);
+  if (provider.session_total) bits.push(`${provider.session_total} total`);
   return bits.join(" / ");
 }
 
@@ -767,9 +771,6 @@ function targetProviderTooltip(provider) {
   if (provider.base_url) details.push(`Base URL: ${provider.base_url}`);
   if (provider.wire_api) details.push(`Wire API: ${provider.wire_api}`);
   if (provider.current) details.push("Current live config");
-  if (provider.matches_current_base_url) details.push("Same base URL as current config");
-  if (provider.sources?.includes("codex_plus_preset")) details.push("From Codex++ preset");
-  if (provider.sources?.includes("codex_plus_override")) details.push("From Codex++ override");
   if (provider.sources?.includes("session_db")) details.push("Present in session DB");
   if (provider.sources?.includes("package_source")) details.push("Present in package source");
   return details.join(" | ");

@@ -1071,7 +1071,7 @@ class SessionTransferTests(unittest.TestCase):
             entries[item["id"]] = item
         self.assertEqual(entries[target_id]["thread_name"], "Renamed title")
 
-    def test_target_providers_include_live_config_and_codex_plus_presets(self) -> None:
+    def test_target_providers_match_session_db_and_include_live_config(self) -> None:
         self.add_thread("11111111-1111-4111-8111-111111111111", "custom", title="Live")
         self.add_thread("22222222-2222-4222-8222-222222222222", "OpenAI", title="OpenAI")
         self.codex_home.mkdir(parents=True, exist_ok=True)
@@ -1081,10 +1081,34 @@ model_provider = "custom"
 model = "gpt-5.5"
 
 [model_providers.custom]
-name = "custom"
+name = "xixiapi"
 base_url = "https://www.fucheers.top/v1"
 wire_api = "responses"
 requires_openai_auth = true
+""",
+            encoding="utf-8",
+        )
+        providers = self.transfer.list_target_providers()
+        by_value = {provider["value"]: provider for provider in providers}
+
+        self.assertEqual(set(by_value), {"custom", "OpenAI"})
+        self.assertEqual(by_value["custom"]["label"], "custom")
+        self.assertTrue(by_value["custom"]["current"])
+        self.assertEqual(by_value["custom"]["model"], "gpt-5.5")
+        self.assertEqual(by_value["custom"]["provider_name"], "xixiapi")
+        self.assertFalse(by_value["OpenAI"]["current"])
+
+    def test_target_providers_include_live_config_without_sessions(self) -> None:
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "live-only"
+model = "gpt-5.5"
+
+[model_providers.live-only]
+name = "Remote provider"
+base_url = "https://example.test/v1"
+wire_api = "responses"
 """,
             encoding="utf-8",
         )
@@ -1094,19 +1118,9 @@ requires_openai_auth = true
                 {
                     "customPresets": [
                         {
-                            "id": "fucheers-newapi",
-                            "name": "Fucheers (NewAPI)",
-                            "configText": """
-model_provider = "Fucheers"
-model = "gpt-5.5"
-
-[model_providers.Fucheers]
-name = "Fucheers"
-base_url = "https://www.fucheers.top/v1"
-wire_api = "responses"
-requires_openai_auth = true
-""",
-                            "authText": '{"OPENAI_API_KEY":"secret-not-returned"}',
+                            "id": "unrelated-preset",
+                            "name": "Unrelated preset",
+                            "configText": 'model_provider = "preset-only"',
                         }
                     ]
                 }
@@ -1115,16 +1129,23 @@ requires_openai_auth = true
         )
 
         providers = self.transfer.list_target_providers()
-        by_value = {provider["value"]: provider for provider in providers}
 
-        self.assertIn("custom", by_value)
-        self.assertTrue(by_value["custom"]["current"])
-        self.assertEqual(by_value["custom"]["model"], "gpt-5.5")
-        self.assertEqual(by_value["custom"]["provider_name"], "custom")
-        self.assertIn("Fucheers", by_value)
-        self.assertEqual(by_value["Fucheers"]["preset_id"], "fucheers-newapi")
-        self.assertNotIn("authText", json.dumps(providers))
-        self.assertNotIn("secret-not-returned", json.dumps(providers))
+        self.assertEqual(
+            providers,
+            [
+                {
+                    "value": "live-only",
+                    "label": "live-only",
+                    "sources": ["live_config"],
+                    "session_total": 0,
+                    "current": True,
+                    "provider_name": "Remote provider",
+                    "model": "gpt-5.5",
+                    "base_url": "https://example.test/v1",
+                    "wire_api": "responses",
+                }
+            ],
+        )
 
     def test_current_config_reports_unknown_model_provider_id(self) -> None:
         self.codex_home.mkdir(parents=True, exist_ok=True)

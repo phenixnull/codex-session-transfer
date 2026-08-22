@@ -463,7 +463,6 @@ class CodexSessionTransfer:
                     "sources": [],
                     "session_total": 0,
                     "current": False,
-                    "matches_current_base_url": False,
                 },
             )
             source = fields.pop("source", None)
@@ -485,26 +484,16 @@ class CodexSessionTransfer:
 
         current = self.current_config()
         current_provider = current.get("model_provider")
-        current_base_url = current.get("base_url")
         if current_provider:
             upsert(
                 str(current_provider),
                 source="live_config",
-                label=str(current.get("provider_name") or current_provider),
                 current=True,
                 provider_name=current.get("provider_name"),
                 model=current.get("model"),
                 base_url=current.get("base_url"),
                 wire_api=current.get("wire_api"),
             )
-
-        for provider in self._codex_plus_preset_providers():
-            value = provider["value"]
-            provider_fields = dict(provider)
-            provider_fields.pop("value", None)
-            upsert(value, **provider_fields)
-            if current_base_url and provider.get("base_url") == current_base_url:
-                merged[value]["matches_current_base_url"] = True
 
         for value, item in merged.items():
             if value == current_provider:
