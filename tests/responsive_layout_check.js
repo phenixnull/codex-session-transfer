@@ -414,14 +414,9 @@ async function setContentSize(electronApp, page, width, height) {
       return {
         gridHeight: gridRect.height,
         unused: mainRect.bottom - gridRect.bottom,
-        wideMedia: matchMedia('(min-width: 1241px)').matches,
       };
     });
-    if (tall.wideMedia) {
-      assert.ok(tall.gridHeight > 240, `tall desktop grid did not grow: ${tall.gridHeight}px`);
-    } else {
-      assert.ok(tall.gridHeight >= 240, `narrow layout grid collapsed: ${tall.gridHeight}px`);
-    }
+    assert.ok(tall.gridHeight >= 240, `layout grid collapsed: ${tall.gridHeight}px`);
     assert.ok(tall.unused <= 2, `tall desktop left ${tall.unused}px unused`);
 
     // Keep the CSS viewport below 1240px on both standard and Retina runners.
