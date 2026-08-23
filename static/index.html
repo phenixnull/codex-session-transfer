@@ -454,6 +454,22 @@
                 </div>
               </div>
               <div id="previewMessages" class="messages"></div>
+              <section id="overwriteResolution" class="overwrite-resolution" aria-label="Overwrite target choices" hidden>
+                <div class="overwrite-resolution-head">
+                  <div>
+                    <strong>Ambiguous overwrite matches</strong>
+                    <span id="overwriteResolutionCount" class="count-chip">0 pending</span>
+                  </div>
+                  <button id="applyOverwriteChoicesButton" type="button" disabled>
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M20 6 9 17l-5-5"></path>
+                    </svg>
+                    <span>Recheck choices</span>
+                  </button>
+                </div>
+                <p id="overwriteResolutionHint" class="copy-hint">Choose a destination session for each ambiguous match, or explicitly skip overwrite.</p>
+                <div id="overwriteResolutionItems" class="overwrite-resolution-items"></div>
+              </section>
               <div id="previewItems" class="preview-items"></div>
               <div class="copy-actions">
                 <button id="previewButton" type="button">

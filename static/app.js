@@ -22,6 +22,7 @@ const state = {
   sessionRenderCollapsed: true,
   preview: null,
   previewLoadingMore: false,
+  overwriteSelections: {},
   copyInProgress: false,
   skillPreview: null,
   copyResult: "",
@@ -151,6 +152,9 @@ function copyRequest() {
     include_archived: $("includeArchived").checked,
     overwrite: Boolean($("overwriteSessions")?.checked),
   };
+  if (request.overwrite && Object.keys(state.overwriteSelections).length) {
+    request.overwrite_selections = { ...state.overwriteSelections };
+  }
   const workspaceMapping = packageWorkspaceMapping();
   if (workspaceMapping) request.workspace_mapping = workspaceMapping;
   return request;
@@ -1493,10 +1497,15 @@ async function previewCopy() {
   renderPreview(plan);
   const loaded = plan.items?.length || 0;
   const total = plan.item_total ?? loaded;
+  const ambiguityCount = Number(
+    plan.overwrite_ambiguity_count ?? plan.overwrite_ambiguities?.length ?? 0,
+  );
   setCopyResult(
     plan.can_execute
       ? `Preview ready: ${loaded}${total !== loaded ? ` / ${total}` : ""} session(s) can be ${usingPackageSource() ? "imported" : "copied"}.`
-      : "Preview is not executable. Fix the messages above.",
+      : ambiguityCount
+        ? `Choose or skip ${ambiguityCount} ambiguous overwrite match(es), then recheck the choices.`
+        : "Preview is not executable. Fix the messages above.",
     plan.can_execute ? "info" : "error",
   );
 }
@@ -1515,6 +1524,7 @@ function renderPreview(plan) {
   messages.replaceChildren();
   items.replaceChildren();
   items.onscroll = null;
+  renderOverwriteResolution(plan);
   if (!plan) {
     updateCopyButton();
     return;
@@ -1537,6 +1547,117 @@ function renderPreview(plan) {
   }
   renderPreviewItems(plan);
   updateCopyButton();
+}
+
+function hasOverwriteSelection(sourceId) {
+  return Object.prototype.hasOwnProperty.call(state.overwriteSelections, sourceId);
+}
+
+function overwriteSelectionValue(sourceId) {
+  if (!hasOverwriteSelection(sourceId)) return "";
+  const value = state.overwriteSelections[sourceId];
+  return value === null ? "__skip__" : String(value);
+}
+
+function formatOverwriteDate(value) {
+  const timestamp = Number(value || 0);
+  if (!timestamp) return "time unavailable";
+  try {
+    return new Date(timestamp).toLocaleString();
+  } catch {
+    return "time unavailable";
+  }
+}
+
+function renderOverwriteResolution(plan) {
+  const panel = $("overwriteResolution");
+  const count = $("overwriteResolutionCount");
+  const hint = $("overwriteResolutionHint");
+  const items = $("overwriteResolutionItems");
+  const applyButton = $("applyOverwriteChoicesButton");
+  if (!panel || !count || !hint || !items || !applyButton) return;
+
+  const ambiguities = plan?.overwrite_ambiguities || [];
+  if (!plan || !plan.overwrite || !ambiguities.length) {
+    panel.hidden = true;
+    items.replaceChildren();
+    count.textContent = "0 pending";
+    applyButton.disabled = true;
+    return;
+  }
+
+  panel.hidden = false;
+  items.replaceChildren();
+  const pending = ambiguities.filter((item) => !hasOverwriteSelection(item.source_id)).length;
+  count.textContent = `${pending} pending`;
+  hint.textContent = pending
+    ? "Choose a destination session for each item, or explicitly skip overwrite so it is copied as a new session."
+    : "All choices are set. Recheck the choices before copying.";
+  applyButton.disabled = pending > 0 || state.copyInProgress;
+  applyButton.title = pending
+    ? `Choose ${pending} remaining overwrite decision${pending === 1 ? "" : "s"}.`
+    : "Rebuild the plan using these overwrite decisions.";
+
+  for (const ambiguity of ambiguities) {
+    const row = document.createElement("article");
+    row.className = "overwrite-resolution-item";
+
+    const sourceTitle = document.createElement("strong");
+    sourceTitle.textContent = ambiguity.source_display_title || ambiguity.source_title || ambiguity.source_id;
+    row.append(sourceTitle);
+
+    const sourceMeta = document.createElement("span");
+    sourceMeta.className = "overwrite-resolution-meta";
+    sourceMeta.textContent = `${ambiguity.reason || "Multiple matches"} · ${shortPath(ambiguity.source_cwd) || "project unavailable"}`;
+    row.append(sourceMeta);
+
+    const sourceMessage = document.createElement("p");
+    sourceMessage.textContent = ambiguity.source_first_message || ambiguity.source_preview || "No first message available";
+    row.append(sourceMessage);
+
+    const select = document.createElement("select");
+    select.className = "overwrite-resolution-select";
+    select.setAttribute("aria-label", `Overwrite target for ${ambiguity.source_id}`);
+
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Choose a target session...";
+    select.append(placeholder);
+
+    for (const candidate of ambiguity.candidates || []) {
+      const option = document.createElement("option");
+      option.value = candidate.id;
+      option.textContent = `${candidate.display_title || candidate.title || candidate.id} · ${shortPath(candidate.cwd) || "project unavailable"} · ${candidate.archived ? "Archived" : formatOverwriteDate(candidate.updated_at_ms)} · ${String(candidate.id).slice(0, 8)}`;
+      option.title = candidate.first_message || candidate.preview || candidate.id;
+      select.append(option);
+    }
+
+    const skip = document.createElement("option");
+    skip.value = "__skip__";
+    skip.textContent = "Skip overwrite and create a new copy";
+    select.append(skip);
+    select.value = overwriteSelectionValue(ambiguity.source_id);
+    select.addEventListener("change", () => {
+      const value = select.value;
+      if (!value) delete state.overwriteSelections[ambiguity.source_id];
+      else if (value === "__skip__") state.overwriteSelections[ambiguity.source_id] = null;
+      else state.overwriteSelections[ambiguity.source_id] = value;
+      renderOverwriteResolution(state.preview);
+      updateCopyButton();
+    });
+    row.append(select);
+
+    const selected = overwriteSelectionValue(ambiguity.source_id);
+    const selectionNote = document.createElement("code");
+    selectionNote.className = "overwrite-resolution-choice";
+    selectionNote.textContent = selected === "__skip__"
+      ? "This source will be copied as a new target session."
+      : selected
+        ? `Selected target: ${selected}`
+        : "No decision yet";
+    row.append(selectionNote);
+    items.append(row);
+  }
 }
 
 function renderPreviewItems(plan) {
@@ -1607,6 +1728,7 @@ function invalidatePreview({ clearResult = true } = {}) {
   state.preview = null;
   state.previewLoadingMore = false;
   renderPreview(null);
+  state.overwriteSelections = {};
   if (clearResult) setCopyResult("");
 }
 
@@ -1690,6 +1812,7 @@ async function executeCopy() {
     );
     state.preview = null;
     renderPreview(null);
+    state.overwriteSelections = {};
     const copiedCount = Number(result.item_total ?? result.items?.length ?? 0);
     const overwrittenCount = Number(
       result.overwritten_count ?? (result.items || []).filter((item) => item.overwritten).length,
@@ -2211,6 +2334,12 @@ function copyDisabledReasons(blocked) {
   if (target && targetProviderIsConfigured({ value: target }) === false) {
     reasons.push(`Target provider '${target}' is not defined in config.toml.`);
   }
+  const ambiguityCount = Number(
+    state.preview?.overwrite_ambiguity_count ?? state.preview?.overwrite_ambiguities?.length ?? 0,
+  );
+  if ($("overwriteSessions")?.checked && ambiguityCount) {
+    reasons.push(`Resolve ${ambiguityCount} ambiguous overwrite match${ambiguityCount === 1 ? "" : "es"} first.`);
+  }
   if (state.copyInProgress) {
     reasons.push("A session operation is already running.");
   }
@@ -2400,6 +2529,9 @@ function bindEvents() {
     chooseWorkspaceDirectory().catch((error) => setCopyResult(error.message, "error"));
   });
   $("previewButton").addEventListener("click", previewCopy);
+  $("applyOverwriteChoicesButton").addEventListener("click", () => {
+    previewCopy().catch((error) => setCopyResult(error.message, "error"));
+  });
   $("rebindButton").addEventListener("click", () => {
     executeRebind().catch((error) => setCopyResult(error.message, "error"));
   });
@@ -2461,6 +2593,7 @@ function renderFileRuntimeNotice() {
     "includeDescendants",
     "selectAll",
     "previewButton",
+    "applyOverwriteChoicesButton",
     "rebindButton",
     "copyButton",
     "exportSkillsPackageButton",

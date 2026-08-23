@@ -1549,6 +1549,101 @@ td p {
   min-height: 80px;
 }
 
+.overwrite-resolution {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 8px;
+  min-height: 0;
+  max-height: 340px;
+  border: 1px solid var(--status-warning-border);
+  border-radius: var(--radius-panel);
+  background: var(--status-warning-muted);
+  padding: 9px;
+}
+
+.overwrite-resolution-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.overwrite-resolution-head > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.overwrite-resolution-head strong {
+  min-width: 0;
+  color: var(--foreground-strong);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overwrite-resolution-head button {
+  min-height: 29px;
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.overwrite-resolution-items {
+  display: grid;
+  gap: 7px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.overwrite-resolution-item {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid color-mix(in oklch, var(--status-warning) 28%, var(--border));
+  border-radius: var(--radius-control);
+  background: color-mix(in oklch, var(--background) 36%, transparent);
+  padding: 8px;
+}
+
+.overwrite-resolution-item strong {
+  color: var(--foreground-strong);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.overwrite-resolution-meta,
+.overwrite-resolution-item p,
+.overwrite-resolution-choice {
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.overwrite-resolution-item p {
+  display: -webkit-box;
+  max-height: 39px;
+  margin: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.overwrite-resolution-select {
+  width: 100%;
+  min-width: 0;
+  min-height: 31px;
+  font-size: 11px;
+}
+
+.overwrite-resolution-choice {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
 .preview-lazy-status {
   justify-self: center;
   color: var(--faint-foreground);

@@ -292,6 +292,35 @@ class SessionTransferTests(unittest.TestCase):
             {source_cwd: str(target_project)},
         )
 
+    def test_copy_request_parses_overwrite_selections_and_explicit_skip(self) -> None:
+        request = CopyRequest.from_json(
+            {
+                "source_provider": "ProviderA",
+                "target_provider": "ProviderB",
+                "thread_ids": ["source-a", "source-b"],
+                "overwrite": True,
+                "overwrite_selections": {
+                    "source-a": "target-a",
+                    "source-b": None,
+                },
+            }
+        )
+
+        self.assertEqual(
+            request.overwrite_selections,
+            {"source-a": "target-a", "source-b": None},
+        )
+
+        with self.assertRaises(ValueError):
+            CopyRequest.from_json(
+                {
+                    "source_provider": "ProviderA",
+                    "target_provider": "ProviderB",
+                    "thread_ids": ["source-a"],
+                    "overwrite_selections": {"source-a": 42},
+                }
+            )
+
     def test_copy_request_rejects_invalid_workspace_mapping_shapes(self) -> None:
         base = {
             "source_provider": "ProviderA",
@@ -956,6 +985,186 @@ class SessionTransferTests(unittest.TestCase):
         self.assertEqual(rows[0][0], destination_id)
         self.assertEqual(rows[0][1], "Current conversation")
         self.assertNotIn('"old":true', Path(rows[0][3]).read_text(encoding="utf-8"))
+
+    def test_local_copy_overwrite_requires_manual_choice_for_ambiguous_targets(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        target_one = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        target_two = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        project = Path(self.temp.name) / "ambiguous-project"
+        self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Repeated conversation",
+            preview="Source transcript",
+            cwd=project,
+            first_user_message="The same opening message",
+        )
+        for target_id, marker in ((target_one, "one"), (target_two, "two")):
+            target_rollout = write_rollout(
+                self.codex_home,
+                target_id,
+                "ProviderB",
+                entries=[{"item": {"type": "old_event", "payload": {"marker": marker}}}],
+            )
+            insert_thread(
+                self.db_path,
+                thread_id=target_id,
+                rollout_path=target_rollout,
+                provider="ProviderB",
+                title="Repeated conversation",
+                preview=f"Target transcript {marker}",
+                cwd=project,
+                first_user_message="The same opening message",
+            )
+
+        request = CopyRequest(
+            "ProviderA",
+            "ProviderB",
+            [source_id],
+            False,
+            True,
+            overwrite=True,
+        )
+        preview = self.transfer.preview_copy(request)
+
+        self.assertFalse(preview["can_execute"], preview)
+        self.assertEqual(preview["overwrite_ambiguity_count"], 1)
+        self.assertEqual(
+            {candidate["id"] for candidate in preview["overwrite_ambiguities"][0]["candidates"]},
+            {target_one, target_two},
+        )
+        self.assertIn("require a target selection", " ".join(preview["errors"]))
+
+        selected = self.transfer.preview_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [source_id],
+                False,
+                True,
+                overwrite=True,
+                overwrite_selections={source_id: target_two},
+            )
+        )
+        self.assertTrue(selected["can_execute"], selected)
+        self.assertEqual(selected["overwrite_ambiguity_count"], 0)
+        self.assertEqual(selected["items"][0]["target_id"], target_two)
+        self.assertEqual(selected["items"][0]["overwrite_match"], "manual selection")
+        self.assertTrue(selected["items"][0]["overwritten"])
+
+        copied = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [source_id],
+                False,
+                True,
+                overwrite=True,
+                overwrite_selections={source_id: target_two},
+            )
+        )
+        self.assertTrue(copied["ok"], copied)
+        self.assertEqual(copied["items"][0]["target_id"], target_two)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            target_rows = conn.execute(
+                "SELECT id, rollout_path FROM threads WHERE model_provider = 'ProviderB' ORDER BY id"
+            ).fetchall()
+        self.assertEqual([row[0] for row in target_rows], [target_one, target_two])
+        self.assertNotIn('"marker":"two"', Path(target_rows[1][1]).read_text(encoding="utf-8"))
+
+    def test_local_copy_overwrite_can_explicitly_skip_ambiguous_target(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        target_one = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        target_two = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        project = Path(self.temp.name) / "skip-ambiguous-project"
+        self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Repeated conversation",
+            cwd=project,
+            first_user_message="The same opening message",
+        )
+        for target_id in (target_one, target_two):
+            target_rollout = write_rollout(self.codex_home, target_id, "ProviderB")
+            insert_thread(
+                self.db_path,
+                thread_id=target_id,
+                rollout_path=target_rollout,
+                provider="ProviderB",
+                title="Repeated conversation",
+                cwd=project,
+                first_user_message="The same opening message",
+            )
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [source_id],
+                False,
+                True,
+                overwrite=True,
+                overwrite_selections={source_id: None},
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["items"][0]["overwritten"])
+        self.assertNotIn(result["items"][0]["target_id"], {target_one, target_two})
+
+    def test_copy_rejects_invalid_or_reused_overwrite_selection(self) -> None:
+        source_one = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_two = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        target_one = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        target_two = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        project = Path(self.temp.name) / "selection-validation-project"
+        for source_id in (source_one, source_two):
+            self.add_thread(
+                source_id,
+                provider="ProviderA",
+                title="Repeated conversation",
+                cwd=project,
+                first_user_message="The same opening message",
+            )
+        for target_id in (target_one, target_two):
+            target_rollout = write_rollout(self.codex_home, target_id, "ProviderB")
+            insert_thread(
+                self.db_path,
+                thread_id=target_id,
+                rollout_path=target_rollout,
+                provider="ProviderB",
+                title="Repeated conversation",
+                cwd=project,
+                first_user_message="The same opening message",
+            )
+
+        invalid = self.transfer.preview_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [source_one],
+                False,
+                True,
+                overwrite=True,
+                overwrite_selections={source_one: "not-a-target"},
+            )
+        )
+        self.assertFalse(invalid["can_execute"], invalid)
+        self.assertIn("not one of the current target candidates", " ".join(invalid["errors"]))
+
+        reused = self.transfer.preview_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [source_one, source_two],
+                False,
+                True,
+                overwrite=True,
+                overwrite_selections={source_one: target_one, source_two: target_one},
+            )
+        )
+        self.assertFalse(reused["can_execute"], reused)
+        self.assertIn("reuses target session", " ".join(reused["errors"]))
 
     def test_local_copy_overwrite_preserves_thread_section_and_project(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

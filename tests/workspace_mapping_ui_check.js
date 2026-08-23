@@ -14,12 +14,19 @@ for (const id of [
   'chooseWorkspaceDirectoryButton',
   'workspaceMappingList',
   'overwriteSessions',
+  'overwriteResolution',
+  'overwriteResolutionItems',
+  'applyOverwriteChoicesButton',
 ]) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `missing mapping control ${id}`);
 }
 
 assert.match(app, /request\.workspace_mapping\s*=/);
 assert.match(app, /overwrite:\s*Boolean\(\$\("overwriteSessions"\)\?\.checked\)/);
+assert.match(app, /overwrite_selections/);
+assert.match(app, /overwrite_ambiguities/);
+assert.match(app, /renderOverwriteResolution\(/);
+assert.match(app, /Resolve .*ambiguous overwrite match/);
 assert.match(app, /\/api\/copy-package-progress/);
 assert.match(app, /streamApi\(/);
 assert.doesNotMatch(app, /reasons\.push\(["']Run Preview first\./);

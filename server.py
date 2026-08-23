@@ -128,6 +128,7 @@ class CopyRequest:
     overwrite: bool = False
     preview_offset: int = 0
     preview_limit: int = DEFAULT_PREVIEW_PAGE_SIZE
+    overwrite_selections: dict[str, str | None] | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "CopyRequest":
@@ -152,6 +153,23 @@ class CopyRequest:
         )
         if cwd_map and workspace_mapping is not None:
             raise ValueError("cwd_map and workspace_mapping cannot be used together")
+        overwrite_selections_raw = data.get("overwrite_selections", {})
+        if overwrite_selections_raw is None:
+            overwrite_selections_raw = {}
+        if not isinstance(overwrite_selections_raw, dict):
+            raise ValueError("overwrite_selections must be an object")
+        overwrite_selections: dict[str, str | None] = {}
+        for source_id, target_id in overwrite_selections_raw.items():
+            source_key = str(source_id).strip()
+            if not source_key:
+                continue
+            if target_id is None:
+                overwrite_selections[source_key] = None
+                continue
+            if not isinstance(target_id, str):
+                raise ValueError("overwrite_selections values must be target ids or null")
+            target_key = target_id.strip()
+            overwrite_selections[source_key] = target_key or None
         try:
             preview_offset = int(data.get("preview_offset", 0))
             preview_limit = int(data.get("preview_limit", DEFAULT_PREVIEW_PAGE_SIZE))
@@ -172,6 +190,7 @@ class CopyRequest:
             cwd_map=cwd_map,
             workspace_mapping=workspace_mapping,
             overwrite=bool(data.get("overwrite", False)),
+            overwrite_selections=overwrite_selections,
             preview_offset=preview_offset,
             preview_limit=preview_limit,
         )
@@ -3421,8 +3440,14 @@ class CodexSessionTransfer:
         target_database = target_conn or conn
         overwritten_ids: set[str] = set()
         overwrite_matches: dict[str, dict[str, Any]] = {}
+        overwrite_ambiguities: list[dict[str, Any]] = []
         if request.overwrite:
-            overwrite_matches, match_warnings = self._match_overwrite_targets(
+            (
+                overwrite_matches,
+                match_warnings,
+                overwrite_ambiguities,
+                overwrite_selection_errors,
+            ) = self._match_overwrite_targets(
                 target_database,
                 rows,
                 final_ids,
@@ -3430,9 +3455,15 @@ class CodexSessionTransfer:
                 target_provider,
                 source_index=session_index,
                 target_index=self._load_session_index(),
+                overwrite_selections=request.overwrite_selections,
             )
             overwritten_ids = {item["id"] for item in overwrite_matches.values()}
             warnings.extend(match_warnings)
+            errors.extend(overwrite_selection_errors)
+            if overwrite_ambiguities:
+                errors.append(
+                    f"{len(overwrite_ambiguities)} ambiguous overwrite match(es) require a target selection or an explicit skip."
+                )
 
         id_map: dict[str, str] = {}
         unmatched_ids: list[str] = []
@@ -3507,6 +3538,7 @@ class CodexSessionTransfer:
             "_cwd_by_source_id": cwd_by_source_id,
             "_overwritten_ids": overwritten_ids,
             "_overwrite_session_index_ids": set(overwritten_ids),
+            "_overwrite_ambiguities": overwrite_ambiguities,
         }
 
     def _empty_plan(
@@ -3530,6 +3562,7 @@ class CodexSessionTransfer:
             "_cwd_by_source_id": {},
             "_overwritten_ids": set(),
             "_overwrite_session_index_ids": set(),
+            "_overwrite_ambiguities": [],
         }
 
     def _append_descendants(
@@ -3642,13 +3675,20 @@ class CodexSessionTransfer:
         *,
         source_index: dict[str, dict[str, Any]],
         target_index: dict[str, dict[str, Any]],
-    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        overwrite_selections: dict[str, str | None] | None = None,
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[str],
+        list[dict[str, Any]],
+        list[str],
+    ]:
         """Find destination sessions that represent the same conversation.
 
         Provider switches can create a new thread id while retaining the same
         project and conversation identity. Exact ids therefore win, followed
         by increasingly conservative metadata matches. Ambiguous matches are
-        left untouched instead of risking an unrelated overwrite.
+        returned as candidate lists so the caller can require an explicit
+        target choice instead of risking an unrelated overwrite.
         """
         target_rows = [
             dict(row)
@@ -3661,6 +3701,15 @@ class CodexSessionTransfer:
         used_targets: set[str] = set()
         matches: dict[str, dict[str, Any]] = {}
         warnings: list[str] = []
+        ambiguities: list[dict[str, Any]] = []
+        selection_errors: list[str] = []
+        selections = dict(overwrite_selections or {})
+
+        unknown_selection_ids = sorted(set(selections) - set(source_ids))
+        for source_id in unknown_selection_ids:
+            selection_errors.append(
+                f"Overwrite selection references a source thread outside this copy: {source_id}."
+            )
 
         def text_key(value: Any) -> str:
             return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
@@ -3690,28 +3739,67 @@ class CodexSessionTransfer:
             set(by_id),
         )
 
-        for source_id in source_ids:
-            source_identity = source_identities.get(source_id)
-            if source_identity is None:
-                continue
+        def display_title(row: dict[str, Any], index: dict[str, dict[str, Any]]) -> str:
+            index_entry = index.get(str(row.get("id") or "")) or {}
+            name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
+            return str(name or row.get("title") or row.get("preview") or row.get("id") or "")
 
+        def candidate_payload(target_id: str) -> dict[str, Any]:
+            row = by_id[target_id]
+            return {
+                "id": target_id,
+                "title": row.get("title") or "",
+                "thread_name": (
+                    (target_index.get(target_id) or {}).get("thread_name")
+                    if isinstance(target_index.get(target_id) or {}, dict)
+                    else None
+                ),
+                "display_title": display_title(row, target_index),
+                "preview": row.get("preview") or "",
+                "first_message": row.get("first_user_message") or "",
+                "cwd": row.get("cwd") or "",
+                "archived": bool(row.get("archived")),
+                "created_at_ms": row.get("created_at_ms"),
+                "updated_at_ms": row.get("updated_at_ms"),
+            }
+
+        def ambiguity_payload(
+            source_id: str,
+            label: str,
+            candidate_ids: list[str],
+        ) -> dict[str, Any]:
+            row = rows[source_id]
+            return {
+                "source_id": source_id,
+                "source_title": row.get("title") or "",
+                "source_thread_name": (
+                    (source_index.get(source_id) or {}).get("thread_name")
+                    if isinstance(source_index.get(source_id) or {}, dict)
+                    else None
+                ),
+                "source_display_title": display_title(row, source_index),
+                "source_preview": row.get("preview") or "",
+                "source_first_message": row.get("first_user_message") or "",
+                "source_cwd": row.get("cwd") or "",
+                "source_archived": bool(row.get("archived")),
+                "reason": label,
+                "candidates": [candidate_payload(target_id) for target_id in candidate_ids],
+            }
+
+        def candidate_pool(
+            source_id: str,
+            source_identity: tuple[str, str, str],
+        ) -> tuple[str, list[str]]:
             exact = by_id.get(source_id)
             if exact is not None and str(exact["id"]) not in used_targets:
-                matches[source_id] = {"id": str(exact["id"]), "match": "session id"}
-                used_targets.add(str(exact["id"]))
-                continue
+                return "session id", [source_id]
 
-            history = historical_candidates.get(source_id, set()) - used_targets
-            if len(history) == 1:
-                target_id = next(iter(history))
-                matches[source_id] = {"id": target_id, "match": "previous transfer"}
-                used_targets.add(target_id)
-                continue
-            if len(history) > 1:
-                warnings.append(
-                    f"Did not overwrite thread {source_id}: previous transfers identify multiple target sessions."
+            history = sorted(historical_candidates.get(source_id, set()) - used_targets)
+            if history:
+                return (
+                    "previous transfer" if len(history) == 1 else "previous transfers",
+                    history,
                 )
-                continue
 
             cwd, title, first_message = source_identity
             predicates: list[tuple[str, Callable[[tuple[str, str, str]], bool]]] = []
@@ -3724,35 +3812,70 @@ class CodexSessionTransfer:
                 )
             if cwd and first_message:
                 predicates.append(
-                    ("project and first message", lambda item: item[0] == cwd and item[2] == first_message)
+                    (
+                        "project and first message",
+                        lambda item: item[0] == cwd and item[2] == first_message,
+                    )
                 )
             if cwd and title:
                 predicates.append(
-                    ("project and title", lambda item: item[0] == cwd and item[1] == title)
+                    (
+                        "project and title",
+                        lambda item: item[0] == cwd and item[1] == title,
+                    )
                 )
 
-            selected: tuple[str, str] | None = None
             for label, predicate in predicates:
-                candidates = [
+                candidates = sorted(
                     target_id
                     for target_id, target_identity in target_identities.items()
                     if target_id not in used_targets and predicate(target_identity)
-                ]
-                if len(candidates) == 1:
-                    selected = (candidates[0], label)
-                    break
-                if len(candidates) > 1:
+                )
+                if candidates:
+                    return label, candidates
+            return "", []
+
+        for source_id in source_ids:
+            source_identity = source_identities.get(source_id)
+            if source_identity is None:
+                continue
+
+            label, candidates = candidate_pool(source_id, source_identity)
+            if source_id in selections:
+                selected_target = selections[source_id]
+                if selected_target is None:
+                    continue
+                if selected_target in used_targets:
+                    selection_errors.append(
+                        f"Overwrite selection for thread {source_id} reuses target session {selected_target}."
+                    )
+                    continue
+                if selected_target not in candidates:
+                    selection_errors.append(
+                        f"Overwrite selection for thread {source_id} is not one of the current target candidates."
+                    )
+                    continue
+                matches[source_id] = {"id": selected_target, "match": "manual selection"}
+                used_targets.add(selected_target)
+                continue
+
+            if len(candidates) == 1:
+                target_id = candidates[0]
+                matches[source_id] = {"id": target_id, "match": label}
+                used_targets.add(target_id)
+                continue
+            if len(candidates) > 1:
+                if label == "previous transfers":
+                    warnings.append(
+                        f"Did not overwrite thread {source_id}: previous transfers identify multiple target sessions."
+                    )
+                else:
                     warnings.append(
                         f"Did not overwrite thread {source_id}: {label} matched multiple target sessions."
                     )
-                    break
+                ambiguities.append(ambiguity_payload(source_id, label, candidates))
 
-            if selected:
-                target_id, label = selected
-                matches[source_id] = {"id": target_id, "match": label}
-                used_targets.add(target_id)
-
-        return matches, warnings
+        return matches, warnings, ambiguities, selection_errors
 
     def _historical_overwrite_candidates(
         self,
@@ -4261,6 +4384,13 @@ class CodexSessionTransfer:
         request: CopyRequest | None = None,
     ) -> dict[str, Any]:
         payload = {key: value for key, value in plan.items() if not key.startswith("_")}
+        ambiguities = plan.get("_overwrite_ambiguities") or []
+        payload["overwrite_ambiguities"] = [
+            self._public_overwrite_ambiguity(item)
+            for item in ambiguities
+            if isinstance(item, dict)
+        ]
+        payload["overwrite_ambiguity_count"] = len(payload["overwrite_ambiguities"])
         if request is None:
             return payload
 
@@ -4294,6 +4424,58 @@ class CodexSessionTransfer:
             if key in item
         }
         for key in ("title", "thread_name", "display_title"):
+            if key in public_item:
+                public_item[key] = _clip_preview_text(public_item[key])
+        return public_item
+
+    def _public_overwrite_ambiguity(self, item: dict[str, Any]) -> dict[str, Any]:
+        public_item = {
+            key: item.get(key)
+            for key in (
+                "source_id",
+                "source_title",
+                "source_thread_name",
+                "source_display_title",
+                "source_preview",
+                "source_first_message",
+                "source_cwd",
+                "source_archived",
+                "reason",
+            )
+            if key in item
+        }
+        public_item["candidates"] = []
+        for candidate in item.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            public_candidate = {
+                key: candidate.get(key)
+                for key in (
+                    "id",
+                    "title",
+                    "thread_name",
+                    "display_title",
+                    "preview",
+                    "first_message",
+                    "cwd",
+                    "archived",
+                    "created_at_ms",
+                    "updated_at_ms",
+                )
+                if key in candidate
+            }
+            for key in ("title", "thread_name", "display_title", "preview", "first_message", "cwd"):
+                if key in public_candidate:
+                    public_candidate[key] = _clip_preview_text(public_candidate[key])
+            public_item["candidates"].append(public_candidate)
+        for key in (
+            "source_title",
+            "source_thread_name",
+            "source_display_title",
+            "source_preview",
+            "source_first_message",
+            "source_cwd",
+        ):
             if key in public_item:
                 public_item[key] = _clip_preview_text(public_item[key])
         return public_item
