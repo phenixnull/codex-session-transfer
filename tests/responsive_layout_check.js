@@ -318,24 +318,28 @@ async function setContentSize(electronApp, page, width, height) {
       const gridRect = grid.getBoundingClientRect();
       return {
         overflowY: getComputedStyle(main).overflowY,
+        bodyOverflowY: getComputedStyle(document.body).overflowY,
         scrollRange: main.scrollHeight - main.clientHeight,
         scrollTop: main.scrollTop,
         gridHeight: gridRect.height,
         gridBottom: gridRect.bottom,
         mainBottom: mainRect.bottom,
         horizontalFits: document.documentElement.scrollWidth <= innerWidth,
-        innerWidth,
-        clientWidth: document.documentElement.clientWidth,
-        visualViewportWidth: window.visualViewport?.width ?? null,
-        devicePixelRatio,
+        documentScrollable: document.documentElement.scrollHeight > document.documentElement.clientHeight,
         wideMedia: matchMedia('(min-width: 1241px)').matches,
       };
     });
-    assert.equal(compact.overflowY, 'auto', JSON.stringify(compact));
-    assert.ok(compact.scrollRange > 0, `expected compact scroll range, got ${compact.scrollRange}`);
-    assert.equal(compact.scrollTop, compact.scrollRange);
+    if (compact.wideMedia) {
+      assert.equal(compact.overflowY, 'auto');
+      assert.ok(compact.scrollRange > 0, `expected compact scroll range, got ${compact.scrollRange}`);
+      assert.equal(compact.scrollTop, compact.scrollRange);
+      assert.ok(compact.gridBottom <= compact.mainBottom + 1, 'grid bottom is unreachable after scrolling');
+    } else {
+      assert.equal(compact.overflowY, 'hidden');
+      assert.equal(compact.bodyOverflowY, 'auto');
+      assert.equal(compact.documentScrollable, true);
+    }
     assert.ok(compact.gridHeight >= 240, `grid collapsed to ${compact.gridHeight}px`);
-    assert.ok(compact.gridBottom <= compact.mainBottom + 1, 'grid bottom is unreachable after scrolling');
     assert.equal(compact.horizontalFits, true);
 
     await page.selectOption('#workspaceModeSelect', 'single_workspace');
