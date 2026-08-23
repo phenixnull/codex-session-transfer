@@ -288,7 +288,8 @@ async function setContentSize(electronApp, page, width, height) {
     page.on('pageerror', (error) => pageErrors.push(error.message));
     await page.waitForSelector('#sessionTransferGrid');
 
-    await setContentSize(electronApp, page, 1366, 768);
+    // Leave enough physical width for the 1241px CSS breakpoint on Retina runners.
+    await setContentSize(electronApp, page, 1800, 768);
     await page.click('#packageModeButton');
     await page.check('#selectAll');
     await page.waitForFunction(() => document.querySelectorAll('.workspace-mapping-row').length === 10);
