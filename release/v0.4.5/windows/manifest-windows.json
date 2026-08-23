@@ -1,21 +1,21 @@
 {
   "version": "0.4.5",
   "platform": "win",
-  "built_at": "2026-08-23T03:51:42.138696Z",
+  "built_at": "2026-08-23T06:08:25.825063Z",
   "artifacts": [
     {
       "file": "Codex.Session.Transfer-0.4.5-Portable-x64.exe",
-      "sha256": "33f8c9023b6dd29f7328d8808758aeb2b00565fa1d1aa7943283e3156e7309a0",
-      "bytes": 102759283
+      "sha256": "682d941392af94a241b7f684144d63b0e75334d94f0d15fceb6c652e1786cda2",
+      "bytes": 102765728
     },
     {
       "file": "Codex.Session.Transfer-0.4.5-Setup-x64.exe",
-      "sha256": "c72ed18788f08f15fa3ed9de1fbcafce8c107ef51344f7f2ce741adba93f9f9f",
-      "bytes": 103013071
+      "sha256": "9bc79e0aeb88bcab9bd75331184f190438db1e518fb7b6ec54e3468ddc727290",
+      "bytes": 103019520
     },
     {
       "file": "latest.yml",
-      "sha256": "a700ba787bf7c2dc782cf008e7209a57f863afdc8b1abe95dc2111228d6ca009",
+      "sha256": "4dc072f2051274cebe5541ad8a1cd5576f3a77e5aaf3ca2b76888bb966dcdd60",
       "bytes": 389
     }
   ]
