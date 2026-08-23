@@ -324,9 +324,14 @@ async function setContentSize(electronApp, page, width, height) {
         gridBottom: gridRect.bottom,
         mainBottom: mainRect.bottom,
         horizontalFits: document.documentElement.scrollWidth <= innerWidth,
+        innerWidth,
+        clientWidth: document.documentElement.clientWidth,
+        visualViewportWidth: window.visualViewport?.width ?? null,
+        devicePixelRatio,
+        wideMedia: matchMedia('(min-width: 1241px)').matches,
       };
     });
-    assert.equal(compact.overflowY, 'auto');
+    assert.equal(compact.overflowY, 'auto', JSON.stringify(compact));
     assert.ok(compact.scrollRange > 0, `expected compact scroll range, got ${compact.scrollRange}`);
     assert.equal(compact.scrollTop, compact.scrollRange);
     assert.ok(compact.gridHeight >= 240, `grid collapsed to ${compact.gridHeight}px`);
