@@ -28,6 +28,9 @@ SESSION_INDEX_FILENAME = "session_index.jsonl"
 BLOCKING_PROCESS_NAMES = {"codex", "codex-plus-plus", "codex-plus-plus-manager"}
 DEFAULT_THREAD_DETAIL_LIMIT = 80
 MAX_THREAD_DETAIL_LIMIT = 200
+DEFAULT_PREVIEW_PAGE_SIZE = 48
+MAX_PREVIEW_PAGE_SIZE = 200
+PREVIEW_TITLE_LIMIT = 320
 PACKAGE_FORMAT = "codex-session-transfer-package"
 PACKAGE_VERSION = 1
 PACKAGE_MANIFEST_NAME = "manifest.json"
@@ -37,7 +40,7 @@ SKILL_PACKAGE_FORMAT = "codex-skill-transfer-package"
 SKILL_PACKAGE_VERSION = 1
 SKILL_PACKAGE_DIRNAME = "skills"
 ROLLOUT_NAME_RE = re.compile(
-    r"^(?P<prefix>rollout-.+-)"
+    r"^(?P<prefix>rollout-.+(?:-|_))"
     r"(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
     r"(?P<suffix>\.jsonl)$"
@@ -47,6 +50,34 @@ SECRET_PATTERNS = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
 )
+PREVIEW_ITEM_FIELDS = (
+    "source_id",
+    "target_id",
+    "title",
+    "thread_name",
+    "display_title",
+    "session_index_present",
+    "source_provider",
+    "target_provider",
+    "source_cwd",
+    "target_cwd",
+    "cwd_rewritten",
+    "archived",
+    "parent_source_id",
+    "parent_target_id",
+    "child_count",
+    "overwritten",
+    "overwrite_match",
+)
+
+
+def _clip_preview_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    if len(text) <= PREVIEW_TITLE_LIMIT:
+        return text
+    return text[: PREVIEW_TITLE_LIMIT - 3] + "..."
 CODEX_DEFAULT_SOURCE_KINDS = {"cli", "vscode"}
 DEFAULT_IMPORTED_SOURCE_KIND = "vscode"
 DEFAULT_IMPORTED_THREAD_SOURCE = "user"
@@ -95,6 +126,8 @@ class CopyRequest:
     cwd_map: dict[str, str] | None = None
     workspace_mapping: WorkspaceMapping | None = None
     overwrite: bool = False
+    preview_offset: int = 0
+    preview_limit: int = DEFAULT_PREVIEW_PAGE_SIZE
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "CopyRequest":
@@ -119,6 +152,17 @@ class CopyRequest:
         )
         if cwd_map and workspace_mapping is not None:
             raise ValueError("cwd_map and workspace_mapping cannot be used together")
+        try:
+            preview_offset = int(data.get("preview_offset", 0))
+            preview_limit = int(data.get("preview_limit", DEFAULT_PREVIEW_PAGE_SIZE))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("preview_offset and preview_limit must be integers") from exc
+        if preview_offset < 0:
+            raise ValueError("preview_offset must be non-negative")
+        if not 1 <= preview_limit <= MAX_PREVIEW_PAGE_SIZE:
+            raise ValueError(
+                f"preview_limit must be between 1 and {MAX_PREVIEW_PAGE_SIZE}"
+            )
         return cls(
             source_provider=str(data.get("source_provider", "")).strip(),
             target_provider=str(data.get("target_provider", "")).strip(),
@@ -128,6 +172,8 @@ class CopyRequest:
             cwd_map=cwd_map,
             workspace_mapping=workspace_mapping,
             overwrite=bool(data.get("overwrite", False)),
+            preview_offset=preview_offset,
+            preview_limit=preview_limit,
         )
 
 
@@ -449,6 +495,31 @@ class CodexSessionTransfer:
             )
         return result
 
+    def _configured_provider_details(self) -> dict[str, dict[str, Any]]:
+        """Read every provider section so source and target use one catalog."""
+        config_path = self.codex_home / "config.toml"
+        if not config_path.exists():
+            return {}
+        try:
+            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return {}
+        providers = data.get("model_providers") or {}
+        if not isinstance(providers, dict):
+            return {}
+
+        details: dict[str, dict[str, Any]] = {}
+        for provider_id, provider_info in providers.items():
+            if not isinstance(provider_info, dict):
+                provider_info = {}
+            details[str(provider_id)] = {
+                "provider_name": provider_info.get("name"),
+                "base_url": provider_info.get("base_url"),
+                "wire_api": provider_info.get("wire_api"),
+                "model": data.get("model"),
+            }
+        return details
+
     def list_target_providers(self) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}
 
@@ -493,6 +564,17 @@ class CodexSessionTransfer:
                 model=current.get("model"),
                 base_url=current.get("base_url"),
                 wire_api=current.get("wire_api"),
+            )
+
+        for provider_id, details in self._configured_provider_details().items():
+            upsert(
+                provider_id,
+                source="live_config" if provider_id == current_provider else "config",
+                current=provider_id == current_provider,
+                provider_name=details.get("provider_name"),
+                model=details.get("model"),
+                base_url=details.get("base_url"),
+                wire_api=details.get("wire_api"),
             )
 
         for value, item in merged.items():
@@ -681,7 +763,10 @@ class CodexSessionTransfer:
             query += "\nLIMIT ?"
             params.append(recent_limit)
         rows = conn.execute(query, params).fetchall()
-        return [self._thread_summary(conn, row, session_index) for row in rows]
+        return [
+            self._thread_summary(conn, row, session_index, compact=True)
+            for row in rows
+        ]
 
     def thread_detail(
         self,
@@ -761,14 +846,61 @@ class CodexSessionTransfer:
             "has_more": has_more,
         }
 
+    @staticmethod
+    def _report_copy_progress(
+        callback: Callable[[dict[str, Any]], None] | None,
+        *,
+        phase: str,
+        current: int = 0,
+        total: int = 0,
+        message: str = "",
+        item: dict[str, Any] | None = None,
+    ) -> None:
+        if callback is None:
+            return
+        event: dict[str, Any] = {
+            "type": "progress",
+            "phase": phase,
+            "current": max(0, int(current)),
+            "total": max(0, int(total)),
+        }
+        if message:
+            event["message"] = message
+        if item:
+            item_title = item.get("display_title") or item.get("title") or item.get("source_id")
+            event["item_title"] = _clip_preview_text(item_title)
+            event["source_id"] = item.get("source_id")
+        try:
+            callback(event)
+        except OSError:
+            # A disconnected browser should not interrupt an already started copy.
+            pass
+
     def preview_copy(self, request: CopyRequest) -> dict[str, Any]:
         with closing(self._connect(read_only=True)) as conn:
             plan = self._build_copy_plan(conn, request)
-        return self._public_plan(plan)
+        return self._public_plan(plan, request=request)
 
-    def copy_threads(self, request: CopyRequest) -> dict[str, Any]:
+    def copy_threads(
+        self,
+        request: CopyRequest,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        progress_total = max(len(request.thread_ids), 1)
+        self._report_copy_progress(
+            progress_callback,
+            phase="checking",
+            total=progress_total,
+            message="Checking the destination and selected sessions",
+        )
         blocking = self.blocking_processes()
         if blocking:
+            self._report_copy_progress(
+                progress_callback,
+                phase="blocked",
+                total=progress_total,
+                message="Close Codex and the provider switcher before copying",
+            )
             payload = {
                 "ok": False,
                 "blocked": True,
@@ -779,12 +911,33 @@ class CodexSessionTransfer:
             payload["manifest_path"] = str(manifest_path)
             return payload
 
+        self._report_copy_progress(
+            progress_callback,
+            phase="planning",
+            total=progress_total,
+            message="Building the copy plan",
+        )
         preflight = self.preview_copy(request)
         if not preflight["can_execute"]:
+            self._report_copy_progress(
+                progress_callback,
+                phase="error",
+                total=progress_total,
+                message=(preflight.get("errors") or ["Copy plan is not executable"])[0],
+            )
             payload = {"ok": False, "blocked": False, **preflight}
             manifest_path = self._write_manifest(payload, request)
             payload["manifest_path"] = str(manifest_path)
             return payload
+
+        self._report_copy_progress(
+            progress_callback,
+            phase="ready",
+            total=int(preflight.get("item_total") or len(preflight.get("items") or [])),
+            message=(
+                f"Ready to copy {int(preflight.get('item_total') or len(preflight.get('items') or []))} session(s)"
+            ),
+        )
 
         self.manifest_dir.mkdir(parents=True, exist_ok=True)
         backup_path = self._backup_database()
@@ -816,7 +969,8 @@ class CodexSessionTransfer:
                         plan["_overwrite_session_index_ids"] = set(
                             plan.get("_overwrite_session_index_ids", set())
                         ) | target_index_ids.intersection(plan["_id_map"].values())
-                    for item in plan["items"]:
+                    total_items = len(plan["items"])
+                    for index, item in enumerate(plan["items"], start=1):
                         self._write_rollout_copy(
                             Path(item["source_rollout_path"]),
                             Path(item["dest_rollout_path"]),
@@ -827,10 +981,24 @@ class CodexSessionTransfer:
                             overwrite=Path(item["dest_rollout_path"]) in overwrite_paths,
                         )
                         copied_paths.append(Path(item["dest_rollout_path"]))
+                        self._report_copy_progress(
+                            progress_callback,
+                            phase="copying",
+                            current=index,
+                            total=total_items,
+                            item=item,
+                        )
 
                     self._insert_thread_rows(conn, plan, plan["target_provider"])
                     self._insert_spawn_edges(conn, plan)
                     self._insert_dynamic_tools(conn, plan)
+                    self._report_copy_progress(
+                        progress_callback,
+                        phase="committing",
+                        current=total_items,
+                        total=total_items,
+                        message="Committing the database and session index",
+                    )
                     session_index_snapshot = self._snapshot_session_index()
                     session_index_entries = self._append_session_index_entries(plan)
                     conn.commit()
@@ -874,6 +1042,17 @@ class CodexSessionTransfer:
 
         manifest_path = self._write_manifest(manifest_payload, request)
         manifest_payload["manifest_path"] = str(manifest_path)
+        self._report_copy_progress(
+            progress_callback,
+            phase="done" if manifest_payload.get("ok") else "error",
+            current=len(manifest_payload.get("items") or []),
+            total=len(manifest_payload.get("items") or []) or progress_total,
+            message=(
+                f"Copied {len(manifest_payload.get('items') or [])} session(s)"
+                if manifest_payload.get("ok")
+                else (manifest_payload.get("errors") or ["Copy failed"])[0]
+            ),
+        )
         return manifest_payload
 
     def blocking_processes(self) -> list[dict[str, Any]]:
@@ -1336,12 +1515,29 @@ class CodexSessionTransfer:
                     source_index=self._load_session_index_from_path(package.session_index_path),
                     dest_path_resolver=self._dest_rollout_path_for_import,
                 )
-        return self._public_plan(plan)
+        return self._public_plan(plan, request=request)
 
-    def copy_imported_package_threads(self, request: CopyRequest) -> dict[str, Any]:
+    def copy_imported_package_threads(
+        self,
+        request: CopyRequest,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         package = self._require_loaded_package()
+        progress_total = max(len(request.thread_ids), 1)
+        self._report_copy_progress(
+            progress_callback,
+            phase="checking",
+            total=progress_total,
+            message="Checking the destination and selected sessions",
+        )
         blocking = self.blocking_processes()
         if blocking:
+            self._report_copy_progress(
+                progress_callback,
+                phase="blocked",
+                total=progress_total,
+                message="Close Codex and the provider switcher before importing",
+            )
             payload = {
                 "ok": False,
                 "blocked": True,
@@ -1353,12 +1549,33 @@ class CodexSessionTransfer:
             payload["manifest_path"] = str(manifest_path)
             return payload
 
+        self._report_copy_progress(
+            progress_callback,
+            phase="planning",
+            total=progress_total,
+            message="Building the import plan",
+        )
         preflight = self.preview_imported_package_copy(request)
         if not preflight["can_execute"]:
+            self._report_copy_progress(
+                progress_callback,
+                phase="error",
+                total=progress_total,
+                message=(preflight.get("errors") or ["Import plan is not executable"])[0],
+            )
             payload = {"ok": False, "blocked": False, **preflight, "package_path": str(package.package_path)}
             manifest_path = self._write_manifest(payload, request)
             payload["manifest_path"] = str(manifest_path)
             return payload
+
+        self._report_copy_progress(
+            progress_callback,
+            phase="ready",
+            total=int(preflight.get("item_total") or len(preflight.get("items") or [])),
+            message=(
+                f"Ready to import {int(preflight.get('item_total') or len(preflight.get('items') or []))} session(s)"
+            ),
+        )
 
         self.manifest_dir.mkdir(parents=True, exist_ok=True)
         backup_path = self._backup_database()
@@ -1398,7 +1615,8 @@ class CodexSessionTransfer:
                             plan["_overwrite_session_index_ids"] = set(
                                 plan.get("_overwrite_session_index_ids", set())
                             ) | target_index_ids.intersection(plan["_id_map"].values())
-                        for item in plan["items"]:
+                        total_items = len(plan["items"])
+                        for index, item in enumerate(plan["items"], start=1):
                             destination_path = Path(item["dest_rollout_path"])
                             self._write_rollout_copy(
                                 Path(item["source_rollout_path"]),
@@ -1413,10 +1631,24 @@ class CodexSessionTransfer:
                                 overwrite=destination_path in overwrite_paths,
                             )
                             copied_paths.append(destination_path)
+                            self._report_copy_progress(
+                                progress_callback,
+                                phase="copying",
+                                current=index,
+                                total=total_items,
+                                item=item,
+                            )
 
                         self._insert_thread_rows(target_conn, plan, plan["target_provider"])
                         self._insert_spawn_edges_from_source(source_conn, target_conn, plan)
                         self._insert_dynamic_tools_from_source(source_conn, target_conn, plan)
+                        self._report_copy_progress(
+                            progress_callback,
+                            phase="committing",
+                            current=total_items,
+                            total=total_items,
+                            message="Committing the database and session index",
+                        )
                         session_index_snapshot = self._snapshot_session_index()
                         session_index_entries = self._append_session_index_entries(
                             plan,
@@ -1466,6 +1698,17 @@ class CodexSessionTransfer:
 
         manifest_path = self._write_manifest(manifest_payload, request)
         manifest_payload["manifest_path"] = str(manifest_path)
+        self._report_copy_progress(
+            progress_callback,
+            phase="done" if manifest_payload.get("ok") else "error",
+            current=len(manifest_payload.get("items") or []),
+            total=len(manifest_payload.get("items") or []) or progress_total,
+            message=(
+                f"Imported {len(manifest_payload.get('items') or [])} session(s)"
+                if manifest_payload.get("ok")
+                else (manifest_payload.get("errors") or ["Import failed"])[0]
+            ),
+        )
         return manifest_payload
 
     def _connect(self, *, read_only: bool) -> sqlite3.Connection:
@@ -2493,6 +2736,8 @@ class CodexSessionTransfer:
         conn: sqlite3.Connection,
         row: sqlite3.Row,
         session_index: dict[str, dict[str, Any]],
+        *,
+        compact: bool = False,
     ) -> dict[str, Any]:
         thread_id = row["id"]
         parent = self._parent_thread_id(conn, thread_id) or self._source_parent_id(row["source"])
@@ -2503,13 +2748,19 @@ class CodexSessionTransfer:
         rollout_path = Path(row["rollout_path"])
         index_entry = session_index.get(thread_id) or {}
         thread_name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
-        display_title = thread_name or row["title"] or row["preview"] or thread_id
+        title = row["title"]
+        preview = row["preview"]
+        if compact:
+            title = _clip_preview_text(title)
+            thread_name = _clip_preview_text(thread_name) if thread_name else None
+            preview = _clip_preview_text(preview)
+        display_title = thread_name or title or preview or thread_id
         return {
             "id": thread_id,
-            "title": row["title"],
+            "title": title,
             "thread_name": thread_name,
             "display_title": display_title,
-            "preview": row["preview"],
+            "preview": preview,
             "model_provider": row["model_provider"],
             "model": row["model"],
             "source": row["source"],
@@ -2784,6 +3035,17 @@ class CodexSessionTransfer:
             errors.append("target_provider is required")
         if not ordered_ids:
             errors.append("Select at least one thread")
+        config_path = self.codex_home / "config.toml"
+        configured_provider_ids = {
+            str(value).strip()
+            for value in self.current_config().get("configured_provider_ids", [])
+            if str(value).strip()
+        }
+        if target_provider and config_path.exists() and target_provider not in configured_provider_ids:
+            errors.append(
+                f"Target provider '{target_provider}' is not defined in {config_path}. "
+                f"Add [model_providers.{target_provider}] or choose a configured provider."
+            )
         if errors:
             return self._empty_plan(request, errors, warnings)
         if target_provider_warning:
@@ -3557,8 +3819,53 @@ class CodexSessionTransfer:
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return manifest_path
 
-    def _public_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in plan.items() if not key.startswith("_")}
+    def _public_plan(
+        self,
+        plan: dict[str, Any],
+        *,
+        request: CopyRequest | None = None,
+    ) -> dict[str, Any]:
+        payload = {key: value for key, value in plan.items() if not key.startswith("_")}
+        if request is None:
+            return payload
+
+        all_items = payload.get("items") or []
+        offset = min(request.preview_offset, len(all_items))
+        end = min(offset + request.preview_limit, len(all_items))
+        payload["items"] = [self._public_plan_item(item) for item in all_items[offset:end]]
+        payload["item_total"] = len(all_items)
+        payload["preview_offset"] = offset
+        payload["preview_limit"] = request.preview_limit
+        payload["has_more"] = end < len(all_items)
+        payload["next_preview_offset"] = end if end < len(all_items) else None
+        return payload
+
+    def _public_plan_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        public_item = {
+            key: item[key]
+            for key in PREVIEW_ITEM_FIELDS
+            if key in item
+        }
+        for key in ("title", "thread_name", "display_title"):
+            if key in public_item:
+                public_item[key] = _clip_preview_text(public_item[key])
+        return public_item
+
+    def public_copy_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        payload = {key: value for key, value in result.items() if not key.startswith("_")}
+        items = result.get("items") or []
+        payload["items"] = [
+            self._public_plan_item(item)
+            for item in items
+            if isinstance(item, dict)
+        ]
+        payload["item_total"] = int(result.get("item_total") or len(items))
+        payload["overwritten_count"] = sum(
+            1
+            for item in items
+            if isinstance(item, dict) and item.get("overwritten")
+        )
+        return payload
 
     def _manifest_safe_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         cloned = json.loads(json.dumps(payload, ensure_ascii=False))
@@ -3652,6 +3959,8 @@ def app_base_dir() -> Path:
 
 def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[SimpleHTTPRequestHandler]:
     class TransferRequestHandler(SimpleHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, directory=str(static_dir), **kwargs)
 
@@ -3818,18 +4127,28 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                     self._send_json(transfer.import_skills(request))
                     return
 
+                if self.path in {"/api/copy-progress", "/api/copy-package-progress"}:
+                    request = CopyRequest.from_json(self._read_json())
+                    self._stream_copy(
+                        request,
+                        package=self.path == "/api/copy-package-progress",
+                    )
+                    return
+
                 request = CopyRequest.from_json(self._read_json())
                 if self.path == "/api/preview-copy":
                     self._send_json(transfer.preview_copy(request))
                     return
                 if self.path == "/api/copy":
-                    self._send_json(transfer.copy_threads(request))
+                    self._send_json(transfer.public_copy_result(transfer.copy_threads(request)))
                     return
                 if self.path == "/api/preview-package-copy":
                     self._send_json(transfer.preview_imported_package_copy(request))
                     return
                 if self.path == "/api/copy-package":
-                    self._send_json(transfer.copy_imported_package_threads(request))
+                    self._send_json(
+                        transfer.public_copy_result(transfer.copy_imported_package_threads(request))
+                    )
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
             except ValueError as exc:
@@ -3839,6 +4158,47 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                     {"ok": False, "errors": [str(exc)]},
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+
+        def _stream_copy(self, request: CopyRequest, *, package: bool) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            def send_event(payload: dict[str, Any]) -> None:
+                body = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+                chunk = f"{len(body):X}\r\n".encode("ascii") + body + b"\r\n"
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except OSError:
+                    # A disconnected browser should not interrupt an already started copy.
+                    pass
+
+            try:
+                result = (
+                    transfer.copy_imported_package_threads(request, progress_callback=send_event)
+                    if package
+                    else transfer.copy_threads(request, progress_callback=send_event)
+                )
+            except Exception as exc:
+                send_event(
+                    {
+                        "type": "progress",
+                        "phase": "error",
+                        "current": 0,
+                        "total": max(len(request.thread_ids), 1),
+                        "message": str(exc),
+                    }
+                )
+                result = {"ok": False, "blocked": False, "errors": [str(exc)], "items": []}
+            send_event({"type": "complete", "result": transfer.public_copy_result(result)})
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                pass
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))

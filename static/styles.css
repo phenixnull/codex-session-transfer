@@ -1544,6 +1544,19 @@ td p {
   overflow: auto;
 }
 
+.preview-pane .preview-items {
+  flex: 1 1 auto;
+  min-height: 80px;
+}
+
+.preview-lazy-status {
+  justify-self: center;
+  color: var(--faint-foreground);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 3px 0 7px;
+}
+
 .message {
   border-radius: var(--radius-control);
   font-size: 12px;
@@ -1604,6 +1617,96 @@ td p {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   margin-top: auto;
+}
+
+.preview-pane .copy-actions {
+  margin-top: 0;
+}
+
+.copy-progress {
+  display: grid;
+  gap: 7px;
+  border: 1px solid color-mix(in oklch, var(--primary) 30%, var(--border));
+  border-radius: var(--radius-panel);
+  background: color-mix(in oklch, var(--primary) 10%, var(--muted));
+  padding: 9px 10px;
+}
+
+.copy-progress.active {
+  border-color: color-mix(in oklch, var(--primary) 58%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--primary) 16%, transparent);
+}
+
+.copy-progress.complete {
+  border-color: var(--status-success-border);
+  background: var(--status-success-muted);
+}
+
+.copy-progress.error {
+  border-color: var(--status-error-border);
+  background: var(--status-error-muted);
+}
+
+.copy-progress-head,
+.copy-progress-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.copy-progress-head strong {
+  color: var(--foreground-strong);
+  font-size: 12px;
+}
+
+.copy-progress-head span,
+.copy-progress-foot span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.copy-progress-foot span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copy-progress-track {
+  position: relative;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--muted) 82%, black);
+}
+
+.copy-progress-bar {
+  display: block;
+  position: relative;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: width 120ms ease-out;
+}
+
+.copy-progress.active .copy-progress-bar::after {
+  position: absolute;
+  inset: 0;
+  width: 34%;
+  background: color-mix(in oklch, white 28%, transparent);
+  content: "";
+  transform: translateX(-120%);
+  animation: copy-progress-glint 1.1s linear infinite;
+}
+
+@keyframes copy-progress-glint {
+  to {
+    transform: translateX(340%);
+  }
 }
 
 #previewButton {

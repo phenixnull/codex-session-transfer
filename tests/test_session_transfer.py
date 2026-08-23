@@ -2,10 +2,13 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 import zipfile
 from contextlib import closing
 from datetime import UTC, datetime
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,9 +16,12 @@ from server import (
     CodexSessionTransfer,
     CopyRequest,
     ExportPackageRequest,
+    MAX_PREVIEW_PAGE_SIZE,
+    PREVIEW_TITLE_LIMIT,
     SkillImportRequest,
     SkillPackageRequest,
     WorkspaceMapping,
+    make_handler,
 )
 
 
@@ -487,6 +493,33 @@ class SessionTransferTests(unittest.TestCase):
 
         self.assertEqual([thread["id"] for thread in threads], [newest_id, middle_id])
 
+    def test_thread_list_compacts_display_text_without_compacting_detail(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        long_title = "Title: " + "t" * 2000
+        long_preview = "Preview: " + "p" * 2000
+        long_name = "Name: " + "n" * 2000
+        self.add_thread(
+            thread_id,
+            title=long_title,
+            preview=long_preview,
+        )
+        self.write_session_index(thread_id, long_name)
+
+        listed = self.transfer.list_threads(
+            source_provider="ProviderA",
+            include_archived=True,
+        )
+        self.assertEqual(len(listed), 1)
+        self.assertLessEqual(len(listed[0]["title"]), PREVIEW_TITLE_LIMIT)
+        self.assertLessEqual(len(listed[0]["preview"]), PREVIEW_TITLE_LIMIT)
+        self.assertLessEqual(len(listed[0]["thread_name"]), PREVIEW_TITLE_LIMIT)
+        self.assertLessEqual(len(listed[0]["display_title"]), PREVIEW_TITLE_LIMIT)
+
+        detail = self.transfer.thread_detail(thread_id)
+        self.assertEqual(detail["thread"]["title"], long_title)
+        self.assertEqual(detail["thread"]["preview"], long_preview)
+        self.assertEqual(detail["thread"]["thread_name"], long_name)
+
     def test_thread_detail_reads_rollout_as_renderable_session_items(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         rollout_path = write_rollout(
@@ -724,6 +757,31 @@ class SessionTransferTests(unittest.TestCase):
         payload = json.loads(first_line)["item"]["payload"]
         self.assertEqual(payload["id"], item["target_id"])
         self.assertEqual(payload["model_provider"], "ProviderB")
+
+    def test_copy_accepts_current_rollout_names_with_composite_session_ids(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_path = self.add_thread(thread_id, title="Current rollout name")
+        composite_path = source_path.with_name(
+            "rollout-2026-08-22T16-53-01-01a02832-bc7a-7163-a988-11b4d47af310_"
+            "01a028ac-64bb-7380-adfc-61dd04ab421f.jsonl"
+        )
+        source_path.rename(composite_path)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                (str(composite_path), thread_id),
+            )
+            conn.commit()
+
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderB", [thread_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        destination = Path(result["items"][0]["dest_rollout_path"])
+        self.assertTrue(destination.exists())
+        self.assertIn("_", destination.name)
+        self.assertTrue(destination.name.endswith(".jsonl"))
 
     def test_copy_single_thread_allows_same_provider(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -1097,6 +1155,424 @@ requires_openai_auth = true
         self.assertEqual(by_value["custom"]["model"], "gpt-5.5")
         self.assertEqual(by_value["custom"]["provider_name"], "xixiapi")
         self.assertFalse(by_value["OpenAI"]["current"])
+
+    def test_target_providers_include_non_current_configured_provider_details(self) -> None:
+        self.add_thread("11111111-1111-4111-8111-111111111111", "custom", title="Old provider")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "Fucheers"
+model = "gpt-5.6"
+
+[model_providers.Fucheers]
+name = "Fucheers"
+base_url = "https://www.fucheers.top/v1"
+wire_api = "responses"
+
+[model_providers.custom]
+name = "xixiapi"
+base_url = "https://www.fucheers.top/v1"
+wire_api = "responses"
+""",
+            encoding="utf-8",
+        )
+
+        providers = {provider["value"]: provider for provider in self.transfer.list_target_providers()}
+
+        self.assertEqual(providers["custom"]["provider_name"], "xixiapi")
+        self.assertIn("config", providers["custom"]["sources"])
+        self.assertFalse(providers["custom"]["current"])
+
+    def test_copy_reports_progress_and_rejects_unconfigured_target(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(source_id, provider="ProviderA", title="Progress")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "ProviderB"
+
+[model_providers.ProviderB]
+name = "Provider B"
+""",
+            encoding="utf-8",
+        )
+
+        blocked_plan = self.transfer.preview_copy(
+            CopyRequest("ProviderA", "ProviderA", [source_id], False, True)
+        )
+        self.assertFalse(blocked_plan["can_execute"])
+        self.assertIn("not defined", blocked_plan["errors"][0])
+
+        events: list[dict[str, object]] = []
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderB", [source_id], False, True),
+            progress_callback=events.append,
+        )
+
+        self.assertTrue(result["ok"], result)
+        phases = [event["phase"] for event in events]
+        self.assertIn("planning", phases)
+        self.assertIn("copying", phases)
+        self.assertIn("committing", phases)
+        self.assertEqual(phases[-1], "done")
+
+    def test_preview_returns_only_requested_page_and_total(self) -> None:
+        thread_ids = [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        ]
+        for index, thread_id in enumerate(thread_ids, start=1):
+            self.add_thread(thread_id, provider="ProviderA", title=f"Session {index}")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "ProviderB"
+
+[model_providers.ProviderB]
+name = "Provider B"
+""",
+            encoding="utf-8",
+        )
+
+        plan = self.transfer.preview_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                thread_ids,
+                False,
+                True,
+                preview_offset=1,
+                preview_limit=1,
+            )
+        )
+
+        self.assertTrue(plan["can_execute"], plan)
+        self.assertEqual(plan["item_total"], 3)
+        self.assertEqual(plan["preview_offset"], 1)
+        self.assertEqual(plan["preview_limit"], 1)
+        self.assertTrue(plan["has_more"])
+        self.assertEqual(plan["next_preview_offset"], 2)
+        self.assertEqual([item["title"] for item in plan["items"]], ["Session 2"])
+
+    def test_preview_and_public_copy_results_bound_large_session_labels(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        long_title = "User prompt: " + "x" * 2000
+        self.add_thread(thread_id, provider="ProviderA", title=long_title)
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "ProviderB"
+
+[model_providers.ProviderB]
+name = "Provider B"
+""",
+            encoding="utf-8",
+        )
+
+        plan = self.transfer.preview_copy(
+            CopyRequest("ProviderA", "ProviderB", [thread_id], False, True)
+        )
+
+        self.assertLessEqual(len(plan["items"][0]["title"]), PREVIEW_TITLE_LIMIT)
+        self.assertLessEqual(len(plan["items"][0]["display_title"]), PREVIEW_TITLE_LIMIT)
+        self.assertNotIn("source_rollout_path", plan["items"][0])
+        self.assertNotIn("dest_rollout_path", plan["items"][0])
+        self.assertLess(len(json.dumps(plan, ensure_ascii=False)), 20_000)
+
+        events: list[dict[str, object]] = []
+        self.transfer._report_copy_progress(
+            events.append,
+            phase="copying",
+            current=1,
+            total=1,
+            item={"display_title": long_title, "source_id": thread_id},
+        )
+        self.assertLessEqual(len(str(events[0]["item_title"])), PREVIEW_TITLE_LIMIT)
+
+        public_result = self.transfer.public_copy_result(
+            {
+                "ok": True,
+                "items": [
+                    {
+                        "source_id": thread_id,
+                        "target_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                        "display_title": long_title,
+                        "source_rollout_path": "source.jsonl",
+                        "dest_rollout_path": "target.jsonl",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(public_result["item_total"], 1)
+        self.assertNotIn("source_rollout_path", public_result["items"][0])
+        self.assertNotIn("dest_rollout_path", public_result["items"][0])
+        self.assertLessEqual(
+            len(public_result["items"][0]["display_title"]), PREVIEW_TITLE_LIMIT
+        )
+
+    def test_http_preview_and_copy_progress_use_compact_public_payloads(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        long_title = "HTTP session: " + "x" * 2000
+        source_rollout = self.add_thread(thread_id, provider="ProviderA", title=long_title)
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "ProviderB"
+
+[model_providers.ProviderB]
+name = "Provider B"
+""",
+            encoding="utf-8",
+        )
+
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(self.transfer, Path(__file__).resolve().parents[1] / "static"),
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        def post(path: str) -> tuple[dict[str, str], bytes]:
+            connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                connection.request(
+                    "POST",
+                    path,
+                    body=json.dumps(
+                        {
+                            "source_provider": "ProviderA",
+                            "target_provider": "ProviderB",
+                            "thread_ids": [thread_id],
+                            "include_archived": True,
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                return dict(response.getheaders()), body
+            finally:
+                connection.close()
+
+        try:
+            preview_headers, preview_body = post("/api/preview-copy")
+            preview = json.loads(preview_body)
+            preview_item = preview["items"][0]
+            self.assertIn("application/json", preview_headers["Content-Type"])
+            self.assertLessEqual(len(preview_item["display_title"]), PREVIEW_TITLE_LIMIT)
+            self.assertNotIn("source_rollout_path", preview_item)
+            self.assertNotIn("dest_rollout_path", preview_item)
+            self.assertLess(len(preview_body), 20_000)
+
+            stream_headers, stream_body = post("/api/copy-progress")
+            events = [json.loads(line) for line in stream_body.splitlines() if line.strip()]
+            self.assertIn("application/x-ndjson", stream_headers["Content-Type"])
+            phases = [event["phase"] for event in events if event.get("type") == "progress"]
+            self.assertIn("copying", phases)
+            self.assertEqual(phases[-1], "done")
+            copying_event = next(
+                event for event in events if event.get("phase") == "copying"
+            )
+            self.assertLessEqual(len(copying_event["item_title"]), PREVIEW_TITLE_LIMIT)
+            complete = next(event for event in events if event.get("type") == "complete")
+            result = complete["result"]
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["item_total"], 1)
+            self.assertNotIn("source_rollout_path", result["items"][0])
+            self.assertNotIn("dest_rollout_path", result["items"][0])
+            self.assertTrue(Path(source_rollout).exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    def test_http_copy_progress_reports_unexpected_handler_errors(self) -> None:
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(self.transfer, Path(__file__).resolve().parents[1] / "static"),
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        try:
+            with patch.object(
+                self.transfer,
+                "copy_threads",
+                side_effect=RuntimeError("synthetic copy failure"),
+            ):
+                connection.request(
+                    "POST",
+                    "/api/copy-progress",
+                    body=json.dumps(
+                        {
+                            "source_provider": "ProviderA",
+                            "target_provider": "ProviderB",
+                            "thread_ids": ["thread-a"],
+                            "include_archived": True,
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                events = [
+                    json.loads(line)
+                    for line in response.read().splitlines()
+                    if line.strip()
+                ]
+
+            self.assertEqual(response.status, 200)
+            phases = [event["phase"] for event in events if event.get("type") == "progress"]
+            self.assertEqual(phases, ["error"])
+            self.assertEqual(events[-1]["type"], "complete")
+            self.assertFalse(events[-1]["result"]["ok"])
+            self.assertIn("synthetic copy failure", events[-1]["result"]["errors"][0])
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    def test_http_copy_progress_reports_blocked_phase_before_complete(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(thread_id, provider="ProviderA", title="Blocked copy")
+        self.transfer.process_checker = lambda: [{"name": "codex.exe", "pid": 123}]
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(self.transfer, Path(__file__).resolve().parents[1] / "static"),
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        try:
+            connection.request(
+                "POST",
+                "/api/copy-progress",
+                body=json.dumps(
+                    {
+                        "source_provider": "ProviderA",
+                        "target_provider": "ProviderB",
+                        "thread_ids": [thread_id],
+                        "include_archived": True,
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            events = [
+                json.loads(line)
+                for line in response.read().splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(response.status, 200)
+            progress = [event for event in events if event.get("type") == "progress"]
+            self.assertEqual([event["phase"] for event in progress], ["checking", "blocked"])
+            self.assertEqual(progress[-1]["current"], 0)
+            self.assertEqual(events[-1]["type"], "complete")
+            self.assertTrue(events[-1]["result"]["blocked"])
+            self.assertFalse(events[-1]["result"]["ok"])
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    def test_copy_request_rejects_invalid_preview_window(self) -> None:
+        base = {
+            "source_provider": "ProviderA",
+            "target_provider": "ProviderB",
+            "thread_ids": ["thread-a"],
+        }
+        for key, value, message in (
+            ("preview_offset", -1, "preview_offset must be non-negative"),
+            ("preview_limit", 0, "preview_limit must be between 1"),
+            ("preview_limit", MAX_PREVIEW_PAGE_SIZE + 1, "preview_limit must be between 1"),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    CopyRequest.from_json({**base, key: value})
+
+    def test_copy_executes_full_plan_even_when_preview_page_is_small(self) -> None:
+        thread_ids = [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        ]
+        for index, thread_id in enumerate(thread_ids, start=1):
+            self.add_thread(thread_id, provider="ProviderA", title=f"Session {index}")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "ProviderB"
+
+[model_providers.ProviderB]
+name = "Provider B"
+""",
+            encoding="utf-8",
+        )
+        request = CopyRequest(
+            "ProviderA",
+            "ProviderB",
+            thread_ids,
+            False,
+            True,
+            preview_limit=1,
+        )
+        events: list[dict[str, object]] = []
+
+        result = self.transfer.copy_threads(request, progress_callback=events.append)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(result["items"]), 3)
+        ready = next(event for event in events if event["phase"] == "ready")
+        self.assertEqual(ready["total"], 3)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            copied_count = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = 'ProviderB'"
+            ).fetchone()[0]
+        self.assertEqual(copied_count, 3)
+
+    def test_package_copy_reports_progress_for_full_plan_when_preview_page_is_small(self) -> None:
+        thread_ids = [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        ]
+        for index, thread_id in enumerate(thread_ids, start=1):
+            self.add_thread(thread_id, provider="ProviderA", title=f"Package session {index}")
+        export = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", thread_ids, False, True)
+        )
+        target, target_sqlite_home = self.loaded_package_target(
+            Path(export["package_path"]),
+            "package-progress-target",
+        )
+        events: list[dict[str, object]] = []
+
+        result = target.copy_imported_package_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderA",
+                thread_ids,
+                False,
+                True,
+                preview_limit=1,
+            ),
+            progress_callback=events.append,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(result["items"]), 3)
+        ready = next(event for event in events if event["phase"] == "ready")
+        self.assertEqual(ready["total"], 3)
+        copying = [event for event in events if event["phase"] == "copying"]
+        self.assertEqual([event["current"] for event in copying], [1, 2, 3])
+        self.assertEqual(events[-1]["phase"], "done")
+        with closing(sqlite3.connect(target_sqlite_home / "state_5.sqlite")) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 3)
 
     def test_target_providers_include_live_config_without_sessions(self) -> None:
         self.codex_home.mkdir(parents=True, exist_ok=True)

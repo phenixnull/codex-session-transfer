@@ -7,6 +7,8 @@ const { _electron: electron } = require('playwright-core');
 const root = path.join(__dirname, '..');
 const staticRoot = path.join(root, 'static');
 const previewRequests = [];
+const copyRequests = [];
+const packageCopyRequests = [];
 const projects = Array.from({ length: 10 }, (_, index) => {
   const cwd = `C:\\source\\Project${index + 1}`;
   return {
@@ -26,12 +28,29 @@ const packageThreads = projects.map((project, index) => ({
   archived: false,
   child_count: 0,
 }));
+const localThreads = Array.from({ length: 3 }, (_, index) => ({
+  id: `local-thread-${index + 1}`,
+  title: `Local session ${index + 1}`,
+  preview: `Local preview ${index + 1}`,
+  source: 'cli',
+  model_provider: 'source-provider',
+  cwd: 'C:\\local\\Project',
+  rollout_exists: true,
+  archived: false,
+  child_count: 0,
+}));
 
 const provider = {
   model_provider: 'source-provider',
   active: packageThreads.length,
   archived: 0,
   total: packageThreads.length,
+};
+const alternateProvider = {
+  model_provider: 'alternate-source',
+  active: 0,
+  archived: 0,
+  total: 0,
 };
 const status = {
   codex_home: 'C:\\Codex',
@@ -42,13 +61,18 @@ const status = {
   blocking_processes: [],
   wal_files: [],
   session_index: { exists: true, entries: packageThreads.length },
-  current_config: { model_provider: 'target-provider', model: 'test-model' },
+  current_config: {
+    exists: true,
+    model_provider: 'target-provider',
+    model: 'test-model',
+    configured_provider_ids: ['target-provider'],
+  },
   session_stats: {
     totals: { total: 0, active: 0, archived: 0, projects: 0 },
     by_provider: {},
     by_project: [],
   },
-  providers: [provider],
+  providers: [provider, alternateProvider],
   target_providers: [
     { value: 'target-provider', label: 'Target', current: true, session_total: 0 },
   ],
@@ -89,8 +113,99 @@ function startFixtureServer() {
     const url = new URL(request.url, 'http://127.0.0.1');
     if (url.pathname === '/api/status') return json(response, status);
     if (url.pathname === '/api/package-threads') return json(response, packageThreads);
-    if (url.pathname === '/api/threads') return json(response, []);
+    if (url.pathname === '/api/threads') {
+      return json(
+        response,
+        ['target-provider', 'alternate-source'].includes(url.searchParams.get('source_provider'))
+          ? []
+          : localThreads,
+      );
+    }
     if (url.pathname === '/api/skills') return json(response, []);
+    if (url.pathname === '/api/copy-progress' && request.method === 'POST') {
+      const chunks = [];
+      request.on('data', (chunk) => chunks.push(chunk));
+      request.on('end', () => {
+        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        copyRequests.push(payload);
+        const events = [
+          { type: 'progress', phase: 'checking', current: 0, total: 3 },
+          { type: 'progress', phase: 'planning', current: 0, total: 3 },
+          { type: 'progress', phase: 'ready', current: 0, total: 3 },
+          ...localThreads.map((thread, index) => ({
+            type: 'progress',
+            phase: 'copying',
+            current: index + 1,
+            total: localThreads.length,
+            item_title: thread.title,
+            source_id: thread.id,
+          })),
+          { type: 'progress', phase: 'committing', current: 3, total: 3 },
+          { type: 'progress', phase: 'done', current: 3, total: 3 },
+          {
+            type: 'complete',
+            result: {
+              ok: true,
+              blocked: false,
+              overwrite: false,
+              item_total: localThreads.length,
+              session_index_entries: localThreads.length,
+              manifest_path: 'C:\\Codex\\session-transfer\\manifest.json',
+              items: localThreads.map((thread, index) => ({
+                source_id: thread.id,
+                target_id: `target-${index + 1}`,
+                display_title: thread.title,
+              })),
+            },
+          },
+        ];
+        response.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
+        response.end(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`);
+      });
+      return;
+    }
+    if (url.pathname === '/api/copy-package-progress' && request.method === 'POST') {
+      const chunks = [];
+      request.on('data', (chunk) => chunks.push(chunk));
+      request.on('end', () => {
+        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        packageCopyRequests.push(payload);
+        const events = [
+          { type: 'progress', phase: 'checking', current: 0, total: packageThreads.length },
+          { type: 'progress', phase: 'planning', current: 0, total: packageThreads.length },
+          { type: 'progress', phase: 'ready', current: 0, total: packageThreads.length },
+          ...packageThreads.map((thread, index) => ({
+            type: 'progress',
+            phase: 'copying',
+            current: index + 1,
+            total: packageThreads.length,
+            item_title: thread.title,
+            source_id: thread.id,
+          })),
+          { type: 'progress', phase: 'committing', current: packageThreads.length, total: packageThreads.length },
+          { type: 'progress', phase: 'done', current: packageThreads.length, total: packageThreads.length },
+          {
+            type: 'complete',
+            result: {
+              ok: true,
+              blocked: false,
+              overwrite: false,
+              item_total: packageThreads.length,
+              session_index_entries: packageThreads.length,
+              manifest_path: 'C:\\Codex\\session-transfer\\manifest.json',
+              items: packageThreads.map((thread, index) => ({
+                source_id: thread.id,
+                target_id: `imported-${index + 1}`,
+                display_title: thread.title,
+              })),
+            },
+          },
+        ];
+        response.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
+        response.end(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`);
+      });
+      return;
+    }
     if (url.pathname === '/api/preview-package-copy' && request.method === 'POST') {
       const chunks = [];
       request.on('data', (chunk) => chunks.push(chunk));
@@ -177,6 +292,23 @@ async function setContentSize(electronApp, page, width, height) {
     await page.click('#packageModeButton');
     await page.check('#selectAll');
     await page.waitForFunction(() => document.querySelectorAll('.workspace-mapping-row').length === 10);
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.click('#copyButton');
+    await page.waitForFunction(
+      () => document.querySelector('#copyProgressPhase').textContent === 'Complete'
+        && document.querySelector('#copyProgressPercent').textContent === '100%',
+    );
+    await page.waitForFunction(() => document.querySelector('#copyResult').textContent.includes('Imported 10 session(s)'));
+    const importedUi = await page.evaluate(() => ({
+      progressPhase: document.querySelector('#copyProgressPhase').textContent,
+      progressPercent: document.querySelector('#copyProgressPercent').textContent,
+      previewItems: document.querySelectorAll('#previewItems .preview-session-item').length,
+    }));
+    assert.equal(importedUi.progressPhase, 'Complete');
+    assert.equal(importedUi.progressPercent, '100%');
+    assert.equal(importedUi.previewItems, 0);
+    assert.equal(packageCopyRequests.length, 1);
+    assert.equal(packageCopyRequests[0].thread_ids.length, 10);
     const compact = await page.evaluate(() => {
       const main = document.querySelector('.main-surface');
       const grid = document.querySelector('#sessionTransferGrid');
@@ -215,6 +347,52 @@ async function setContentSize(electronApp, page, width, height) {
 
     await page.click('#localModeButton');
     await setContentSize(electronApp, page, 1440, 920);
+    await page.waitForFunction(
+      () => document.querySelectorAll('#sourceThreadsBody tr').length === 3,
+    );
+    await page.waitForFunction(() => !document.querySelector('#selectAll').checked);
+    await page.check('#selectAll');
+    await page.waitForFunction(() => document.querySelector('#selectedCount').textContent === '3 selected');
+    const copyReady = await page.evaluate(() => ({
+      disabled: document.querySelector('#copyButton').disabled,
+      hint: document.querySelector('#copyDisabledReason').textContent,
+      previewItems: document.querySelectorAll('#previewItems .preview-session-item').length,
+    }));
+    assert.equal(copyReady.disabled, false);
+    assert.doesNotMatch(copyReady.hint, /Run Preview/i);
+    assert.equal(copyReady.previewItems, 0);
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.click('#copyButton');
+    await page.waitForFunction(
+      () => document.querySelector('#copyProgressPhase').textContent === 'Complete'
+        && document.querySelector('#copyProgressPercent').textContent === '100%',
+    );
+    await page.waitForFunction(() => document.querySelector('#copyResult').textContent.includes('Copied 3 session(s)'));
+    const copiedUi = await page.evaluate(() => ({
+      progressPhase: document.querySelector('#copyProgressPhase').textContent,
+      progressPercent: document.querySelector('#copyProgressPercent').textContent,
+      previewItems: document.querySelectorAll('#previewItems .preview-session-item').length,
+      result: document.querySelector('#copyResult').textContent,
+    }));
+    assert.equal(copiedUi.progressPhase, 'Complete');
+    assert.equal(copiedUi.progressPercent, '100%');
+    assert.equal(copiedUi.previewItems, 0);
+    assert.equal(copyRequests.length, 1);
+    assert.equal(copyRequests[0].thread_ids.length, 3);
+    assert.equal(previewRequests.length, 1);
+    await page.selectOption('#sourceProvider', 'alternate-source');
+    const clearedSelection = await page.evaluate(() => ({
+      selectedCount: document.querySelector('#selectedCount').textContent,
+      copyDisabled: document.querySelector('#copyButton').disabled,
+      previewItems: document.querySelectorAll('#previewItems .preview-session-item').length,
+    }));
+    assert.equal(clearedSelection.selectedCount, '0 selected');
+    assert.equal(clearedSelection.copyDisabled, true);
+    assert.equal(clearedSelection.previewItems, 0);
+    await page.selectOption('#sourceProvider', 'source-provider');
+    await page.waitForFunction(
+      () => document.querySelectorAll('#sourceThreadsBody tr').length === 3,
+    );
     const tall = await page.evaluate(() => {
       const main = document.querySelector('.main-surface');
       const grid = document.querySelector('#sessionTransferGrid');

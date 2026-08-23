@@ -21,6 +21,8 @@ const state = {
   activeThreadLoadingMore: false,
   sessionRenderCollapsed: true,
   preview: null,
+  previewLoadingMore: false,
+  copyInProgress: false,
   skillPreview: null,
   copyResult: "",
   skillsResult: "",
@@ -32,6 +34,8 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const CUSTOM_TARGET = "__custom__";
 const SESSION_RENDER_PAGE_SIZE = 80;
+const PREVIEW_RENDER_PAGE_SIZE = 48;
+const PREVIEW_SCROLL_THRESHOLD = 180;
 const EXPORT_DIR_STORAGE_KEY = "codex-session-transfer.exportDir";
 
 function usingPackageSource() {
@@ -78,6 +82,41 @@ async function api(path, options = {}) {
     throw new Error((data.errors || [response.statusText]).join("; "));
   }
   return data;
+}
+
+async function streamApi(path, options = {}, onEvent = () => {}) {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error((data.errors || [response.statusText]).join("; "));
+  }
+  if (!response.body) throw new Error("Copy progress stream is unavailable in this browser.");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+  const consume = (line) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    onEvent(event);
+    if (event.type === "complete") result = event.result;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) consume(line.replace(/\r$/, ""));
+    if (done) break;
+  }
+  consume(buffer.replace(/\r$/, ""));
+  if (!result) throw new Error("Copy ended without a final result.");
+  return result;
 }
 
 async function uploadPackageFile(path, file) {
@@ -340,10 +379,15 @@ function preferredSourceProvider(currentValue) {
 function preferredTargetProvider(currentValue, sourceValue) {
   const options = targetProviderOptions();
   const current = options.find((provider) => provider.value === currentValue);
-  if (current && current.value !== sourceValue) return current.value;
+  if (current && (current.value !== sourceValue || current.current)) return current.value;
 
-  const liveTarget = options.find((provider) => provider.current && provider.value !== sourceValue);
+  const liveTarget = options.find((provider) => provider.current);
   if (liveTarget) return liveTarget.value;
+
+  const configuredTarget = options.find(
+    (provider) => provider.value !== sourceValue && targetProviderIsConfigured(provider) === true,
+  );
+  if (configuredTarget) return configuredTarget.value;
 
   const nonSourceTarget = options.find((provider) => provider.value !== sourceValue);
   if (nonSourceTarget) return nonSourceTarget.value;
@@ -678,7 +722,7 @@ function renderSourceProviders() {
   for (const provider of providers) {
     const option = document.createElement("option");
     option.value = provider.model_provider;
-    option.textContent = `${provider.model_provider} (${visibleThreadCount(provider)})`;
+    option.textContent = `${providerDisplayName(provider.model_provider)} / ${visibleProviderCount(provider)}${providerConfigurationSuffix(provider.model_provider)}`;
     option.title = providerTooltip(provider, currentSourceStats());
     select.append(option);
   }
@@ -696,24 +740,59 @@ function renderProviderGrid() {
     card.className = "provider-tile";
     card.title = providerTooltip(provider, state.stats);
     const providerStats = state.stats?.by_provider?.[provider.model_provider];
+    const configured = targetProviderIsConfigured({ value: provider.model_provider });
     card.innerHTML = `
-      <strong>${escapeHtml(provider.model_provider)}</strong>
+      <strong>${escapeHtml(providerDisplayName(provider.model_provider))}</strong>
+      <span>id: ${escapeHtml(provider.model_provider)}</span>
       <span>${provider.active} active / ${provider.archived} archived</span>
       <span>${providerStats?.projects ?? 0} projects</span>
-      <span>session-db provider</span>
+      <span>${configured === true ? "configured provider" : configured === false ? "not configured" : "session-db provider"}</span>
     `;
     grid.append(card);
   }
 }
 
+function providerMetadata(value) {
+  return state.targetProviders.find((provider) => provider.value === value) || null;
+}
+
+function providerDisplayName(value, fallbackProvider = null) {
+  const provider = fallbackProvider || providerMetadata(value);
+  const configuredName = String(provider?.provider_name || "").trim();
+  return configuredName && configuredName !== value
+    ? `${configuredName} (id: ${value})`
+    : value;
+}
+
+function visibleProviderCount(provider) {
+  const count = visibleThreadCount(provider);
+  return `${count} ${includeArchivedChecked() ? "total" : "active"}`;
+}
+
+function targetProviderIsConfigured(provider) {
+  const current = state.status?.current_config || {};
+  if (!current.exists) return null;
+  if (!Array.isArray(current.configured_provider_ids)) return null;
+  return (current.configured_provider_ids || []).includes(provider.value);
+}
+
+function providerConfigurationSuffix(value) {
+  return targetProviderIsConfigured({ value }) === false ? " / not configured" : "";
+}
+
 function providerTooltip(provider, stats = state.stats) {
   const details = [];
-  if (provider.model_provider) details.push(`Provider: ${provider.model_provider}`);
+  if (provider.model_provider) {
+    details.push(`Provider: ${providerDisplayName(provider.model_provider)}`);
+    details.push(`Provider id: ${provider.model_provider}`);
+  }
   details.push(`Active: ${provider.active ?? 0}`);
   details.push(`Archived: ${provider.archived ?? 0}`);
   details.push(`Total: ${provider.total ?? 0}`);
   const providerStats = stats?.by_provider?.[provider.model_provider];
   if (providerStats) details.push(`Projects: ${providerStats.projects ?? 0}`);
+  const configured = providerMetadata(provider.model_provider);
+  if (configured) details.push("Present in provider catalog");
   return details.join(" | ");
 }
 
@@ -754,23 +833,29 @@ function targetProviderOptions() {
 }
 
 function targetProviderLabel(provider) {
-  const configuredName = String(provider.provider_name || "").trim();
-  const display = configuredName && configuredName !== provider.value
-    ? `${provider.value} (${configuredName})`
-    : provider.value;
-  const bits = [display];
+  const bits = [providerDisplayName(provider.value, provider)];
   if (provider.current) bits.push("live");
-  if (provider.session_total) bits.push(`${provider.session_total} total`);
+  if (provider.session_total !== undefined || provider.session_active !== undefined) {
+    const count = includeArchivedChecked()
+      ? Number(provider.session_total ?? 0)
+      : Number(provider.session_active ?? provider.session_total ?? 0);
+    bits.push(`${count} ${includeArchivedChecked() ? "total" : "active"}`);
+  }
+  if (targetProviderIsConfigured(provider) === false) bits.push("not configured");
   return bits.join(" / ");
 }
 
 function targetProviderTooltip(provider) {
   const details = [];
-  if (provider.value) details.push(`Provider: ${provider.value}`);
+  if (provider.value) details.push(`Provider: ${providerDisplayName(provider.value, provider)}`);
+  if (provider.provider_name) details.push(`Provider id: ${provider.value}`);
   if (provider.model) details.push(`Model: ${provider.model}`);
   if (provider.base_url) details.push(`Base URL: ${provider.base_url}`);
   if (provider.wire_api) details.push(`Wire API: ${provider.wire_api}`);
   if (provider.current) details.push("Current live config");
+  if (targetProviderIsConfigured(provider) === false) {
+    details.push("Not defined in config.toml; copy is disabled until it is configured");
+  }
   if (provider.sources?.includes("session_db")) details.push("Present in session DB");
   if (provider.sources?.includes("package_source")) details.push("Present in package source");
   return details.join(" | ");
@@ -896,6 +981,20 @@ function renderTargetThreads() {
   renderListCount("targetListCount", state.targetThreads.length);
 }
 
+function syncSourceCheckboxes() {
+  for (const checkbox of document.querySelectorAll("#sourceThreadsBody input[type=checkbox]")) {
+    const threadId = checkbox.closest("tr")?.dataset.threadId;
+    if (threadId) checkbox.checked = state.selected.has(threadId);
+  }
+}
+
+function syncActiveThreadRows() {
+  const activeId = state.activeSession?.id || "";
+  for (const row of document.querySelectorAll("[data-thread-id]")) {
+    row.classList.toggle("active-row", row.dataset.threadId === activeId);
+  }
+}
+
 function renderSourceSkills() {
   const body = $("skillsSourceBody");
   if (!body) return;
@@ -975,6 +1074,7 @@ function skillStateCell(skill, options = {}) {
 
 function threadRow(thread, options = {}) {
   const row = document.createElement("tr");
+  row.dataset.threadId = thread.id;
   if (!thread.rollout_exists) row.classList.add("warn-row");
   if (options.target && state.lastCopiedTargetIds.has(thread.id)) row.classList.add("new-row");
   if (state.activeSession?.id === thread.id) row.classList.add("active-row");
@@ -1034,8 +1134,7 @@ async function selectThreadForRender(thread, side) {
   if (!sameThread) state.activeThreadDetail = null;
   state.activeThreadLoading = false;
   state.activeThreadLoadingMore = false;
-  renderSourceThreads();
-  renderTargetThreads();
+  syncActiveThreadRows();
   renderSessionDetail();
   if (state.sessionRenderCollapsed || (sameThread && state.activeThreadDetail)) return;
   await loadThreadDetailPage({ append: false });
@@ -1373,16 +1472,27 @@ async function previewCopy() {
   const endpoint = usingPackageSource() ? "/api/preview-package-copy" : "/api/preview-copy";
   const plan = await api(endpoint, {
     method: "POST",
-    body: JSON.stringify(copyRequest()),
+    body: JSON.stringify(previewRequest(0)),
   });
   state.preview = plan;
+  state.previewLoadingMore = false;
   renderPreview(plan);
+  const loaded = plan.items?.length || 0;
+  const total = plan.item_total ?? loaded;
   setCopyResult(
     plan.can_execute
-      ? `Preview ready: ${plan.items.length} session(s) can be ${usingPackageSource() ? "imported" : "copied"}.`
+      ? `Preview ready: ${loaded}${total !== loaded ? ` / ${total}` : ""} session(s) can be ${usingPackageSource() ? "imported" : "copied"}.`
       : "Preview is not executable. Fix the messages above.",
     plan.can_execute ? "info" : "error",
   );
+}
+
+function previewRequest(offset) {
+  return {
+    ...copyRequest(),
+    preview_offset: offset,
+    preview_limit: PREVIEW_RENDER_PAGE_SIZE,
+  };
 }
 
 function renderPreview(plan) {
@@ -1390,6 +1500,7 @@ function renderPreview(plan) {
   const items = $("previewItems");
   messages.replaceChildren();
   items.replaceChildren();
+  items.onscroll = null;
   if (!plan) {
     updateCopyButton();
     return;
@@ -1410,9 +1521,19 @@ function renderPreview(plan) {
     `;
     items.append(node);
   }
-  for (const item of plan.items || []) {
+  renderPreviewItems(plan);
+  updateCopyButton();
+}
+
+function renderPreviewItems(plan) {
+  const items = $("previewItems");
+  for (const node of items.querySelectorAll(".preview-session-item, .preview-lazy-status")) {
+    node.remove();
+  }
+  const loadedItems = plan?.items || [];
+  for (const item of loadedItems) {
     const node = document.createElement("div");
-    node.className = "preview-item";
+    node.className = "preview-item preview-session-item";
     node.innerHTML = `
       <strong>${escapeHtml(item.display_title || item.title || item.source_id)}</strong>
       <span>${escapeHtml(item.source_provider)} -> ${escapeHtml(item.target_provider)}</span>
@@ -1423,11 +1544,54 @@ function renderPreview(plan) {
     `;
     items.append(node);
   }
-  updateCopyButton();
+  const total = Number(plan?.item_total ?? loadedItems.length);
+  if (plan?.has_more) {
+    const status = document.createElement("span");
+    status.className = "preview-lazy-status";
+    status.textContent = state.previewLoadingMore
+      ? `${loadedItems.length} / ${total} - loading next page...`
+      : `${loadedItems.length} / ${total} - scroll for more`;
+    items.append(status);
+    items.onscroll = () => {
+      if (items.scrollTop + items.clientHeight >= items.scrollHeight - PREVIEW_SCROLL_THRESHOLD) {
+        loadMorePreview();
+      }
+    };
+  } else {
+    items.onscroll = null;
+  }
+}
+
+async function loadMorePreview() {
+  const basePlan = state.preview;
+  if (!basePlan?.has_more || state.previewLoadingMore) return;
+
+  const endpoint = usingPackageSource() ? "/api/preview-package-copy" : "/api/preview-copy";
+  const nextOffset = Number(basePlan.next_preview_offset ?? basePlan.items?.length ?? 0);
+  state.previewLoadingMore = true;
+  renderPreviewItems(basePlan);
+  try {
+    const page = await api(endpoint, {
+      method: "POST",
+      body: JSON.stringify(previewRequest(nextOffset)),
+    });
+    if (state.preview !== basePlan) return;
+    state.preview = {
+      ...basePlan,
+      ...page,
+      items: [...(basePlan.items || []), ...(page.items || [])],
+    };
+  } catch (error) {
+    setCopyResult(`Preview could not load the next page: ${error.message}`, "error");
+  } finally {
+    state.previewLoadingMore = false;
+    if (state.preview === basePlan || state.preview) renderPreviewItems(state.preview);
+  }
 }
 
 function invalidatePreview({ clearResult = true } = {}) {
   state.preview = null;
+  state.previewLoadingMore = false;
   renderPreview(null);
   if (clearResult) setCopyResult("");
 }
@@ -1446,35 +1610,90 @@ function message(kind, text) {
   return node;
 }
 
+function updateCopyProgress(event = null) {
+  const panel = $("copyProgress");
+  if (!panel) return;
+  if (event?.type === "complete") return;
+  if (!event) {
+    panel.hidden = true;
+    panel.classList.remove("active", "complete", "error");
+    return;
+  }
+
+  const current = Number(event.current || 0);
+  const total = Number(event.total || 0);
+  const percent = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  const phaseLabels = {
+    checking: "Checking",
+    planning: "Planning",
+    ready: "Ready",
+    copying: "Copying",
+    committing: "Committing",
+    blocked: "Blocked",
+    error: "Stopped",
+    done: "Complete",
+  };
+  panel.hidden = false;
+  panel.classList.toggle("active", !["done", "error", "blocked"].includes(event.phase));
+  panel.classList.toggle("complete", event.phase === "done");
+  panel.classList.toggle("error", event.phase === "error" || event.phase === "blocked");
+  $("copyProgressPhase").textContent = phaseLabels[event.phase] || event.phase || "Working";
+  $("copyProgressCount").textContent = total ? `${current} / ${total}` : "Working";
+  $("copyProgressBar").style.width = `${percent}%`;
+  $("copyProgressTrack").setAttribute("aria-valuenow", String(percent));
+  $("copyProgressPercent").textContent = `${percent}%`;
+  $("copyProgressItem").textContent = event.item_title || event.message || "Preparing session transfer";
+}
+
 async function executeCopy() {
   const blocked = (state.status && state.status.blocking_processes || []).length > 0;
-  if (blocked) return;
-  const count = state.preview ? state.preview.items.length : 0;
-  if (!count) return;
+  const reasons = copyDisabledReasons(blocked);
+  if (reasons.length) return;
+  const count = state.selected.size;
   const target = targetProviderValue();
   const action = usingPackageSource() ? "Import" : "Copy";
   const overwriteNotice = $("overwriteSessions")?.checked
     ? " Matching destination conversations will be overwritten."
     : "";
-  const confirmed = window.confirm(`${action} ${count} session(s) to ${target}?${overwriteNotice}`);
+  const descendantsNotice = $("includeDescendants")?.checked ? " Child sessions included." : "";
+  const confirmed = window.confirm(`${action} ${count} selected session(s) to ${target}?${descendantsNotice}${overwriteNotice}`);
   if (!confirmed) return;
-  $("copyButton").disabled = true;
-  setCopyResult(`${action}ing...`, "info");
-  const endpoint = usingPackageSource() ? "/api/copy-package" : "/api/copy";
-  const result = await api(endpoint, {
-    method: "POST",
-    body: JSON.stringify(copyRequest()),
-  });
-  state.preview = result;
-  renderPreview(result);
-  const resultText = result.ok
-    ? `${usingPackageSource() ? "Imported" : "Copied"} ${result.items?.length || 0} session(s).${result.overwrite ? ` Overwrote ${(result.items || []).filter((item) => item.overwritten).length} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
-    : `Not ${usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
-  await loadStatus();
-  renderAllShell();
-  state.lastCopiedTargetIds = new Set((result.items || []).map((item) => item.target_id));
-  await loadThreadLists({ preserveResult: true });
-  setCopyResult(resultText, result.ok ? "success" : "error");
+
+  state.copyInProgress = true;
+  updateCopyButton();
+  updateCopyProgress({ phase: "checking", current: 0, total: count, message: `${action}ing sessions` });
+  setCopyResult(`${action}ing ${count} selected session(s)...`, "info");
+  const endpoint = usingPackageSource() ? "/api/copy-package-progress" : "/api/copy-progress";
+  try {
+    const result = await streamApi(
+      endpoint,
+      {
+        method: "POST",
+        body: JSON.stringify(copyRequest()),
+      },
+      updateCopyProgress,
+    );
+    state.preview = null;
+    renderPreview(null);
+    const copiedCount = Number(result.item_total ?? result.items?.length ?? 0);
+    const overwrittenCount = Number(
+      result.overwritten_count ?? (result.items || []).filter((item) => item.overwritten).length,
+    );
+    const resultText = result.ok
+      ? `${usingPackageSource() ? "Imported" : "Copied"} ${copiedCount} session(s).${result.overwrite ? ` Overwrote ${overwrittenCount} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
+      : `Not ${usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
+    await loadStatus();
+    renderAllShell();
+    state.lastCopiedTargetIds = new Set((result.items || []).map((item) => item.target_id));
+    await loadThreadLists({ preserveResult: true });
+    setCopyResult(resultText, result.ok ? "success" : "error");
+  } catch (error) {
+    updateCopyProgress({ phase: "error", current: 0, total: count, message: error.message });
+    setCopyResult(error.message, "error");
+  } finally {
+    state.copyInProgress = false;
+    updateCopyButton();
+  }
 }
 
 async function killBlockingProcesses() {
@@ -1504,7 +1723,7 @@ async function killBlockingProcesses() {
   setCopyResult(
     remaining
       ? `Killed ${result.killed_count || 0}; ${remaining} blocker(s) remain. Refresh after they exit.`
-      : `Killed ${result.killed_count || 0} blocker(s). Copy can run after Preview succeeds.`,
+      : `Killed ${result.killed_count || 0} blocker(s). Copy is ready when sessions and a target are selected.`,
     remaining ? "error" : "info",
   );
 }
@@ -1853,13 +2072,12 @@ function updateCopyButton() {
   const copyButton = $("copyButton");
   copyButton.disabled = reasons.length > 0;
   copyButton.title = reasons.join(" ");
-  $("copyDisabledReason").textContent = reasons.length ? reasons.join(" ") : "Ready to copy.";
+  $("copyDisabledReason").textContent = reasons.length ? reasons.join(" ") : "Ready to copy. Preview is optional.";
 }
 
 function copyDisabledReasons(blocked) {
   const reasons = [];
   const selectedCount = state.selected.size;
-  const source = $("sourceProvider").value;
   const target = targetProviderValue();
   const blockingCount = (state.status && state.status.blocking_processes || []).length;
 
@@ -1869,15 +2087,14 @@ function copyDisabledReasons(blocked) {
   if (!target) {
     reasons.push("Choose a target provider.");
   }
-  if (!state.preview) {
-    reasons.push("Run Preview first.");
-  } else if (state.preview.errors?.length) {
-    reasons.push(`Preview has errors: ${state.preview.errors[0]}`);
-  } else if (!state.preview.can_execute) {
-    reasons.push("Preview plan is not executable.");
+  if (target && targetProviderIsConfigured({ value: target }) === false) {
+    reasons.push(`Target provider '${target}' is not defined in config.toml.`);
+  }
+  if (state.copyInProgress) {
+    reasons.push("Copy is already running.");
   }
   if (blocked) {
-    reasons.push(`Close Codex/Codex++ before copying (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected). Preview is still read-only and safe.`);
+    reasons.push(`Close Codex/Codex++ before copying (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
   }
   return reasons;
 }
@@ -1897,6 +2114,8 @@ function setMode(mode) {
   state.activeSession = null;
   state.activeThreadDetail = null;
   invalidatePreview();
+  syncSourceCheckboxes();
+  renderSelectionState();
   ensureProviderSelection();
   renderAllShell();
   loadThreadLists().catch((error) => setCopyResult(error.message, "error"));
@@ -2013,6 +2232,8 @@ function bindEvents() {
   });
   $("sourceProvider").addEventListener("change", () => {
     state.selected.clear();
+    syncSourceCheckboxes();
+    renderSelectionState();
     renderTargetProviders();
     renderLiveTargetPanel();
     invalidatePreview();
@@ -2065,7 +2286,8 @@ function bindEvents() {
     } else {
       state.selected.clear();
     }
-    renderSourceThreads();
+    syncSourceCheckboxes();
+    renderSelectionState();
     renderPackagePanel();
     invalidatePreview();
   });

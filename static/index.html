@@ -461,7 +461,7 @@
                     <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
                     <path d="M12 9.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"></path>
                   </svg>
-                  <span>Preview</span>
+                  <span>Preview plan</span>
                 </button>
                 <button id="copyButton" type="button" disabled>
                   <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -470,6 +470,19 @@
                   </svg>
                   <span>Copy</span>
                 </button>
+              </div>
+              <div id="copyProgress" class="copy-progress" aria-live="polite" hidden>
+                <div class="copy-progress-head">
+                  <strong id="copyProgressPhase">Preparing</strong>
+                  <span id="copyProgressCount">0 / 0</span>
+                </div>
+                <div id="copyProgressTrack" class="copy-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <span id="copyProgressBar" class="copy-progress-bar"></span>
+                </div>
+                <div class="copy-progress-foot">
+                  <span id="copyProgressPercent">0%</span>
+                  <span id="copyProgressItem">Preparing session transfer</span>
+                </div>
               </div>
               <p id="copyDisabledReason" class="copy-hint"></p>
               <p id="copyResult" class="result"></p>

@@ -20,6 +20,18 @@ for (const id of [
 
 assert.match(app, /request\.workspace_mapping\s*=/);
 assert.match(app, /overwrite:\s*Boolean\(\$\("overwriteSessions"\)\?\.checked\)/);
+assert.match(app, /\/api\/copy-package-progress/);
+assert.match(app, /streamApi\(/);
+assert.doesNotMatch(app, /reasons\.push\(["']Run Preview first\./);
+assert.match(app, /PREVIEW_RENDER_PAGE_SIZE/);
+assert.match(app, /preview_offset/);
+assert.match(app, /next_preview_offset/);
+assert.match(app, /loadMorePreview\(/);
+assert.match(app, /state\.preview = null;\s*renderPreview\(null\);/);
+assert.doesNotMatch(app, /state\.preview = result;\s*renderPreview\(result\);/);
+assert.match(app, /result\.item_total/);
+assert.match(app, /event\?\.type === ["']complete["']/);
+assert.match(html, /id=["']copyProgress["']/);
 assert.match(app, /window\.codexDesktop\?\.chooseDirectory/);
 assert.match(main, /ipcMain\.handle\(["']codex-session-transfer:choose-directory["']/);
 assert.match(main, /properties:\s*\[["']openDirectory["']\]/);
