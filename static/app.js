@@ -1880,11 +1880,16 @@ async function executeCopy() {
     const overwrittenCount = Number(
       result.overwritten_count ?? (result.items || []).filter((item) => item.overwritten).length,
     );
+    const staleSidebarCount = Number(result.global_state_cleanup?.removed_thread_references || 0);
+    const duplicateIndexCount = Number(result.session_index_removed_lines || 0);
     let resultText;
     if (result.ok && (mirrorTarget || result.mirror_target)) {
       const replacedTargetCount = Number(result.replaced_target_count ?? targetCount);
       const backupText = result.backup_directory ? ` Backup: ${result.backup_directory}.` : "";
-      resultText = `Mirrored ${copiedCount} session(s) to ${target}. Replaced ${replacedTargetCount} previous target session(s).${backupText} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
+      const cleanupText = staleSidebarCount || duplicateIndexCount
+        ? ` Cleaned ${staleSidebarCount} stale sidebar reference(s) and ${duplicateIndexCount} duplicate index line(s).`
+        : "";
+      resultText = `Mirrored ${copiedCount} session(s) to ${target}. Replaced ${replacedTargetCount} previous target session(s).${cleanupText}${backupText} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
     } else if (result.ok) {
       resultText = `${usingPackageSource() ? "Imported" : "Copied"} ${copiedCount} session(s).${result.overwrite ? ` Overwrote ${overwrittenCount} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
     } else {
@@ -1996,7 +2001,7 @@ async function killBlockingProcesses() {
 
 async function repairSessionIndexNames() {
   const confirmed = window.confirm(
-    "Repair copied session names from successful manifests? This writes session_index.jsonl only."
+    "Repair copied session names and remove deleted or duplicate sidebar entries? Close Codex first."
   );
   if (!confirmed) return;
 
@@ -2012,10 +2017,10 @@ async function repairSessionIndexNames() {
   await loadStatus();
   renderAllShell();
   await loadThreadLists({ preserveResult: true });
-  button.textContent = "Repair names";
+  button.textContent = "Repair stale entries";
   setCopyResult(
     result.ok
-      ? `Repaired ${result.repaired_count || 0} copied session name(s) from ${result.scanned_manifests || 0} manifest(s).`
+      ? `Repaired ${result.repaired_count || 0} copied session name(s), removed ${result.global_state_cleanup?.removed_thread_references || 0} stale sidebar reference(s), and removed ${result.session_index_deduplicated || 0} duplicate index line(s).`
       : `Repair failed. ${(result.errors || []).join("; ")}`,
     result.ok ? "success" : "error",
   );
@@ -2560,7 +2565,7 @@ function bindEvents() {
   });
   $("repairNamesButton").addEventListener("click", () => {
     repairSessionIndexNames().catch((error) => {
-      $("repairNamesButton").textContent = "Repair names";
+      $("repairNamesButton").textContent = "Repair stale entries";
       setCopyResult(error.message, "error");
       loadStatus().then(renderAllShell).catch(() => {});
     });

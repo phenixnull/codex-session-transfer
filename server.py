@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 STATE_DB_FILENAME = "state_5.sqlite"
 SESSION_INDEX_FILENAME = "session_index.jsonl"
+GLOBAL_STATE_FILENAME = ".codex-global-state.json"
 BLOCKING_PROCESS_NAMES = {"chatgpt", "codex", "codex-plus-plus", "codex-plus-plus-manager"}
 MAX_COPY_WORKERS = 8
 DEFAULT_THREAD_DETAIL_LIMIT = 80
@@ -452,6 +453,7 @@ class CodexSessionTransfer:
         self.skill_package_dir = self.codex_home / "session-transfer" / "skill-packages"
         self.skill_package_import_dir = self.codex_home / "session-transfer" / "skill-imports"
         self.session_index_path = self.codex_home / SESSION_INDEX_FILENAME
+        self.global_state_path = self.codex_home / GLOBAL_STATE_FILENAME
         self.process_checker = process_checker or default_process_checker
         self.process_terminator = process_terminator or default_process_terminator
         self.path_opener = path_opener or default_path_opener
@@ -1209,6 +1211,7 @@ class CodexSessionTransfer:
         database_backups: dict[str, str] = {}
         rollout_backups: list[RolloutBackup] = []
         session_index_backup: str | None = None
+        global_state_backup: str | None = None
         try:
             self._report_copy_progress(
                 progress_callback,
@@ -1218,6 +1221,7 @@ class CodexSessionTransfer:
             )
             database_backups = self._backup_runtime_databases(backup_dir)
             session_index_backup = self._backup_session_index_for_mirror(backup_dir)
+            global_state_backup = self._backup_global_state_for_mirror(backup_dir)
             rollout_backups = self._backup_mirror_rollouts(
                 backup_rollout_paths,
                 backup_dir,
@@ -1229,6 +1233,7 @@ class CodexSessionTransfer:
                 database_backups=database_backups,
                 rollout_backups=rollout_backups,
                 session_index_backup=session_index_backup,
+                global_state_backup=global_state_backup,
                 source_ids=source_ids_before_backup,
                 target_ids=target_ids_before_backup,
             )
@@ -1246,6 +1251,7 @@ class CodexSessionTransfer:
                 "items": [],
                 "mirror_target": True,
                 "backup_directory": str(backup_dir),
+                "global_state_backup": global_state_backup,
             }
             manifest_path = self._write_manifest(payload, request, operation="mirror")
             payload["manifest_path"] = str(manifest_path)
@@ -1253,7 +1259,9 @@ class CodexSessionTransfer:
 
         rewritten_paths: list[Path] = []
         session_index_snapshot: tuple[bool, str] | None = None
+        global_state_snapshot: tuple[bool, str] | None = None
         session_index_entries: list[dict[str, Any]] = []
+        global_state_cleanup: dict[str, Any] = {}
         manifest_payload: dict[str, Any] | None = None
         committed = False
         plan: dict[str, Any] | None = None
@@ -1308,7 +1316,17 @@ class CodexSessionTransfer:
                     message="Replacing target session names and indexes",
                 )
                 session_index_snapshot = self._snapshot_session_index()
+                global_state_snapshot = self._snapshot_global_state()
                 session_index_entries = self._replace_session_index_for_mirror(plan)
+                available_thread_ids = self._thread_ids_with_rollouts(conn)
+                plan["_session_index_removed_lines"] = int(
+                    plan.get("_session_index_removed_lines", 0)
+                ) + self._canonicalize_session_index(
+                    live_thread_ids=available_thread_ids
+                )
+                global_state_cleanup = self._prune_global_state_thread_references(
+                    available_thread_ids
+                )
 
                 self._report_copy_progress(
                     progress_callback,
@@ -1334,6 +1352,7 @@ class CodexSessionTransfer:
                     "backup_path": database_backups.get(STATE_DB_FILENAME),
                     "backup_directory": str(backup_dir),
                     "database_backups": database_backups,
+                    "global_state_backup": global_state_backup,
                     "rollout_backup_count": len(rollout_backups),
                     "source_rollout_backup_count": len(source_rollout_paths),
                     "target_rollout_backup_count": len(target_rollout_paths),
@@ -1341,6 +1360,11 @@ class CodexSessionTransfer:
                     "session_index_backup": session_index_backup,
                     "session_index_path": str(self.session_index_path),
                     "session_index_entries": len(session_index_entries),
+                    "session_index_removed_lines": int(
+                        plan.get("_session_index_removed_lines", 0)
+                    ),
+                    "global_state_path": str(self.global_state_path),
+                    "global_state_cleanup": global_state_cleanup,
                     "history_projection_mode": "rebuild_on_resume",
                 }
             except BaseException as exc:
@@ -1349,6 +1373,8 @@ class CodexSessionTransfer:
                     conn.rollback()
                     if session_index_snapshot is not None:
                         self._restore_session_index(session_index_snapshot)
+                    if global_state_snapshot is not None:
+                        self._restore_global_state(global_state_snapshot)
                     restore_errors = self._restore_mirror_rollout_backups(rollout_backups)
                 manifest_payload = {
                     "ok": False,
@@ -1359,6 +1385,8 @@ class CodexSessionTransfer:
                     "backup_path": database_backups.get(STATE_DB_FILENAME),
                     "backup_directory": str(backup_dir),
                     "database_backups": database_backups,
+                    "global_state_backup": global_state_backup,
+                    "global_state_cleanup": global_state_cleanup,
                     "rollout_backup_count": len(rollout_backups),
                     "rolled_back": not committed,
                 }
@@ -1625,10 +1653,12 @@ class CodexSessionTransfer:
             return {
                 "ok": False,
                 "blocked": True,
-                "errors": ["Close Codex and provider switcher processes before repairing session names."],
+                "errors": ["Close Codex and provider switcher processes before repairing session state."],
                 "blocking_processes": blocking,
             }
 
+        with closing(self._connect(read_only=True)) as conn:
+            live_thread_ids = self._thread_ids_with_rollouts(conn)
         source_index = self._load_session_index()
         existing_ids = set(source_index)
         entries: list[dict[str, Any]] = []
@@ -1664,10 +1694,20 @@ class CodexSessionTransfer:
                 existing_ids.add(str(target_id))
 
         snapshot = self._snapshot_session_index()
+        global_state_snapshot = self._snapshot_global_state()
+        global_state_cleanup: dict[str, Any] = {}
+        deduplicated_count = 0
         try:
             self._write_session_index_entries(entries)
+            deduplicated_count = self._canonicalize_session_index(
+                live_thread_ids=live_thread_ids | {
+                    str(entry["id"]) for entry in entries
+                }
+            )
+            global_state_cleanup = self._prune_global_state_thread_references(live_thread_ids)
         except Exception:
             self._restore_session_index(snapshot)
+            self._restore_global_state(global_state_snapshot)
             raise
 
         return {
@@ -1675,7 +1715,9 @@ class CodexSessionTransfer:
             "blocked": False,
             "scanned_manifests": scanned,
             "repaired_count": len(entries),
+            "session_index_deduplicated": deduplicated_count,
             "session_index_path": str(self.session_index_path),
+            "global_state_cleanup": global_state_cleanup,
         }
 
     def skills_status(self) -> dict[str, Any]:
@@ -4921,6 +4963,14 @@ class CodexSessionTransfer:
     def _load_session_index(self) -> dict[str, dict[str, Any]]:
         return self._load_session_index_from_path(self.session_index_path)
 
+    @staticmethod
+    def _thread_ids_with_rollouts(conn: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0])
+            for row in conn.execute("SELECT id, rollout_path FROM threads").fetchall()
+            if row[1] and Path(str(row[1])).is_file()
+        }
+
     def _load_session_index_from_path(self, path: Path) -> dict[str, dict[str, Any]]:
         if not path.exists():
             return {}
@@ -4957,6 +5007,224 @@ class CodexSessionTransfer:
             self.session_index_path.unlink()
         except FileNotFoundError:
             pass
+
+    def _canonical_session_index_lines(
+        self,
+        *,
+        remove_ids: set[str] | None = None,
+    ) -> tuple[list[str], int]:
+        if not self.session_index_path.exists():
+            return [], 0
+        text = self.session_index_path.read_text(encoding="utf-8")
+        excluded = {str(thread_id) for thread_id in (remove_ids or set())}
+        lines: list[str | None] = []
+        positions: dict[str, int] = {}
+        removed = 0
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                parsed = None
+            thread_id = (
+                str(parsed.get("id"))
+                if isinstance(parsed, dict) and parsed.get("id")
+                else ""
+            )
+            if thread_id and thread_id in excluded:
+                removed += 1
+                continue
+            if thread_id:
+                previous_position = positions.get(thread_id)
+                if previous_position is not None:
+                    lines[previous_position] = None
+                    removed += 1
+                positions[thread_id] = len(lines)
+            lines.append(line)
+        return [line for line in lines if line is not None], removed
+
+    def _canonicalize_session_index(self, *, live_thread_ids: set[str] | None = None) -> int:
+        if not self.session_index_path.exists():
+            return 0
+        original = self.session_index_path.read_text(encoding="utf-8")
+        remove_ids: set[str] = set()
+        if live_thread_ids is not None:
+            remove_ids = set(self._load_session_index()) - {
+                str(thread_id) for thread_id in live_thread_ids
+            }
+        lines, removed = self._canonical_session_index_lines(remove_ids=remove_ids)
+        replacement = "\n".join(lines) + ("\n" if lines else "")
+        if replacement != original:
+            self._atomic_write_text(self.session_index_path, replacement)
+        return removed
+
+    def _snapshot_global_state(self) -> tuple[bool, str]:
+        if not self.global_state_path.exists():
+            return False, ""
+        return True, self.global_state_path.read_text(encoding="utf-8")
+
+    def _restore_global_state(self, snapshot: tuple[bool, str]) -> None:
+        existed, text = snapshot
+        if existed:
+            self._atomic_write_text(self.global_state_path, text)
+            return
+        try:
+            self.global_state_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _prune_global_state_thread_references(
+        self,
+        live_thread_ids: set[str],
+    ) -> dict[str, Any]:
+        """Drop deleted threads from Electron's cached sidebar state.
+
+        The SQLite thread table is authoritative. Electron keeps project ordering,
+        descriptions, and assignments in a separate JSON file, so deleting a thread
+        from SQLite alone leaves a clickable ghost entry in the sidebar.
+        """
+        result = {
+            "path": str(self.global_state_path),
+            "exists": self.global_state_path.exists(),
+            "changed": False,
+            "removed_thread_references": 0,
+            "deduplicated_sidebar_ids": 0,
+        }
+        if not self.global_state_path.exists():
+            return result
+
+        raw_text = self.global_state_path.read_text(encoding="utf-8")
+        try:
+            state = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid Codex global state JSON: {self.global_state_path}: {exc}") from exc
+        if not isinstance(state, dict):
+            raise ValueError(f"Codex global state is not an object: {self.global_state_path}")
+
+        live_ids = {str(thread_id) for thread_id in live_thread_ids}
+        removed = 0
+        deduplicated = 0
+        changed = False
+
+        def filter_list(value: Any, *, dedupe: bool = True) -> Any:
+            nonlocal removed, deduplicated, changed
+            if not isinstance(value, list):
+                return value
+            filtered: list[Any] = []
+            seen: set[str] = set()
+            for item in value:
+                thread_id = str(item)
+                if thread_id not in live_ids:
+                    removed += 1
+                    changed = True
+                    continue
+                if dedupe and thread_id in seen:
+                    deduplicated += 1
+                    changed = True
+                    continue
+                seen.add(thread_id)
+                filtered.append(item)
+            if filtered != value:
+                changed = True
+            return filtered
+
+        def filter_mapping(value: Any) -> Any:
+            nonlocal removed, changed
+            if not isinstance(value, dict):
+                return value
+            filtered = dict(value)
+            for key in list(filtered):
+                if str(key) not in live_ids:
+                    del filtered[key]
+                    removed += 1
+                    changed = True
+            return filtered
+
+        for key in ("projectless-thread-ids", "pinned-thread-ids"):
+            if key in state:
+                state[key] = filter_list(state[key])
+
+        for key in (
+            "thread-project-assignments",
+            "thread-projectless-output-directories",
+            "thread-writable-roots",
+            "thread-workspace-root-hints",
+        ):
+            if key in state:
+                state[key] = filter_mapping(state[key])
+
+        orders = state.get("sidebar-project-thread-orders")
+        if isinstance(orders, dict):
+            sidebar_seen: set[str] = set()
+            for project in orders.values():
+                if not isinstance(project, dict) or not isinstance(project.get("threadIds"), list):
+                    continue
+                filtered: list[Any] = []
+                for item in project["threadIds"]:
+                    thread_id = str(item)
+                    if thread_id not in live_ids:
+                        removed += 1
+                        changed = True
+                        continue
+                    if thread_id in sidebar_seen:
+                        deduplicated += 1
+                        changed = True
+                        continue
+                    sidebar_seen.add(thread_id)
+                    filtered.append(item)
+                if filtered != project["threadIds"]:
+                    project["threadIds"] = filtered
+                    changed = True
+
+        atom_state = state.get("electron-persisted-atom-state")
+        if isinstance(atom_state, dict):
+            for key in ("thread-descriptions-v1", "heartbeat-thread-permissions-by-id"):
+                if key in atom_state:
+                    atom_state[key] = filter_mapping(atom_state[key])
+
+            unread = atom_state.get("unread-thread-ids-by-host-v1")
+            if isinstance(unread, dict):
+                for host, host_value in list(unread.items()):
+                    if isinstance(host_value, list):
+                        unread[host] = filter_list(host_value)
+                    elif isinstance(host_value, dict):
+                        unread[host] = filter_mapping(host_value)
+
+            per_thread_prefixes = (
+                "thread-client-id-v1:local%3A",
+                "thread-client-id-v1:local:",
+                "thread-browser-tabs-v1:",
+                "thread-tab-routes-v1:",
+                "thread-reference-capability:",
+                "codex-writing-block-deleted-thread-v1:",
+            )
+            for key in list(atom_state):
+                if not key.startswith(per_thread_prefixes):
+                    continue
+                thread_id = next(
+                    (
+                        key[len(prefix) :]
+                        for prefix in per_thread_prefixes
+                        if key.startswith(prefix)
+                    ),
+                    "",
+                )
+                if thread_id and thread_id not in live_ids:
+                    del atom_state[key]
+                    removed += 1
+                    changed = True
+
+        result["changed"] = changed
+        result["removed_thread_references"] = removed
+        result["deduplicated_sidebar_ids"] = deduplicated
+        if changed:
+            newline = "\n" if raw_text.endswith(("\n", "\r")) else ""
+            self._atomic_write_text(
+                self.global_state_path,
+                json.dumps(state, ensure_ascii=False, separators=(",", ":")) + newline,
+            )
+        return result
 
     def _append_session_index_entries(
         self,
@@ -5152,6 +5420,13 @@ class CodexSessionTransfer:
         shutil.copy2(self.session_index_path, destination)
         return str(destination)
 
+    def _backup_global_state_for_mirror(self, backup_dir: Path) -> str | None:
+        if not self.global_state_path.exists():
+            return None
+        destination = backup_dir / GLOBAL_STATE_FILENAME
+        shutil.copy2(self.global_state_path, destination)
+        return str(destination)
+
     def _backup_mirror_rollouts(
         self,
         rollout_paths: list[Path],
@@ -5226,6 +5501,7 @@ class CodexSessionTransfer:
         database_backups: dict[str, str],
         rollout_backups: list[RolloutBackup],
         session_index_backup: str | None,
+        global_state_backup: str | None,
         source_ids: set[str],
         target_ids: set[str],
     ) -> None:
@@ -5237,6 +5513,7 @@ class CodexSessionTransfer:
             "target_session_ids": sorted(target_ids),
             "database_backups": database_backups,
             "session_index_backup": session_index_backup,
+            "global_state_backup": global_state_backup,
             "rollout_backups": [
                 {
                     "original_path": str(item.original_path),
@@ -5475,17 +5752,10 @@ class CodexSessionTransfer:
     ) -> list[dict[str, Any]]:
         source_entries = self._load_session_index()
         remove_ids = set(plan.get("_target_ids", set())) | set(plan["_id_map"].values())
-        preserved_lines: list[str] = []
-        if self.session_index_path.exists():
-            for line in self.session_index_path.read_text(encoding="utf-8").splitlines():
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError:
-                    parsed = None
-                thread_id = str(parsed.get("id")) if isinstance(parsed, dict) and parsed.get("id") else ""
-                if thread_id in remove_ids:
-                    continue
-                preserved_lines.append(line)
+        preserved_lines, removed_lines = self._canonical_session_index_lines(
+            remove_ids=remove_ids
+        )
+        plan["_session_index_removed_lines"] = removed_lines
 
         entries: list[dict[str, Any]] = []
         for source_id in plan["_ordered_ids"]:

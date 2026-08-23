@@ -1291,6 +1291,161 @@ class SessionTransferTests(unittest.TestCase):
                 0,
             )
 
+    def test_full_mirror_cleans_stale_and_duplicate_global_sidebar_references(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        target_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        self.add_thread(source_id, provider="ProviderA", title="Current source")
+        self.add_thread(target_id, provider="ProviderB", title="Old target")
+        self.write_session_index(source_id, "Current source")
+        self.write_session_index(source_id, "Current source (latest)")
+        self.write_session_index(target_id, "Old target")
+
+        global_state = {
+            "projectless-thread-ids": [source_id, target_id, target_id],
+            "pinned-thread-ids": [target_id],
+            "thread-project-assignments": {
+                source_id: {"projectKind": "local"},
+                target_id: {"projectKind": "local"},
+            },
+            "thread-writable-roots": {target_id: ["C:/old"]},
+            "sidebar-project-thread-orders": {
+                "project-a": {"threadIds": [target_id, source_id, source_id]},
+                "project-b": {"threadIds": [target_id]},
+            },
+            "electron-persisted-atom-state": {
+                "thread-descriptions-v1": {
+                    source_id: "Current source",
+                    target_id: "Old target",
+                },
+                "thread-client-id-v1:local%3A" + target_id: "client-old",
+                "thread-reference-capability:" + target_id: "cap-old",
+            },
+        }
+        self.transfer.global_state_path.write_text(
+            json.dumps(global_state, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        original_global_state = self.transfer.global_state_path.read_text(encoding="utf-8")
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                True,
+                mirror_target=True,
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        cleanup = result["global_state_cleanup"]
+        self.assertGreater(cleanup["removed_thread_references"], 0)
+        self.assertGreater(cleanup["deduplicated_sidebar_ids"], 0)
+        backup_path = Path(result["global_state_backup"])
+        self.assertEqual(backup_path.read_text(encoding="utf-8"), original_global_state)
+
+        cleaned = json.loads(self.transfer.global_state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cleaned["sidebar-project-thread-orders"],
+            {"project-a": {"threadIds": [source_id]}, "project-b": {"threadIds": []}},
+        )
+        self.assertEqual(cleaned["projectless-thread-ids"], [source_id])
+        self.assertNotIn(target_id, cleaned["thread-project-assignments"])
+        self.assertNotIn(target_id, cleaned["electron-persisted-atom-state"]["thread-descriptions-v1"])
+        self.assertNotIn(
+            "thread-client-id-v1:local%3A" + target_id,
+            cleaned["electron-persisted-atom-state"],
+        )
+
+        index_lines = (self.transfer.session_index_path.read_text(encoding="utf-8")).splitlines()
+        index_ids = [json.loads(line)["id"] for line in index_lines]
+        self.assertEqual(index_ids.count(source_id), 1)
+        self.assertNotIn(target_id, index_ids)
+
+    def test_repair_session_state_removes_stale_sidebar_entries_and_duplicate_index_lines(self) -> None:
+        live_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        stale_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        missing_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        self.add_thread(live_id, provider="ProviderA", title="Live")
+        missing_path = self.add_thread(missing_id, provider="ProviderA", title="Missing rollout")
+        missing_path.unlink()
+        self.write_session_index(live_id, "Live")
+        self.write_session_index(live_id, "Live latest")
+        self.write_session_index(stale_id, "Deleted")
+        self.write_session_index(missing_id, "Missing rollout")
+        self.transfer.global_state_path.write_text(
+            json.dumps(
+                {
+                    "sidebar-project-thread-orders": {
+                        "project": {"threadIds": [stale_id, missing_id, live_id, live_id]}
+                    },
+                    "electron-persisted-atom-state": {
+                        "thread-descriptions-v1": {
+                            stale_id: "Deleted",
+                            missing_id: "Missing rollout",
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.transfer.repair_session_index_from_manifests()
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["session_index_deduplicated"], 3)
+        self.assertGreater(result["global_state_cleanup"]["removed_thread_references"], 0)
+        cleaned = json.loads(self.transfer.global_state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cleaned["sidebar-project-thread-orders"]["project"]["threadIds"],
+            [live_id],
+        )
+        index_ids = [
+            json.loads(line)["id"]
+            for line in self.transfer.session_index_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(index_ids, [live_id])
+
+    def test_full_mirror_restores_global_state_when_verification_fails(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        target_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        self.add_thread(source_id, provider="ProviderA", title="Source")
+        self.add_thread(target_id, provider="ProviderB", title="Target")
+        original_global_state = json.dumps(
+            {
+                "sidebar-project-thread-orders": {
+                    "project": {"threadIds": [target_id]}
+                }
+            },
+            ensure_ascii=False,
+        )
+        self.transfer.global_state_path.write_text(original_global_state, encoding="utf-8")
+
+        with patch.object(
+            self.transfer,
+            "_verify_mirror",
+            side_effect=RuntimeError("forced global state rollback"),
+        ):
+            result = self.transfer.copy_threads(
+                CopyRequest(
+                    "ProviderA",
+                    "ProviderB",
+                    [],
+                    False,
+                    True,
+                    mirror_target=True,
+                )
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(
+            self.transfer.global_state_path.read_text(encoding="utf-8"),
+            original_global_state,
+        )
+
     def test_full_mirror_remaps_paginated_history_base_id_and_byte_offset(self) -> None:
         parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         child_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

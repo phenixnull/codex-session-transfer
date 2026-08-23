@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml"><img alt="Release Build" src="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml/badge.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.9-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.10-blue">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-39-47848f">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12%2B-3776ab">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-24292f">
