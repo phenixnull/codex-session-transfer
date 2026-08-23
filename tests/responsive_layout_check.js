@@ -406,7 +406,8 @@ async function setContentSize(electronApp, page, width, height) {
     assert.ok(tall.gridHeight > 240, `tall desktop grid did not grow: ${tall.gridHeight}px`);
     assert.ok(tall.unused <= 2, `tall desktop left ${tall.unused}px unused`);
 
-    await setContentSize(electronApp, page, 1024, 600);
+    // Keep the CSS viewport below 1240px on both standard and Retina runners.
+    await setContentSize(electronApp, page, 800, 600);
     const narrow = await page.evaluate(() => ({
       bodyOverflowY: getComputedStyle(document.body).overflowY,
       horizontalFits: document.documentElement.scrollWidth <= innerWidth,
