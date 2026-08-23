@@ -255,12 +255,15 @@ function startFixtureServer() {
 }
 
 async function setContentSize(electronApp, page, width, height) {
-  await electronApp.evaluate(({ BrowserWindow }, size) => {
-    BrowserWindow.getAllWindows()[0].setContentSize(size.width, size.height);
+  const contentSize = await electronApp.evaluate(({ BrowserWindow }, size) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    window.setContentSize(size.width, size.height);
+    const [actualWidth, actualHeight] = window.getContentSize();
+    return { width: actualWidth, height: actualHeight };
   }, { width, height });
   await page.waitForFunction(
     (size) => innerWidth === size.width && innerHeight === size.height,
-    { width, height },
+    contentSize,
   );
 }
 
