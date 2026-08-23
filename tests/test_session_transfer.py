@@ -910,8 +910,10 @@ class SessionTransferTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         destination = Path(result["items"][0]["dest_rollout_path"])
         self.assertTrue(destination.exists())
-        self.assertIn("_", destination.name)
-        self.assertTrue(destination.name.endswith(".jsonl"))
+        self.assertEqual(
+            destination.name,
+            f"rollout-2026-08-22T16-53-01-{result['items'][0]['target_id']}.jsonl",
+        )
 
     def test_copy_single_thread_allows_same_provider(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -1351,6 +1353,98 @@ class SessionTransferTests(unittest.TestCase):
             copied_paths[id_map[parent_id]].stat().st_size,
         )
         self.assertNotEqual(history_base["end_byte_offset"], original_parent_size)
+
+    def test_full_mirror_preserves_reverted_rollout_history_base(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        replacement_rollout_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        base_path = self.add_thread(thread_id, provider="ProviderA", title="Reverted thread")
+        base_bytes = base_path.read_bytes()
+        replacement_path = base_path.with_name(
+            f"{base_path.stem}_{replacement_rollout_id}.jsonl"
+        )
+        replacement_records = [
+            json.loads(line) for line in base_path.read_text(encoding="utf-8").splitlines()
+        ]
+        replacement_meta = replacement_records[0]["item"]["payload"]
+        replacement_meta["history_mode"] = "paginated"
+        replacement_meta["history_base"] = {
+            "thread_id": thread_id,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": len(base_bytes),
+        }
+        replacement_path.write_text(
+            "".join(compact_json(record) + "\n" for record in replacement_records),
+            encoding="utf-8",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                (str(replacement_path), thread_id),
+            )
+            conn.commit()
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                True,
+                mirror_target=True,
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        copied_meta = json.loads(
+            replacement_path.read_text(encoding="utf-8").splitlines()[0]
+        )["item"]["payload"]
+        self.assertEqual(copied_meta["model_provider"], "ProviderB")
+        self.assertEqual(copied_meta["history_base"]["thread_id"], thread_id)
+        self.assertEqual(copied_meta["history_base"]["end_byte_offset"], len(base_bytes))
+        self.assertEqual(base_path.read_bytes(), base_bytes)
+
+    def test_copy_preserves_external_reverted_rollout_history_base(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        replacement_rollout_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        base_path = self.add_thread(thread_id, provider="ProviderA", title="Reverted thread")
+        base_size = base_path.stat().st_size
+        replacement_path = base_path.with_name(
+            f"{base_path.stem}_{replacement_rollout_id}.jsonl"
+        )
+        replacement_records = [
+            json.loads(line) for line in base_path.read_text(encoding="utf-8").splitlines()
+        ]
+        replacement_meta = replacement_records[0]["item"]["payload"]
+        replacement_meta["history_mode"] = "paginated"
+        replacement_meta["history_base"] = {
+            "thread_id": thread_id,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": base_size,
+        }
+        replacement_path.write_text(
+            "".join(compact_json(record) + "\n" for record in replacement_records),
+            encoding="utf-8",
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                (str(replacement_path), thread_id),
+            )
+            conn.commit()
+
+        result = self.transfer.copy_threads(
+            CopyRequest("ProviderA", "ProviderB", [thread_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        target_path = Path(result["items"][0]["dest_rollout_path"])
+        copied_meta = json.loads(
+            target_path.read_text(encoding="utf-8").splitlines()[0]
+        )["item"]["payload"]
+        self.assertNotEqual(result["items"][0]["target_id"], thread_id)
+        self.assertEqual(copied_meta["id"], result["items"][0]["target_id"])
+        self.assertEqual(copied_meta["history_base"]["thread_id"], thread_id)
+        self.assertEqual(copied_meta["history_base"]["end_byte_offset"], base_size)
 
     def test_full_mirror_copies_durable_sidecars_and_clears_runtime_projections(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

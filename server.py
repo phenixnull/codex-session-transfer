@@ -71,11 +71,13 @@ ROLLOUT_THREAD_ID_LIST_FIELDS = {"thread_ids"}
 SKILL_PACKAGE_FORMAT = "codex-skill-transfer-package"
 SKILL_PACKAGE_VERSION = 1
 SKILL_PACKAGE_DIRNAME = "skills"
+ROLLOUT_UUID_PATTERN = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 ROLLOUT_NAME_RE = re.compile(
-    r"^(?P<prefix>rollout-.+(?:-|_))"
-    r"(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
-    r"(?P<suffix>\.jsonl)$"
+    rf"^(?P<prefix>rollout-.+?-)(?P<thread_id>{ROLLOUT_UUID_PATTERN})"
+    rf"(?:_(?P<rollout_id>{ROLLOUT_UUID_PATTERN}))?(?P<suffix>\.jsonl)$"
 )
 SECRET_PATTERNS = (
     re.compile(r"\bghp_[A-Za-z0-9_]{20,}\b"),
@@ -4261,6 +4263,13 @@ class CodexSessionTransfer:
             raise ValueError(f"Unsupported rollout file name: {source_path.name}")
         return source_path.with_name(f"{match.group('prefix')}{target_id}{match.group('suffix')}")
 
+    @staticmethod
+    def _rollout_id_from_path(rollout_path: Path) -> str:
+        match = ROLLOUT_NAME_RE.match(rollout_path.name)
+        if not match:
+            raise ValueError(f"Unsupported rollout file name: {rollout_path.name}")
+        return match.group("rollout_id") or match.group("thread_id")
+
     def _write_rollout_copy(
         self,
         source_path: Path,
@@ -4272,7 +4281,8 @@ class CodexSessionTransfer:
         target_cwd: str | None = None,
         target_source: str | None = None,
         overwrite: bool = False,
-        history_base_offsets: dict[tuple[str, int], int] | None = None,
+        history_base_rewrites: dict[tuple[str, int], tuple[str, int]] | None = None,
+        history_base_rewrite_ids: set[str] | None = None,
         tracked_offsets: set[int] | None = None,
     ) -> dict[int, int]:
         if dest_path.exists() and not overwrite:
@@ -4325,7 +4335,8 @@ class CodexSessionTransfer:
                         target_cwd=target_cwd,
                         target_source=target_source,
                         destination_path=dest_path,
-                        history_base_offsets=history_base_offsets or {},
+                        history_base_rewrites=history_base_rewrites or {},
+                        history_base_rewrite_ids=history_base_rewrite_ids or set(),
                     )
                     session_meta_count += int(is_session_meta)
                     if changed:
@@ -4371,7 +4382,8 @@ class CodexSessionTransfer:
         target_cwd: str | None,
         target_source: str | None,
         destination_path: Path,
-        history_base_offsets: dict[tuple[str, int], int],
+        history_base_rewrites: dict[tuple[str, int], tuple[str, int]],
+        history_base_rewrite_ids: set[str],
     ) -> tuple[bool, bool]:
         item_type, payload = self._rollout_record_item(record)
         if not isinstance(payload, dict):
@@ -4395,20 +4407,31 @@ class CodexSessionTransfer:
                 base_offset = history_base.get("end_byte_offset")
                 if (
                     isinstance(base_thread_id, str)
-                    and base_thread_id in id_map
                     and isinstance(base_offset, int)
+                    and base_thread_id in history_base_rewrite_ids
                 ):
                     key = (base_thread_id, base_offset)
-                    if key not in history_base_offsets:
+                    if key not in history_base_rewrites:
                         raise ValueError(
-                            f"Missing rewritten history offset for {base_thread_id} at {base_offset}"
+                            f"Missing rewritten history position for rollout "
+                            f"{base_thread_id} at {base_offset}"
                         )
+                    target_base_id, target_base_offset = history_base_rewrites[key]
+                    changed |= self._set_json_value(
+                        history_base,
+                        "thread_id",
+                        target_base_id,
+                    )
                     changed |= self._set_json_value(
                         history_base,
                         "end_byte_offset",
-                        history_base_offsets[key],
+                        target_base_offset,
                     )
-            changed |= self._remap_thread_identity_values(metadata, id_map)
+            changed |= self._remap_thread_identity_values(
+                metadata,
+                id_map,
+                excluded_keys=frozenset({"history_base"}),
+            )
             if target_source:
                 changed |= self._set_json_value(metadata, "source", target_source)
             elif "source" in metadata:
@@ -4459,25 +4482,34 @@ class CodexSessionTransfer:
 
         target_sources = plan.get("_target_source_by_source_id", {})
         items_by_id = {str(item["source_id"]): item for item in items}
+        rollout_id_by_source_id: dict[str, str] = {}
+        source_id_by_rollout_id: dict[str, str] = {}
+        for source_id, item in items_by_id.items():
+            rollout_id = self._rollout_id_from_path(Path(item["source_rollout_path"]))
+            other_source_id = source_id_by_rollout_id.get(rollout_id)
+            if other_source_id is not None:
+                raise ValueError(
+                    f"Multiple source sessions use rollout {rollout_id}: "
+                    f"{other_source_id}, {source_id}"
+                )
+            rollout_id_by_source_id[source_id] = rollout_id
+            source_id_by_rollout_id[rollout_id] = source_id
         dependencies = self._rollout_history_dependencies(items)
         required_offsets: dict[str, set[int]] = {}
         for source_id, dependency in dependencies.items():
             if dependency is None:
                 continue
             base_id, base_offset = dependency
-            if base_id not in plan["_id_map"]:
+            base_source_id = source_id_by_rollout_id.get(base_id)
+            if base_source_id is None:
                 continue
-            if base_id not in items_by_id:
-                raise ValueError(
-                    f"History base {base_id} for {source_id} is not included in the copy plan"
-                )
-            required_offsets.setdefault(base_id, set()).add(base_offset)
+            required_offsets.setdefault(base_source_id, set()).add(base_offset)
 
-        rewritten_history_offsets: dict[tuple[str, int], int] = {}
+        rewritten_history_positions: dict[tuple[str, int], tuple[str, int]] = {}
 
         def write_one(
             item: dict[str, Any],
-            history_offsets: dict[tuple[str, int], int],
+            history_positions: dict[tuple[str, int], tuple[str, int]],
         ) -> RolloutWriteResult:
             destination_path = Path(item["dest_rollout_path"])
             offset_map = self._write_rollout_copy(
@@ -4489,7 +4521,8 @@ class CodexSessionTransfer:
                 target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
                 target_source=target_sources.get(item["source_id"]),
                 overwrite=destination_path in overwrite_paths,
-                history_base_offsets=history_offsets,
+                history_base_rewrites=history_positions,
+                history_base_rewrite_ids=set(source_id_by_rollout_id),
                 tracked_offsets=required_offsets.get(str(item["source_id"]), set()),
             )
             return RolloutWriteResult(
@@ -4508,8 +4541,8 @@ class CodexSessionTransfer:
                 if source_id in pending_ids
                 and (
                     dependencies.get(source_id) is None
-                    or dependencies[source_id][0] not in plan["_id_map"]
-                    or dependencies[source_id][0] in finished_ids
+                    or dependencies[source_id][0] not in source_id_by_rollout_id
+                    or source_id_by_rollout_id[dependencies[source_id][0]] in finished_ids
                 )
             ]
             if not ready_ids:
@@ -4518,7 +4551,7 @@ class CodexSessionTransfer:
                     + ", ".join(sorted(pending_ids))
                 )
 
-            history_offsets = dict(rewritten_history_offsets)
+            history_positions = dict(rewritten_history_positions)
             futures: dict[Future[RolloutWriteResult], dict[str, Any]] = {}
             failure: BaseException | None = None
             level_results: list[RolloutWriteResult] = []
@@ -4528,7 +4561,7 @@ class CodexSessionTransfer:
             ) as executor:
                 for source_id in ready_ids:
                     item = items_by_id[source_id]
-                    futures[executor.submit(write_one, item, history_offsets)] = item
+                    futures[executor.submit(write_one, item, history_positions)] = item
                 for future in as_completed(futures):
                     try:
                         result = future.result()
@@ -4566,8 +4599,13 @@ class CodexSessionTransfer:
 
             for result in level_results:
                 source_id = str(result.item["source_id"])
+                source_rollout_id = rollout_id_by_source_id[source_id]
+                target_rollout_id = self._rollout_id_from_path(result.destination_path)
                 for old_offset, new_offset in result.offset_map.items():
-                    rewritten_history_offsets[(source_id, old_offset)] = new_offset
+                    rewritten_history_positions[(source_rollout_id, old_offset)] = (
+                        target_rollout_id,
+                        new_offset,
+                    )
                 finished_ids.add(source_id)
                 pending_ids.discard(source_id)
 
@@ -4643,10 +4681,14 @@ class CodexSessionTransfer:
         self,
         value: Any,
         id_map: dict[str, str],
+        *,
+        excluded_keys: frozenset[str] = frozenset(),
     ) -> bool:
         changed = False
         if isinstance(value, dict):
             for key, child in value.items():
+                if key in excluded_keys:
+                    continue
                 if key in ROLLOUT_THREAD_ID_FIELDS and isinstance(child, str) and child in id_map:
                     value[key] = id_map[child]
                     changed = True
@@ -4657,10 +4699,18 @@ class CodexSessionTransfer:
                         value[key] = replacement
                         changed = True
                     continue
-                changed |= self._remap_thread_identity_values(child, id_map)
+                changed |= self._remap_thread_identity_values(
+                    child,
+                    id_map,
+                    excluded_keys=excluded_keys,
+                )
         elif isinstance(value, list):
             for child in value:
-                changed |= self._remap_thread_identity_values(child, id_map)
+                changed |= self._remap_thread_identity_values(
+                    child,
+                    id_map,
+                    excluded_keys=excluded_keys,
+                )
         return changed
 
     def _validate_rebind_rollout(
