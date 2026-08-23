@@ -3,10 +3,15 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const {
+  LOOPBACK_HOST,
+  buildServerArguments,
+  createInstanceToken,
+  reserveLoopbackPort,
+  serverMatchesInstance,
+} = require("./server-runtime");
 
-const HOST = "127.0.0.1";
-const PORT = process.env.CODEX_SESSION_TRANSFER_PORT || "8765";
-const APP_URL = `http://${HOST}:${PORT}`;
+const HOST = LOOPBACK_HOST;
 const APP_ID = "com.phenixnull.codex-session-transfer";
 
 let serverProcess = null;
@@ -34,7 +39,7 @@ function iconPath() {
   return path.join(appRoot(), "assets", name);
 }
 
-function createWindow() {
+function createWindow(appUrl) {
   const win = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -59,7 +64,7 @@ function createWindow() {
     },
   });
 
-  win.loadURL(APP_URL);
+  win.loadURL(appUrl);
 }
 
 ipcMain.handle("codex-session-transfer:choose-directory", async (event) => {
@@ -70,29 +75,16 @@ ipcMain.handle("codex-session-transfer:choose-directory", async (event) => {
   return result.canceled ? null : result.filePaths[0] || null;
 });
 
-async function waitForServer() {
+async function waitForServer(appUrl, instanceToken, child) {
   for (let i = 0; i < 60; i += 1) {
-    try {
-      const response = await fetch(`${APP_URL}/api/status`);
-      if (response.ok) return true;
-    } catch {
-      // Keep polling while the local server starts.
-    }
+    if (child && child.exitCode !== null) return false;
+    if (await serverMatchesInstance(appUrl, instanceToken)) return true;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return false;
 }
 
-async function isServerReady() {
-  try {
-    const response = await fetch(`${APP_URL}/api/status`);
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-function packagedServerCandidate() {
+function packagedServerCandidate(runtimeArgs) {
   const platformDir = process.platform === "win32" ? "win" : process.platform === "darwin" ? "mac" : "linux";
   const binaryName = process.platform === "win32"
     ? "codex-session-transfer-server.exe"
@@ -101,19 +93,19 @@ function packagedServerCandidate() {
   if (!fs.existsSync(resourcePath)) return null;
   return {
     command: resourcePath,
-    args: ["--host", HOST, "--port", PORT],
+    args: runtimeArgs,
     cwd: path.dirname(resourcePath),
     label: "packaged server",
   };
 }
 
-function devServerCandidates() {
+function devServerCandidates(runtimeArgs) {
   const repoRoot = path.join(__dirname, "..");
   const candidates = [];
   if (process.env.PYTHON) {
     candidates.push({
       command: process.env.PYTHON,
-      args: ["server.py", "--host", HOST, "--port", PORT],
+      args: ["server.py", ...runtimeArgs],
       cwd: repoRoot,
       label: "PYTHON",
     });
@@ -130,7 +122,7 @@ function devServerCandidates() {
   if (fs.existsSync(bundledPython)) {
     candidates.push({
       command: bundledPython,
-      args: ["server.py", "--host", HOST, "--port", PORT],
+      args: ["server.py", ...runtimeArgs],
       cwd: repoRoot,
       label: "Codex bundled Python",
     });
@@ -138,22 +130,22 @@ function devServerCandidates() {
   candidates.push(
     ...(process.platform === "win32"
     ? [
-        { command: "py", args: ["-3", "server.py", "--host", HOST, "--port", PORT], cwd: repoRoot, label: "py launcher" },
-        { command: "python", args: ["server.py", "--host", HOST, "--port", PORT], cwd: repoRoot, label: "python" },
+        { command: "py", args: ["-3", "server.py", ...runtimeArgs], cwd: repoRoot, label: "py launcher" },
+        { command: "python", args: ["server.py", ...runtimeArgs], cwd: repoRoot, label: "python" },
       ]
     : [
-        { command: "python3", args: ["server.py", "--host", HOST, "--port", PORT], cwd: repoRoot, label: "python3" },
-        { command: "python", args: ["server.py", "--host", HOST, "--port", PORT], cwd: repoRoot, label: "python" },
+        { command: "python3", args: ["server.py", ...runtimeArgs], cwd: repoRoot, label: "python3" },
+        { command: "python", args: ["server.py", ...runtimeArgs], cwd: repoRoot, label: "python" },
       ])
   );
   return candidates;
 }
 
-function serverCandidates() {
+function serverCandidates(runtimeArgs) {
   const candidates = [];
-  const packaged = packagedServerCandidate();
+  const packaged = packagedServerCandidate(runtimeArgs);
   if (packaged) candidates.push(packaged);
-  if (!app.isPackaged) candidates.push(...devServerCandidates());
+  if (!app.isPackaged) candidates.push(...devServerCandidates(runtimeArgs));
   return candidates;
 }
 
@@ -192,46 +184,72 @@ function launchServer(candidate) {
   });
 }
 
+function terminateServer(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 1500);
+    child.once("exit", finish);
+    try {
+      child.kill();
+    } catch {
+      finish();
+    }
+  });
+}
+
 async function startServer() {
-  for (const candidate of serverCandidates()) {
-    const result = await launchServer(candidate);
-    if (!result.ok) {
+  const instanceToken = createInstanceToken();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let reservation;
+    try {
+      reservation = await reserveLoopbackPort(HOST);
+    } catch {
       continue;
     }
-    serverProcess = result.child;
-    if (await waitForServer()) {
-      return true;
-    }
-    if (serverProcess && !serverProcess.killed) {
-      serverProcess.kill();
+    const appUrl = `http://${HOST}:${reservation.port}`;
+    const runtimeArgs = buildServerArguments({
+      host: HOST,
+      port: reservation.port,
+      instanceToken,
+      parentPid: process.pid,
+    });
+    await reservation.release();
+
+    for (const candidate of serverCandidates(runtimeArgs)) {
+      const result = await launchServer(candidate);
+      if (!result.ok) continue;
+      serverProcess = result.child;
+      if (await waitForServer(appUrl, instanceToken, result.child)) {
+        return { ok: true, appUrl, instanceToken };
+      }
+      await terminateServer(result.child);
+      if (serverProcess === result.child) serverProcess = null;
     }
   }
-  return false;
+  return { ok: false };
 }
 
 app.whenReady().then(async () => {
-  if (!(await isServerReady())) {
-    const started = await startServer();
-    if (!started) {
-      dialog.showErrorBox(
-        "Codex Session Transfer",
-        `Could not start the packaged local server for ${APP_URL}.`
-      );
-      app.quit();
-      return;
-    }
-  }
-
-  if (!(await isServerReady())) {
+  const runtime = await startServer();
+  if (!runtime.ok || !(await serverMatchesInstance(runtime.appUrl, runtime.instanceToken))) {
     dialog.showErrorBox(
       "Codex Session Transfer",
-      `Could not connect to the local server at ${APP_URL}.`
+      "Could not start this app's packaged local server."
     );
     app.quit();
     return;
   }
 
-  createWindow();
+  createWindow(runtime.appUrl);
 });
 
 app.on("before-quit", () => {

@@ -10,6 +10,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 import uuid
 import zipfile
@@ -5917,7 +5919,62 @@ def app_base_dir() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
 
-def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[SimpleHTTPRequestHandler]:
+def parent_process_is_alive(parent_pid: int) -> bool:
+    if parent_pid <= 0:
+        return False
+    if parent_pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        import ctypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        wait_failed = 0xFFFFFFFF
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(synchronize, False, parent_pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0)
+            if result == wait_failed:
+                return True
+            return result == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(parent_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def watch_parent_process(
+    parent_pid: int,
+    stop_callback: Callable[[], None],
+    *,
+    poll_interval: float = 1.0,
+) -> None:
+    while parent_process_is_alive(parent_pid):
+        time.sleep(poll_interval)
+    stop_callback()
+
+
+def make_handler(
+    transfer: CodexSessionTransfer,
+    static_dir: Path,
+    *,
+    instance_token: str = "",
+) -> type[SimpleHTTPRequestHandler]:
     class TransferRequestHandler(SimpleHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -5930,6 +5987,9 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == "/api/health":
+                self._send_json({"ok": True, "instance_token": instance_token})
+                return
             if parsed.path == "/api/status":
                 self._send_json(transfer.status())
                 return
@@ -6247,13 +6307,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Codex provider session transfer tool")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--instance-token", default="")
+    parser.add_argument("--parent-pid", type=int)
     parser.add_argument("--codex-home", type=Path)
     parser.add_argument("--sqlite-home", type=Path)
     args = parser.parse_args(argv)
 
     transfer = CodexSessionTransfer(codex_home=args.codex_home, sqlite_home=args.sqlite_home)
     static_dir = app_base_dir() / "static"
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(transfer, static_dir))
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(transfer, static_dir, instance_token=args.instance_token),
+    )
+    if args.parent_pid:
+        threading.Thread(
+            target=watch_parent_process,
+            args=(args.parent_pid, server.shutdown),
+            name="electron-parent-watchdog",
+            daemon=True,
+        ).start()
     url = f"http://{args.host}:{args.port}"
     print(f"Codex session transfer tool listening on {url}", flush=True)
     try:

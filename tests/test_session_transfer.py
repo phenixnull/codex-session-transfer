@@ -23,6 +23,8 @@ from server import (
     SkillPackageRequest,
     WorkspaceMapping,
     make_handler,
+    parent_process_is_alive,
+    watch_parent_process,
 )
 
 
@@ -2235,6 +2237,43 @@ name = "Provider B"
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=5)
+
+    def test_http_health_returns_exact_instance_token(self) -> None:
+        instance_token = "test-instance-token"
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(
+                self.transfer,
+                Path(__file__).resolve().parents[1] / "static",
+                instance_token=instance_token,
+            ),
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        try:
+            connection.request("GET", "/api/health")
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                payload,
+                {"ok": True, "instance_token": instance_token},
+            )
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    def test_parent_watchdog_stops_after_parent_disappears(self) -> None:
+        stopped = threading.Event()
+        with patch("server.parent_process_is_alive", return_value=False):
+            watch_parent_process(999_999, stopped.set, poll_interval=0.001)
+
+        self.assertTrue(stopped.is_set())
+        self.assertTrue(parent_process_is_alive(os.getpid()))
 
     def test_http_copy_progress_reports_unexpected_handler_errors(self) -> None:
         server = ThreadingHTTPServer(
