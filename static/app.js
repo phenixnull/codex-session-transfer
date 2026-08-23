@@ -156,6 +156,16 @@ function copyRequest() {
   return request;
 }
 
+function rebindRequest() {
+  return {
+    source_provider: $("sourceProvider").value,
+    target_provider: targetProviderValue(),
+    thread_ids: Array.from(state.selected),
+    include_descendants: $("includeDescendants").checked,
+    include_archived: $("includeArchived").checked,
+  };
+}
+
 function selectedPackageProjects() {
   if (!usingPackageSource()) return [];
   return window.WorkspaceMapping.selectedProjects(
@@ -407,6 +417,7 @@ function renderAllShell() {
   renderProjectFilter();
   renderPackagePanel();
   renderSkillsPackagePanel();
+  updateRebindButton();
 }
 
 function renderPageChrome() {
@@ -445,6 +456,8 @@ function renderModeChrome() {
   if (panel) panel.hidden = !isPackageMode;
   const title = $("workbenchTitle");
   if (title) title.textContent = usingPackageSource() ? "Package Source Sessions" : "Source Sessions";
+  const rebindButton = $("rebindButton");
+  if (rebindButton) rebindButton.hidden = isPackageMode;
   const kind = $("sourceSetupKind");
   if (kind) kind.textContent = usingPackageSource() ? "Package" : "Provider";
   const label = $("sourceProviderLabel");
@@ -1457,6 +1470,7 @@ function renderSelectionState() {
   $("selectAll").checked =
     state.sourceThreads.length > 0 && state.sourceThreads.every((thread) => state.selected.has(thread.id));
   updateCopyButton();
+  updateRebindButton();
   renderPackagePanel();
 }
 
@@ -1628,6 +1642,7 @@ function updateCopyProgress(event = null) {
     planning: "Planning",
     ready: "Ready",
     copying: "Copying",
+    rebinding: "Rebinding",
     committing: "Committing",
     blocked: "Blocked",
     error: "Stopped",
@@ -1693,6 +1708,64 @@ async function executeCopy() {
   } finally {
     state.copyInProgress = false;
     updateCopyButton();
+  }
+}
+
+async function executeRebind() {
+  const reasons = rebindDisabledReasons();
+  if (reasons.length) return;
+  const count = state.selected.size;
+  const source = $("sourceProvider").value;
+  const target = targetProviderValue();
+  const descendantsNotice = $("includeDescendants")?.checked ? " Child sessions included." : "";
+  const archivedNotice = $("includeArchived")?.checked ? " Archived sessions included." : "";
+  const confirmed = window.confirm(
+    `Rebind ${count} selected session(s) from ${source} to ${target}?${descendantsNotice}${archivedNotice}\n\nSession IDs, titles, names, and transcript files will be preserved.`
+  );
+  if (!confirmed) return;
+
+  state.copyInProgress = true;
+  updateCopyButton();
+  updateRebindButton();
+  updateCopyProgress({
+    phase: "checking",
+    current: 0,
+    total: count,
+    message: "Rebinding sessions",
+  });
+  setCopyResult(`Rebinding ${count} selected session(s)...`, "info");
+  try {
+    const result = await streamApi(
+      "/api/rebind-progress",
+      {
+        method: "POST",
+        body: JSON.stringify(rebindRequest()),
+      },
+      updateCopyProgress,
+    );
+    const reboundCount = Number(result.rebound_count ?? result.item_total ?? result.items?.length ?? 0);
+    const resultText = result.ok
+      ? `Rebound ${reboundCount} session(s) to ${result.target_provider || target}. IDs and transcript files were preserved. Backup: ${result.backup_path}`
+      : `Not rebound. ${(result.errors || []).join("; ")}`;
+    await loadStatus();
+    state.selected.clear();
+    state.lastCopiedTargetIds.clear();
+    renderAllShell();
+    if (result.ok && result.target_provider) {
+      const sourceSelect = $("sourceProvider");
+      if (Array.from(sourceSelect.options).some((option) => option.value === result.target_provider)) {
+        sourceSelect.value = result.target_provider;
+      }
+    }
+    await loadThreadLists({ preserveResult: true });
+    setCopyResult(resultText, result.ok ? "success" : "error");
+  } catch (error) {
+    updateCopyProgress({ phase: "error", current: 0, total: count, message: error.message });
+    setCopyResult(error.message, "error");
+  } finally {
+    state.copyInProgress = false;
+    updateCopyButton();
+    updateRebindButton();
   }
 }
 
@@ -2075,6 +2148,54 @@ function updateCopyButton() {
   $("copyDisabledReason").textContent = reasons.length ? reasons.join(" ") : "Ready to copy. Preview is optional.";
 }
 
+function updateRebindButton() {
+  const button = $("rebindButton");
+  const hint = $("rebindDisabledReason");
+  if (!button) return;
+  const reasons = rebindDisabledReasons();
+  button.disabled = reasons.length > 0;
+  button.title = reasons.join(" ");
+  if (hint) {
+    hint.textContent = reasons.length
+      ? reasons.join(" ")
+      : "Rebind keeps the original session ID, transcript, title, and session index entry.";
+  }
+}
+
+function rebindDisabledReasons() {
+  const reasons = [];
+  const selectedCount = state.selected.size;
+  const source = $("sourceProvider")?.value || "";
+  const target = targetProviderValue();
+  const blockingCount = (state.status && state.status.blocking_processes || []).length;
+
+  if (usingPackageSource()) {
+    reasons.push("Rebind is available for local sessions only.");
+  }
+  if (selectedCount === 0) {
+    reasons.push("Select at least one session.");
+  }
+  if (!source) {
+    reasons.push("Choose a source provider.");
+  }
+  if (!target) {
+    reasons.push("Choose a target provider.");
+  }
+  if (source && target && source === target) {
+    reasons.push("Source and target providers must be different.");
+  }
+  if (target && targetProviderIsConfigured({ value: target }) === false) {
+    reasons.push(`Target provider '${target}' is not defined in config.toml.`);
+  }
+  if (state.copyInProgress) {
+    reasons.push("A session operation is already running.");
+  }
+  if (blockingCount) {
+    reasons.push(`Close Codex/Codex++ before rebinding (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
+  }
+  return reasons;
+}
+
 function copyDisabledReasons(blocked) {
   const reasons = [];
   const selectedCount = state.selected.size;
@@ -2091,7 +2212,7 @@ function copyDisabledReasons(blocked) {
     reasons.push(`Target provider '${target}' is not defined in config.toml.`);
   }
   if (state.copyInProgress) {
-    reasons.push("Copy is already running.");
+    reasons.push("A session operation is already running.");
   }
   if (blocked) {
     reasons.push(`Close Codex/Codex++ before copying (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
@@ -2243,11 +2364,13 @@ function bindEvents() {
     updateCustomTargetVisibility();
     renderLiveTargetPanel();
     invalidatePreview();
+    updateRebindButton();
     loadTargetThreads();
   });
   $("targetProviderCustom").addEventListener("input", () => {
     renderLiveTargetPanel();
     invalidatePreview();
+    updateRebindButton();
     loadTargetThreads();
   });
   $("overwriteSessions").addEventListener("change", () => invalidatePreview());
@@ -2277,6 +2400,9 @@ function bindEvents() {
     chooseWorkspaceDirectory().catch((error) => setCopyResult(error.message, "error"));
   });
   $("previewButton").addEventListener("click", previewCopy);
+  $("rebindButton").addEventListener("click", () => {
+    executeRebind().catch((error) => setCopyResult(error.message, "error"));
+  });
   $("copyButton").addEventListener("click", executeCopy);
   $("sessionRenderToggleButton").addEventListener("click", () => setSessionRenderCollapsed(true));
   $("sessionRenderExpandButton").addEventListener("click", () => setSessionRenderCollapsed(false));
@@ -2335,6 +2461,7 @@ function renderFileRuntimeNotice() {
     "includeDescendants",
     "selectAll",
     "previewButton",
+    "rebindButton",
     "copyButton",
     "exportSkillsPackageButton",
     "skillsPackagePathInput",

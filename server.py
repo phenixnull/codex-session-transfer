@@ -178,6 +178,28 @@ class CopyRequest:
 
 
 @dataclass(frozen=True)
+class RebindRequest:
+    source_provider: str
+    target_provider: str
+    thread_ids: list[str]
+    include_descendants: bool
+    include_archived: bool
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "RebindRequest":
+        thread_ids = data.get("thread_ids", [])
+        if not isinstance(thread_ids, list):
+            raise ValueError("thread_ids must be a list")
+        return cls(
+            source_provider=str(data.get("source_provider", "")).strip(),
+            target_provider=str(data.get("target_provider", "")).strip(),
+            thread_ids=[str(thread_id).strip() for thread_id in thread_ids if str(thread_id).strip()],
+            include_descendants=bool(data.get("include_descendants", False)),
+            include_archived=bool(data.get("include_archived", False)),
+        )
+
+
+@dataclass(frozen=True)
 class ExportPackageRequest:
     source_provider: str
     thread_ids: list[str]
@@ -1051,6 +1073,179 @@ class CodexSessionTransfer:
                 f"Copied {len(manifest_payload.get('items') or [])} session(s)"
                 if manifest_payload.get("ok")
                 else (manifest_payload.get("errors") or ["Copy failed"])[0]
+            ),
+        )
+        return manifest_payload
+
+    def preview_rebind(self, request: RebindRequest) -> dict[str, Any]:
+        with closing(self._connect(read_only=True)) as conn:
+            plan = self._build_rebind_plan(conn, request)
+        return self._public_rebind_plan(plan)
+
+    def rebind_threads(
+        self,
+        request: RebindRequest,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        progress_total = max(len(request.thread_ids), 1)
+        self._report_copy_progress(
+            progress_callback,
+            phase="checking",
+            total=progress_total,
+            message="Checking the selected sessions and target provider",
+        )
+        blocking = self.blocking_processes()
+        if blocking:
+            self._report_copy_progress(
+                progress_callback,
+                phase="blocked",
+                total=progress_total,
+                message="Close Codex and the provider switcher before rebinding",
+            )
+            payload = {
+                "ok": False,
+                "blocked": True,
+                "errors": ["Close Codex and provider switcher processes before rebinding."],
+                "blocking_processes": blocking,
+                "items": [],
+            }
+            manifest_path = self._write_manifest(payload, request, operation="rebind")
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        self._report_copy_progress(
+            progress_callback,
+            phase="planning",
+            total=progress_total,
+            message="Building the provider rebind plan",
+        )
+        preflight = self.preview_rebind(request)
+        if not preflight["can_execute"]:
+            self._report_copy_progress(
+                progress_callback,
+                phase="error",
+                total=progress_total,
+                message=(preflight.get("errors") or ["Rebind plan is not executable"])[0],
+            )
+            payload = {"ok": False, "blocked": False, **preflight}
+            manifest_path = self._write_manifest(payload, request, operation="rebind")
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        item_total = int(preflight.get("item_total") or len(preflight.get("items") or []))
+        self._report_copy_progress(
+            progress_callback,
+            phase="ready",
+            total=item_total,
+            message=f"Ready to rebind {item_total} session(s)",
+        )
+
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = self._backup_database(operation="rebind")
+        rollout_backups: list[tuple[Path, Path]] = []
+        rewritten_paths: set[Path] = set()
+        manifest_payload: dict[str, Any] | None = None
+
+        with closing(self._connect(read_only=False)) as conn:
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("BEGIN IMMEDIATE")
+                plan = self._build_rebind_plan(conn, request)
+                if plan["errors"]:
+                    conn.rollback()
+                    manifest_payload = {
+                        "ok": False,
+                        "blocked": False,
+                        **self._public_rebind_plan(plan),
+                        "backup_path": str(backup_path),
+                    }
+                else:
+                    rollout_paths = list(
+                        dict.fromkeys(Path(item["rollout_path"]) for item in plan["items"])
+                    )
+                    rollout_backups = self._backup_rollout_files(
+                        rollout_paths,
+                        operation="rebind",
+                    )
+                    total_items = len(plan["items"])
+                    for index, item in enumerate(plan["items"], start=1):
+                        rollout_path = Path(item["rollout_path"])
+                        if rollout_path not in rewritten_paths:
+                            self._write_rollout_provider(
+                                rollout_path,
+                                plan["target_provider"],
+                            )
+                            rewritten_paths.add(rollout_path)
+                        self._report_copy_progress(
+                            progress_callback,
+                            phase="rebinding",
+                            current=index,
+                            total=total_items,
+                            item=item,
+                        )
+
+                    ordered_ids = plan["_ordered_ids"]
+                    placeholders = ",".join("?" for _ in ordered_ids)
+                    updated = conn.execute(
+                        "UPDATE threads SET model_provider = ? "
+                        f"WHERE id IN ({placeholders}) AND model_provider = ?",
+                        [plan["target_provider"], *ordered_ids, plan["source_provider"]],
+                    ).rowcount
+                    if updated != total_items:
+                        raise RuntimeError(
+                            f"Expected to update {total_items} session(s), but updated {updated}"
+                        )
+
+                    self._report_copy_progress(
+                        progress_callback,
+                        phase="committing",
+                        current=total_items,
+                        total=total_items,
+                        message="Committing the provider rebind",
+                    )
+                    conn.commit()
+                    manifest_payload = {
+                        "ok": True,
+                        "blocked": False,
+                        **self._public_rebind_plan(plan),
+                        "backup_path": str(backup_path),
+                        "rollout_backup_paths": [str(backup) for _, backup in rollout_backups],
+                        "session_index_path": str(self.session_index_path),
+                        "session_index_entries": 0,
+                    }
+            except Exception as exc:
+                conn.rollback()
+                self._restore_rollout_backups(rollout_backups)
+                manifest_payload = {
+                    "ok": False,
+                    "blocked": False,
+                    "errors": [str(exc)],
+                    "items": [],
+                    "backup_path": str(backup_path),
+                    "rollout_backup_paths": [str(backup) for _, backup in rollout_backups],
+                    "rolled_back": True,
+                }
+
+        if manifest_payload is None:
+            manifest_payload = {
+                "ok": False,
+                "blocked": False,
+                "errors": ["Provider rebind ended without a result"],
+                "items": [],
+                "backup_path": str(backup_path),
+            }
+        manifest_path = self._write_manifest(manifest_payload, request, operation="rebind")
+        manifest_payload["manifest_path"] = str(manifest_path)
+        result_items = manifest_payload.get("items") or []
+        self._report_copy_progress(
+            progress_callback,
+            phase="done" if manifest_payload.get("ok") else "error",
+            current=len(result_items),
+            total=len(result_items) or progress_total,
+            message=(
+                f"Rebound {len(result_items)} session(s)"
+                if manifest_payload.get("ok")
+                else (manifest_payload.get("errors") or ["Provider rebind failed"])[0]
             ),
         )
         return manifest_payload
@@ -3011,6 +3206,129 @@ class CodexSessionTransfer:
             redacted = pattern.sub("[redacted]", redacted)
         return redacted
 
+    def _build_rebind_plan(
+        self,
+        conn: sqlite3.Connection,
+        request: RebindRequest,
+    ) -> dict[str, Any]:
+        errors: list[str] = []
+        warnings: list[str] = []
+        source_provider = request.source_provider.strip()
+        target_provider = request.target_provider.strip()
+        target_provider, target_provider_warning = self._resolve_target_provider(target_provider)
+        ordered_ids = self._dedupe(request.thread_ids)
+
+        if not source_provider:
+            errors.append("source_provider is required")
+        if not target_provider:
+            errors.append("target_provider is required")
+        if not ordered_ids:
+            errors.append("Select at least one thread")
+        if source_provider and target_provider == source_provider:
+            errors.append("Source and target providers are already the same")
+
+        config_path = self.codex_home / "config.toml"
+        configured_provider_ids = {
+            str(value).strip()
+            for value in self.current_config().get("configured_provider_ids", [])
+            if str(value).strip()
+        }
+        if target_provider and config_path.exists() and target_provider not in configured_provider_ids:
+            errors.append(
+                f"Target provider '{target_provider}' is not defined in {config_path}. "
+                f"Add [model_providers.{target_provider}] or choose a configured provider."
+            )
+        if errors:
+            return self._empty_rebind_plan(request, errors, warnings)
+        if target_provider_warning:
+            warnings.append(target_provider_warning)
+
+        rows = self._threads_by_ids(conn, ordered_ids)
+        for thread_id in ordered_ids:
+            row = rows.get(thread_id)
+            if row is None:
+                errors.append(f"Thread not found: {thread_id}")
+                continue
+            if row["model_provider"] != source_provider:
+                errors.append(f"Thread {thread_id} is not in provider {source_provider}")
+            if int(row["archived"]) and not request.include_archived:
+                errors.append(f"Thread {thread_id} is archived but include_archived is false")
+
+        final_ids = [thread_id for thread_id in ordered_ids if thread_id in rows]
+        if request.include_descendants:
+            final_ids = self._append_descendants(conn, final_ids, source_provider, request, errors)
+            rows = self._threads_by_ids(conn, final_ids)
+
+        session_index = self._load_session_index()
+        items: list[dict[str, Any]] = []
+        for thread_id in final_ids:
+            row = rows[thread_id]
+            rollout_path = Path(row["rollout_path"])
+            metadata_provider = self._validate_rebind_rollout(
+                rollout_path,
+                thread_id,
+                errors,
+            )
+            index_entry = session_index.get(thread_id) or {}
+            thread_name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
+            display_title = thread_name or row["title"] or row["preview"] or thread_id
+            parent = self._parent_thread_id(conn, thread_id) or self._source_parent_id(row["source"])
+            items.append(
+                {
+                    "source_id": thread_id,
+                    "target_id": thread_id,
+                    "title": row["title"],
+                    "thread_name": thread_name,
+                    "display_title": display_title,
+                    "session_index_present": bool(thread_name),
+                    "source_provider": source_provider,
+                    "target_provider": target_provider,
+                    "source_cwd": str(row["cwd"]),
+                    "target_cwd": str(row["cwd"]),
+                    "cwd_rewritten": False,
+                    "archived": bool(row["archived"]),
+                    "parent_source_id": parent,
+                    "parent_target_id": parent,
+                    "child_count": self._child_count(conn, thread_id),
+                    "overwritten": False,
+                    "overwrite_match": None,
+                    "rollout_path": str(rollout_path),
+                    "metadata_provider": metadata_provider,
+                }
+            )
+
+        return {
+            "can_execute": not errors and bool(items),
+            "errors": errors,
+            "warnings": warnings,
+            "items": items,
+            "source_provider": source_provider,
+            "target_provider": target_provider,
+            "include_descendants": request.include_descendants,
+            "include_archived": request.include_archived,
+            "_ordered_ids": final_ids,
+            "_rows": rows,
+        }
+
+    def _empty_rebind_plan(
+        self,
+        request: RebindRequest,
+        errors: list[str],
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "can_execute": False,
+            "errors": errors,
+            "warnings": warnings,
+            "items": [],
+            "source_provider": request.source_provider,
+            "target_provider": request.target_provider,
+            "include_descendants": request.include_descendants,
+            "include_archived": request.include_archived,
+            "_ordered_ids": [],
+            "_rows": {},
+        }
+
     def _build_copy_plan(
         self,
         conn: sqlite3.Connection,
@@ -3511,6 +3829,116 @@ class CodexSessionTransfer:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_text("".join(lines), encoding="utf-8")
 
+    def _validate_rebind_rollout(
+        self,
+        rollout_path: Path,
+        thread_id: str,
+        errors: list[str],
+    ) -> str | None:
+        if not rollout_path.exists():
+            errors.append(f"Rollout file missing for thread {thread_id}: {rollout_path}")
+            return None
+        if rollout_path.is_symlink():
+            errors.append(f"Symlink rollout is not supported for thread {thread_id}: {rollout_path}")
+            return None
+        if rollout_path.suffix != ".jsonl" or not ROLLOUT_NAME_RE.match(rollout_path.name):
+            errors.append(f"Unsupported rollout file for thread {thread_id}: {rollout_path}")
+            return None
+        try:
+            with rollout_path.open("rb") as fh:
+                first_line = fh.readline()
+            if not first_line:
+                raise ValueError("rollout is empty")
+            line_text = first_line.decode("utf-8-sig")
+            parsed = json.loads(line_text)
+            if not isinstance(parsed, dict):
+                raise ValueError("first rollout line is not an object")
+            payload = self._session_meta_payload(parsed)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            errors.append(f"Invalid session metadata for thread {thread_id}: {rollout_path} ({exc})")
+            return None
+
+        for key in ("id", "session_id"):
+            value = payload.get(key)
+            if value and str(value) != thread_id:
+                errors.append(
+                    f"Rollout metadata {key} does not match thread {thread_id}: {rollout_path}"
+                )
+                break
+        value = payload.get("model_provider")
+        return str(value) if value is not None else None
+
+    def _backup_rollout_files(
+        self,
+        rollout_paths: list[Path],
+        *,
+        operation: str,
+    ) -> list[tuple[Path, Path]]:
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        backups: list[tuple[Path, Path]] = []
+        try:
+            for rollout_path in rollout_paths:
+                backup_path = self.manifest_dir / (
+                    f"{operation}-rollout-{uuid.uuid4().hex}-{rollout_path.name}"
+                )
+                try:
+                    # A hard link keeps a full rollback copy without duplicating large transcripts
+                    # on the usual same-volume Codex home. Fall back to a regular copy elsewhere.
+                    os.link(rollout_path, backup_path)
+                except OSError:
+                    shutil.copy2(rollout_path, backup_path)
+                backups.append((rollout_path, backup_path))
+        except Exception:
+            for _, backup_path in backups:
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+            raise
+        return backups
+
+    def _write_rollout_provider(self, rollout_path: Path, target_provider: str) -> None:
+        temp_path: Path | None = None
+        try:
+            with rollout_path.open("rb") as source:
+                first_line = source.readline()
+                if not first_line:
+                    raise ValueError(f"Rollout is empty: {rollout_path}")
+                line_text = first_line.decode("utf-8-sig")
+                parsed = json.loads(line_text)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"First rollout line is not an object: {rollout_path}")
+                payload = self._session_meta_payload(parsed)
+                payload["model_provider"] = target_provider
+                if first_line.endswith(b"\r\n"):
+                    line_ending = b"\r\n"
+                elif first_line.endswith(b"\n"):
+                    line_ending = b"\n"
+                else:
+                    line_ending = b""
+                replacement = compact_json(parsed).encode("utf-8") + line_ending
+
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{rollout_path.name}.",
+                    suffix=".tmp",
+                    dir=rollout_path.parent,
+                    delete=False,
+                ) as temp:
+                    temp_path = Path(temp.name)
+                    temp.write(replacement)
+                    shutil.copyfileobj(source, temp)
+                    temp.flush()
+                    os.fsync(temp.fileno())
+            os.replace(temp_path, rollout_path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
     def _session_meta_payload(self, rollout_line: dict[str, Any]) -> dict[str, Any]:
         item = rollout_line.get("item")
         if isinstance(item, dict) and item.get("type") == "session_meta":
@@ -3779,12 +4207,12 @@ class CodexSessionTransfer:
             return datetime.fromtimestamp(int(updated_at), UTC).isoformat().replace("+00:00", "Z")
         return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-    def _backup_database(self) -> Path:
+    def _backup_database(self, *, operation: str = "copy") -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = self.manifest_dir / f"state_5.before-copy-{timestamp}.sqlite"
+        backup_path = self.manifest_dir / f"state_5.before-{operation}-{timestamp}.sqlite"
         counter = 1
         while backup_path.exists():
-            backup_path = self.manifest_dir / f"state_5.before-copy-{timestamp}-{counter}.sqlite"
+            backup_path = self.manifest_dir / f"state_5.before-{operation}-{timestamp}-{counter}.sqlite"
             counter += 1
         source = sqlite3.connect(self.db_path)
         try:
@@ -3797,23 +4225,30 @@ class CodexSessionTransfer:
             source.close()
         return backup_path
 
-    def _write_manifest(self, payload: dict[str, Any], request: CopyRequest) -> Path:
+    def _write_manifest(
+        self,
+        payload: dict[str, Any],
+        request: CopyRequest | RebindRequest,
+        *,
+        operation: str = "copy",
+    ) -> Path:
         self.manifest_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        manifest_path = self.manifest_dir / f"copy-{timestamp}.json"
+        manifest_path = self.manifest_dir / f"{operation}-{timestamp}.json"
         counter = 1
         while manifest_path.exists():
-            manifest_path = self.manifest_dir / f"copy-{timestamp}-{counter}.json"
+            manifest_path = self.manifest_dir / f"{operation}-{timestamp}-{counter}.json"
             counter += 1
         manifest = {
             "created_at": datetime.now(UTC).isoformat(),
+            "operation": operation,
             "source_provider": request.source_provider,
             "target_provider": request.target_provider,
             "source_sqlite_home": str(self.sqlite_home),
             "state_db_path": str(self.db_path),
             "include_descendants": request.include_descendants,
             "include_archived": request.include_archived,
-            "overwrite": request.overwrite,
+            "overwrite": bool(getattr(request, "overwrite", False)),
             **self._manifest_safe_payload(payload),
         }
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3838,6 +4273,18 @@ class CodexSessionTransfer:
         payload["preview_limit"] = request.preview_limit
         payload["has_more"] = end < len(all_items)
         payload["next_preview_offset"] = end if end < len(all_items) else None
+        return payload
+
+    def _public_rebind_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        payload = {key: value for key, value in plan.items() if not key.startswith("_")}
+        items = payload.get("items") or []
+        payload["items"] = [
+            self._public_plan_item(item)
+            for item in items
+            if isinstance(item, dict)
+        ]
+        payload["item_total"] = len(items)
+        payload["rebound_count"] = len(items)
         return payload
 
     def _public_plan_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -3865,6 +4312,18 @@ class CodexSessionTransfer:
             for item in items
             if isinstance(item, dict) and item.get("overwritten")
         )
+        return payload
+
+    def public_rebind_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        payload = {key: value for key, value in result.items() if not key.startswith("_")}
+        items = result.get("items") or []
+        payload["items"] = [
+            self._public_plan_item(item)
+            for item in items
+            if isinstance(item, dict)
+        ]
+        payload["item_total"] = int(result.get("item_total") or len(items))
+        payload["rebound_count"] = int(result.get("rebound_count") or len(items))
         return payload
 
     def _manifest_safe_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4127,6 +4586,21 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                     self._send_json(transfer.import_skills(request))
                     return
 
+                if self.path == "/api/rebind-progress":
+                    request = RebindRequest.from_json(self._read_json())
+                    self._stream_rebind(request)
+                    return
+                if self.path == "/api/preview-rebind":
+                    request = RebindRequest.from_json(self._read_json())
+                    self._send_json(transfer.preview_rebind(request))
+                    return
+                if self.path == "/api/rebind":
+                    request = RebindRequest.from_json(self._read_json())
+                    self._send_json(
+                        transfer.public_rebind_result(transfer.rebind_threads(request))
+                    )
+                    return
+
                 if self.path in {"/api/copy-progress", "/api/copy-package-progress"}:
                     request = CopyRequest.from_json(self._read_json())
                     self._stream_copy(
@@ -4194,6 +4668,42 @@ def make_handler(transfer: CodexSessionTransfer, static_dir: Path) -> type[Simpl
                 )
                 result = {"ok": False, "blocked": False, "errors": [str(exc)], "items": []}
             send_event({"type": "complete", "result": transfer.public_copy_result(result)})
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                pass
+
+        def _stream_rebind(self, request: RebindRequest) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            def send_event(payload: dict[str, Any]) -> None:
+                body = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+                chunk = f"{len(body):X}\r\n".encode("ascii") + body + b"\r\n"
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except OSError:
+                    pass
+
+            try:
+                result = transfer.rebind_threads(request, progress_callback=send_event)
+            except Exception as exc:
+                send_event(
+                    {
+                        "type": "progress",
+                        "phase": "error",
+                        "current": 0,
+                        "total": max(len(request.thread_ids), 1),
+                        "message": str(exc),
+                    }
+                )
+                result = {"ok": False, "blocked": False, "errors": [str(exc)], "items": []}
+            send_event({"type": "complete", "result": transfer.public_rebind_result(result)})
             try:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()

@@ -18,6 +18,7 @@ from server import (
     ExportPackageRequest,
     MAX_PREVIEW_PAGE_SIZE,
     PREVIEW_TITLE_LIMIT,
+    RebindRequest,
     SkillImportRequest,
     SkillPackageRequest,
     WorkspaceMapping,
@@ -757,6 +758,104 @@ class SessionTransferTests(unittest.TestCase):
         payload = json.loads(first_line)["item"]["payload"]
         self.assertEqual(payload["id"], item["target_id"])
         self.assertEqual(payload["model_provider"], "ProviderB")
+
+    def test_rebind_preserves_session_id_rollout_tail_and_session_index(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        rollout_path = self.add_thread(thread_id, provider="ProviderA", title="Rebind me")
+        self.write_session_index(thread_id, "Renamed rebind session")
+        original_rollout = rollout_path.read_bytes()
+        original_index = (self.codex_home / "session_index.jsonl").read_text(encoding="utf-8")
+
+        request = RebindRequest("ProviderA", "ProviderB", [thread_id], False, True)
+        preview = self.transfer.preview_rebind(request)
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["items"][0]["source_id"], thread_id)
+        self.assertEqual(preview["items"][0]["target_id"], thread_id)
+
+        progress: list[dict[str, object]] = []
+        result = self.transfer.rebind_threads(request, progress.append)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["rebound_count"], 1)
+        self.assertEqual(result["session_index_entries"], 0)
+        self.assertTrue(Path(result["backup_path"]).exists())
+        self.assertTrue(Path(result["rollout_backup_paths"][0]).exists())
+        self.assertIn("rebinding", [event.get("phase") for event in progress])
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT id, model_provider, rollout_path FROM threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()
+        self.assertEqual(row[0], thread_id)
+        self.assertEqual(row[1], "ProviderB")
+        self.assertEqual(row[2], str(rollout_path))
+
+        updated_lines = rollout_path.read_bytes().splitlines(keepends=True)
+        original_lines = original_rollout.splitlines(keepends=True)
+        self.assertEqual(updated_lines[1:], original_lines[1:])
+        self.assertEqual(
+            json.loads(updated_lines[0].decode("utf-8"))["item"]["payload"]["model_provider"],
+            "ProviderB",
+        )
+        self.assertEqual(
+            (self.codex_home / "session_index.jsonl").read_text(encoding="utf-8"),
+            original_index,
+        )
+
+    def test_rebind_rolls_back_database_and_rollouts_after_partial_failure(self) -> None:
+        first_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        second_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        first_rollout = self.add_thread(first_id, provider="ProviderA", title="First")
+        second_rollout = self.add_thread(second_id, provider="ProviderA", title="Second")
+        original_first = first_rollout.read_bytes()
+        original_second = second_rollout.read_bytes()
+        original_writer = self.transfer._write_rollout_provider
+        calls = 0
+
+        def write_first_then_fail(path: Path, target_provider: str) -> None:
+            nonlocal calls
+            if calls == 0:
+                calls += 1
+                original_writer(path, target_provider)
+                return
+            raise OSError("simulated rollout write failure")
+
+        with patch.object(self.transfer, "_write_rollout_provider", side_effect=write_first_then_fail):
+            result = self.transfer.rebind_threads(
+                RebindRequest("ProviderA", "ProviderB", [first_id, second_id], False, True)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rolled_back"])
+        self.assertIn("simulated rollout write failure", result["errors"][0])
+        self.assertEqual(first_rollout.read_bytes(), original_first)
+        self.assertEqual(second_rollout.read_bytes(), original_second)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            providers = conn.execute(
+                "SELECT id, model_provider FROM threads ORDER BY id"
+            ).fetchall()
+        self.assertEqual(providers, [(first_id, "ProviderA"), (second_id, "ProviderA")])
+
+    def test_rebind_is_blocked_while_codex_is_running(self) -> None:
+        thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.add_thread(thread_id, provider="ProviderA")
+        self.transfer.process_checker = lambda: [{"name": "codex.exe", "pid": 1234}]
+
+        result = self.transfer.rebind_threads(
+            RebindRequest("ProviderA", "ProviderB", [thread_id], False, True)
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["blocked"])
+        self.assertIn("provider switcher", result["errors"][0])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT model_provider FROM threads WHERE id = ?", (thread_id,)
+                ).fetchone()[0],
+                "ProviderA",
+            )
 
     def test_copy_accepts_current_rollout_names_with_composite_session_ids(self) -> None:
         thread_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

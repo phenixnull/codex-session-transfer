@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml"><img alt="Release Build" src="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml/badge.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.4-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.5-blue">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-39-47848f">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12%2B-3776ab">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-24292f">
@@ -24,6 +24,7 @@ Codex Session Transfer gives you a focused UI for inspecting local Codex provide
 - **Responsive compact layout** - scroll the main workbench on short desktop displays and use bounded session lists on narrow screens.
 - **Skills migration** - export, load, preview, and import Codex skills with overwrite control.
 - **Optional copy plans** - copy sessions directly with live progress, or inspect a plan first without rendering thousands of rows at once.
+- **In-place provider rebind** - move selected local sessions to the current provider without changing session IDs, titles, transcript files, or session index entries; database and rollout backups are kept for rollback.
 - **Paged previews** - the preview pane requests 48 plan items at a time and loads the next page only when you scroll.
 - **Local safety checks** - show database integrity, WAL files, blocking Codex processes, and session index status before write operations.
 - **Desktop packaging** - build Windows and macOS desktop artifacts with Electron Builder and the included release workflow.

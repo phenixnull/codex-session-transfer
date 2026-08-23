@@ -463,6 +463,15 @@
                   </svg>
                   <span>Preview plan</span>
                 </button>
+                <button id="rebindButton" type="button" disabled>
+                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h13"></path>
+                    <path d="m14 4 3 3-3 3"></path>
+                    <path d="M20 17H7"></path>
+                    <path d="m10 14-3 3 3 3"></path>
+                  </svg>
+                  <span>Rebind provider</span>
+                </button>
                 <button id="copyButton" type="button" disabled>
                   <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M8 8h10v10H8z"></path>
@@ -485,6 +494,7 @@
                 </div>
               </div>
               <p id="copyDisabledReason" class="copy-hint"></p>
+              <p id="rebindDisabledReason" class="copy-hint"></p>
               <p id="copyResult" class="result"></p>
             </aside>
           </div>
