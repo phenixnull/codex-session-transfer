@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -2975,7 +2976,11 @@ class CodexSessionTransfer:
             )
         return clean, None
 
-    def _normalize_windows_path(self, path: str) -> str:
+    @staticmethod
+    def _normalize_windows_path(path: str) -> str:
+        extended_unc_prefix = "\\\\?\\UNC\\"
+        if path.casefold().startswith(extended_unc_prefix.casefold()):
+            return "\\\\" + path[len(extended_unc_prefix) :]
         return path[4:] if path.startswith("\\\\?\\") else path
 
     def _date_start_ms(self, value: str) -> int | None:
@@ -5001,7 +5006,7 @@ class CodexSessionTransfer:
 
     def _mirror_target_rollout_paths(self, plan: dict[str, Any]) -> list[Path]:
         paths: list[Path] = []
-        seen: set[Path] = set()
+        seen: set[tuple[str, str]] = set()
         safe_roots = [
             (self.codex_home / "sessions").resolve(),
             (self.codex_home / "archived_sessions").resolve(),
@@ -5018,13 +5023,33 @@ class CodexSessionTransfer:
             plain_name = resolved.name[:-4] if resolved.name.endswith(".zst") else resolved.name
             if not ROLLOUT_NAME_RE.match(plain_name):
                 raise ValueError(f"Unsupported target rollout file name: {path}")
-            if resolved not in seen:
-                seen.add(resolved)
+            path_key = self._source_path_match_key(str(resolved))
+            if path_key not in seen:
+                seen.add(path_key)
                 paths.append(resolved)
         return paths
 
     @staticmethod
     def _path_is_within(path: Path, root: Path) -> bool:
+        path_text = str(path)
+        root_text = str(root)
+        normalized_path = CodexSessionTransfer._normalize_windows_path(path_text)
+        normalized_root = CodexSessionTransfer._normalize_windows_path(root_text)
+
+        def is_windows_path(value: str) -> bool:
+            return bool(re.match(r"^[A-Za-z]:[\\/]", value)) or value.startswith("\\\\")
+
+        path_is_windows = is_windows_path(normalized_path)
+        root_is_windows = is_windows_path(normalized_root)
+        if path_is_windows or root_is_windows:
+            if not (path_is_windows and root_is_windows):
+                return False
+            comparable_path = ntpath.normcase(ntpath.normpath(normalized_path))
+            comparable_root = ntpath.normcase(ntpath.normpath(normalized_root))
+            try:
+                return ntpath.commonpath((comparable_path, comparable_root)) == comparable_root
+            except ValueError:
+                return False
         try:
             path.relative_to(root)
             return True
@@ -5099,7 +5124,10 @@ class CodexSessionTransfer:
 
         def backup_one(index: int, original_path: Path) -> RolloutBackup:
             try:
-                relative = original_path.resolve().relative_to(codex_root)
+                relative_source = Path(
+                    self._normalize_windows_path(str(original_path))
+                ).resolve()
+                relative = relative_source.relative_to(codex_root)
             except ValueError:
                 relative = Path("external") / f"{index:06d}-{original_path.name}"
             backup_path = backup_root / relative

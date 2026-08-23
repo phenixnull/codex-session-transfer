@@ -936,6 +936,104 @@ class SessionTransferTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(provider_count, 2)
 
+    def test_path_is_within_accepts_windows_extended_path_prefix(self) -> None:
+        sessions_root = Path(r"C:\Users\hd\.codex\sessions")
+        rollout = Path(
+            r"\\?\C:\Users\hd\.codex\sessions\2026\06\04\rollout-"
+            r"2026-06-04T21-35-39-c431cb07-1fcf-4919-9414-0b35ef850f11.jsonl"
+        )
+        lookalike = Path(
+            r"\\?\C:\Users\hd\.codex\sessions-evil\rollout-"
+            r"2026-06-04T21-35-39-c431cb07-1fcf-4919-9414-0b35ef850f11.jsonl"
+        )
+        other_drive = Path(
+            r"\\?\D:\Users\hd\.codex\sessions\rollout-"
+            r"2026-06-04T21-35-39-c431cb07-1fcf-4919-9414-0b35ef850f11.jsonl"
+        )
+        unc_root = Path(r"\\server\share\.codex\sessions")
+        extended_unc_rollout = Path(
+            r"\\?\UNC\server\share\.codex\sessions\rollout-"
+            r"2026-06-04T21-35-39-c431cb07-1fcf-4919-9414-0b35ef850f11.jsonl"
+        )
+
+        self.assertTrue(self.transfer._path_is_within(rollout, sessions_root))
+        self.assertFalse(self.transfer._path_is_within(lookalike, sessions_root))
+        self.assertFalse(self.transfer._path_is_within(other_drive, sessions_root))
+        self.assertTrue(self.transfer._path_is_within(extended_unc_rollout, unc_root))
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended paths are Windows-only")
+    def test_mirror_accepts_existing_target_rollout_with_extended_path(self) -> None:
+        target_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        target_path = self.add_thread(
+            target_id,
+            provider="ProviderB",
+            title="Extended target rollout",
+        ).resolve()
+        extended_target_path = Path(f"\\\\?\\{target_path}")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                (str(extended_target_path), target_id),
+            )
+            conn.commit()
+
+        paths = self.transfer._mirror_target_rollout_paths(
+            {
+                "_target_rows": {
+                    target_id: {"rollout_path": str(extended_target_path)},
+                }
+            }
+        )
+
+        self.assertEqual(paths, [extended_target_path.resolve()])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended paths are Windows-only")
+    def test_full_mirror_supports_extended_source_and_target_rollout_paths(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        target_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        source_path = self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Extended source rollout",
+        ).resolve()
+        target_path = self.add_thread(
+            target_id,
+            provider="ProviderB",
+            title="Extended target rollout",
+        ).resolve()
+        extended_source_path = Path(f"\\\\?\\{source_path}")
+        extended_target_path = Path(f"\\\\?\\{target_path}")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.executemany(
+                "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                (
+                    (str(extended_source_path), source_id),
+                    (str(extended_target_path), target_id),
+                ),
+            )
+            conn.commit()
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                False,
+                mirror_target=True,
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(extended_target_path.exists())
+        self.assertTrue(extended_source_path.exists())
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+        self.assertEqual(row, ("ProviderB", str(extended_source_path)))
+
     def test_full_mirror_replaces_every_target_session_without_matching(self) -> None:
         source_active = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         source_archived = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
