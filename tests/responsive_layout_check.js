@@ -40,11 +40,17 @@ const localThreads = Array.from({ length: 3 }, (_, index) => ({
   child_count: 0,
 }));
 
-const provider = {
+const packageProvider = {
   model_provider: 'source-provider',
   active: packageThreads.length,
   archived: 0,
   total: packageThreads.length,
+};
+const localProvider = {
+  model_provider: 'source-provider',
+  active: localThreads.length,
+  archived: 0,
+  total: localThreads.length,
 };
 const alternateProvider = {
   model_provider: 'alternate-source',
@@ -72,17 +78,17 @@ const status = {
     by_provider: {},
     by_project: [],
   },
-  providers: [provider, alternateProvider],
+  providers: [localProvider, alternateProvider],
   target_providers: [
-    { value: 'target-provider', label: 'Target', current: true, session_total: 0 },
+    { value: 'target-provider', label: 'Target', current: true, session_total: 2 },
   ],
   package_source: {
     loaded: true,
     package_path: 'C:\\packages\\layout-test.zip',
-    providers: [provider],
+    providers: [packageProvider],
     session_stats: {
       totals: { total: packageThreads.length, active: packageThreads.length, archived: 0 },
-      by_provider: { 'source-provider': provider },
+      by_provider: { 'source-provider': packageProvider },
       by_project: projects.map((project) => ({ ...project, total: 1, active: 1, archived: 0 })),
     },
     manifest: { projects, thread_count: packageThreads.length },
@@ -148,8 +154,11 @@ function startFixtureServer() {
               ok: true,
               blocked: false,
               overwrite: false,
+              mirror_target: true,
+              replaced_target_count: 2,
               item_total: localThreads.length,
               session_index_entries: localThreads.length,
+              backup_directory: 'C:\\Codex\\session-transfer\\backups\\provider-mirror-test',
               manifest_path: 'C:\\Codex\\session-transfer\\manifest.json',
               items: localThreads.map((thread, index) => ({
                 source_id: thread.id,
@@ -313,6 +322,7 @@ async function setContentSize(electronApp, page, width, height) {
     assert.equal(importedUi.previewItems, 0);
     assert.equal(packageCopyRequests.length, 1);
     assert.equal(packageCopyRequests[0].thread_ids.length, 10);
+    assert.equal(packageCopyRequests[0].mirror_target, false);
     const compact = await page.evaluate(() => {
       const main = document.querySelector('.main-surface');
       const grid = document.querySelector('#sessionTransferGrid');
@@ -364,23 +374,40 @@ async function setContentSize(electronApp, page, width, height) {
       () => document.querySelectorAll('#sourceThreadsBody tr').length === 3,
     );
     await page.waitForFunction(() => !document.querySelector('#selectAll').checked);
-    await page.check('#selectAll');
-    await page.waitForFunction(() => document.querySelector('#selectedCount').textContent === '3 selected');
+    await page.waitForFunction(() => !document.querySelector('#copyButton').disabled);
     const copyReady = await page.evaluate(() => ({
       disabled: document.querySelector('#copyButton').disabled,
       hint: document.querySelector('#copyDisabledReason').textContent,
+      selectedCount: document.querySelector('#selectedCount').textContent,
       previewItems: document.querySelectorAll('#previewItems .preview-session-item').length,
+      footerFits: document.querySelector('.preview-footer').scrollWidth
+        <= document.querySelector('.preview-footer').clientWidth,
+      actionsFit: document.querySelector('.copy-actions').scrollWidth
+        <= document.querySelector('.copy-actions').clientWidth,
+      splitDelta: Math.abs(
+        document.querySelector('.preview-content').getBoundingClientRect().height
+          - document.querySelector('.preview-footer').getBoundingClientRect().height,
+      ),
     }));
     assert.equal(copyReady.disabled, false);
+    assert.equal(copyReady.selectedCount, '0 selected');
     assert.doesNotMatch(copyReady.hint, /Run Preview/i);
+    assert.match(copyReady.hint, /mirror all 3 source session/i);
     assert.equal(copyReady.previewItems, 0);
-    page.once('dialog', (dialog) => dialog.accept());
+    assert.equal(copyReady.footerFits, true);
+    assert.equal(copyReady.actionsFit, true);
+    assert.ok(copyReady.splitDelta <= 2, `preview split differs by ${copyReady.splitDelta}px`);
+    let mirrorConfirmation = '';
+    page.once('dialog', (dialog) => {
+      mirrorConfirmation = dialog.message();
+      dialog.accept();
+    });
     await page.click('#copyButton');
     await page.waitForFunction(
       () => document.querySelector('#copyProgressPhase').textContent === 'Complete'
         && document.querySelector('#copyProgressPercent').textContent === '100%',
     );
-    await page.waitForFunction(() => document.querySelector('#copyResult').textContent.includes('Copied 3 session(s)'));
+    await page.waitForFunction(() => document.querySelector('#copyResult').textContent.includes('Mirrored 3 session(s)'));
     const copiedUi = await page.evaluate(() => ({
       progressPhase: document.querySelector('#copyProgressPhase').textContent,
       progressPercent: document.querySelector('#copyProgressPercent').textContent,
@@ -390,8 +417,15 @@ async function setContentSize(electronApp, page, width, height) {
     assert.equal(copiedUi.progressPhase, 'Complete');
     assert.equal(copiedUi.progressPercent, '100%');
     assert.equal(copiedUi.previewItems, 0);
+    assert.match(copiedUi.result, /Replaced 2 previous target session/);
+    assert.match(copiedUi.result, /provider-mirror-test/);
+    assert.match(mirrorConfirmation, /Mirror all 3 session\(s\) from source-provider to target-provider/);
+    assert.match(mirrorConfirmation, /All 2 existing target-provider session\(s\)/);
     assert.equal(copyRequests.length, 1);
-    assert.equal(copyRequests[0].thread_ids.length, 3);
+    assert.equal(copyRequests[0].mirror_target, true);
+    assert.equal(copyRequests[0].thread_ids.length, 0);
+    assert.equal(copyRequests[0].include_archived, true);
+    assert.equal(copyRequests[0].include_descendants, true);
     assert.equal(previewRequests.length, 1);
     await page.selectOption('#sourceProvider', 'alternate-source');
     const clearedSelection = await page.evaluate(() => ({

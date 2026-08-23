@@ -211,11 +211,11 @@
                     <input id="searchInput" placeholder="Title, preview, message, id">
                   </label>
                   <div class="toggle-row">
-                    <label class="check">
+                    <label id="includeArchivedLabel" class="check">
                       <input id="includeArchived" type="checkbox">
                       <span>Archived</span>
                     </label>
-                    <label class="check">
+                    <label id="includeDescendantsLabel" class="check">
                       <input id="includeDescendants" type="checkbox">
                       <span>Copy tree</span>
                     </label>
@@ -235,7 +235,7 @@
                   <div id="liveTargetPanel" class="live-target-panel"></div>
                   <label id="overwriteSessionsLabel" class="check session-overwrite-control">
                     <input id="overwriteSessions" type="checkbox">
-                    <span>Overwrite matching sessions</span>
+                    <span>Back up and replace entire target</span>
                   </label>
                 </section>
               </div>
@@ -453,65 +453,69 @@
                   <h2>Preview</h2>
                 </div>
               </div>
-              <div id="previewMessages" class="messages"></div>
-              <section id="overwriteResolution" class="overwrite-resolution" aria-label="Overwrite target choices" hidden>
-                <div class="overwrite-resolution-head">
-                  <div>
-                    <strong>Ambiguous overwrite matches</strong>
-                    <span id="overwriteResolutionCount" class="count-chip">0 pending</span>
+              <div class="preview-content">
+                <div id="previewMessages" class="messages"></div>
+                <section id="overwriteResolution" class="overwrite-resolution" aria-label="Overwrite target choices" hidden>
+                  <div class="overwrite-resolution-head">
+                    <div>
+                      <strong>Ambiguous overwrite matches</strong>
+                      <span id="overwriteResolutionCount" class="count-chip">0 pending</span>
+                    </div>
+                    <button id="applyOverwriteChoicesButton" type="button" disabled>
+                      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M20 6 9 17l-5-5"></path>
+                      </svg>
+                      <span>Recheck choices</span>
+                    </button>
                   </div>
-                  <button id="applyOverwriteChoicesButton" type="button" disabled>
+                  <p id="overwriteResolutionHint" class="copy-hint">Choose a destination session for each ambiguous match, or explicitly skip overwrite.</p>
+                  <div id="overwriteResolutionItems" class="overwrite-resolution-items"></div>
+                </section>
+                <div id="previewItems" class="preview-items"></div>
+              </div>
+              <div class="preview-footer">
+                <div class="copy-actions">
+                  <button id="previewButton" type="button">
                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M20 6 9 17l-5-5"></path>
+                      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
+                      <path d="M12 9.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"></path>
                     </svg>
-                    <span>Recheck choices</span>
+                    <span>Preview plan</span>
+                  </button>
+                  <button id="rebindButton" type="button" disabled>
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M4 7h13"></path>
+                      <path d="m14 4 3 3-3 3"></path>
+                      <path d="M20 17H7"></path>
+                      <path d="m10 14-3 3 3 3"></path>
+                    </svg>
+                    <span>Rebind provider</span>
+                  </button>
+                  <button id="copyButton" type="button" disabled>
+                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M8 8h10v10H8z"></path>
+                      <path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path>
+                    </svg>
+                    <span>Copy</span>
                   </button>
                 </div>
-                <p id="overwriteResolutionHint" class="copy-hint">Choose a destination session for each ambiguous match, or explicitly skip overwrite.</p>
-                <div id="overwriteResolutionItems" class="overwrite-resolution-items"></div>
-              </section>
-              <div id="previewItems" class="preview-items"></div>
-              <div class="copy-actions">
-                <button id="previewButton" type="button">
-                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
-                    <path d="M12 9.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"></path>
-                  </svg>
-                  <span>Preview plan</span>
-                </button>
-                <button id="rebindButton" type="button" disabled>
-                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M4 7h13"></path>
-                    <path d="m14 4 3 3-3 3"></path>
-                    <path d="M20 17H7"></path>
-                    <path d="m10 14-3 3 3 3"></path>
-                  </svg>
-                  <span>Rebind provider</span>
-                </button>
-                <button id="copyButton" type="button" disabled>
-                  <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M8 8h10v10H8z"></path>
-                    <path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path>
-                  </svg>
-                  <span>Copy</span>
-                </button>
+                <div id="copyProgress" class="copy-progress" aria-live="polite" hidden>
+                  <div class="copy-progress-head">
+                    <strong id="copyProgressPhase">Preparing</strong>
+                    <span id="copyProgressCount">0 / 0</span>
+                  </div>
+                  <div id="copyProgressTrack" class="copy-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <span id="copyProgressBar" class="copy-progress-bar"></span>
+                  </div>
+                  <div class="copy-progress-foot">
+                    <span id="copyProgressPercent">0%</span>
+                    <span id="copyProgressItem">Preparing session transfer</span>
+                  </div>
+                </div>
+                <p id="copyDisabledReason" class="copy-hint"></p>
+                <p id="rebindDisabledReason" class="copy-hint"></p>
+                <p id="copyResult" class="result"></p>
               </div>
-              <div id="copyProgress" class="copy-progress" aria-live="polite" hidden>
-                <div class="copy-progress-head">
-                  <strong id="copyProgressPhase">Preparing</strong>
-                  <span id="copyProgressCount">0 / 0</span>
-                </div>
-                <div id="copyProgressTrack" class="copy-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-                  <span id="copyProgressBar" class="copy-progress-bar"></span>
-                </div>
-                <div class="copy-progress-foot">
-                  <span id="copyProgressPercent">0%</span>
-                  <span id="copyProgressItem">Preparing session transfer</span>
-                </div>
-              </div>
-              <p id="copyDisabledReason" class="copy-hint"></p>
-              <p id="rebindDisabledReason" class="copy-hint"></p>
-              <p id="copyResult" class="result"></p>
             </aside>
           </div>
         </aside>

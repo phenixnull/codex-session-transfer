@@ -934,6 +934,544 @@ class SessionTransferTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(provider_count, 2)
 
+    def test_full_mirror_replaces_every_target_session_without_matching(self) -> None:
+        source_active = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_archived = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        old_target = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        target_only = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        unrelated = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        source_paths = {
+            source_active: self.add_thread(
+                source_active,
+                provider="ProviderA",
+                title="Latest active",
+            ),
+            source_archived: self.add_thread(
+                source_archived,
+                provider="ProviderA",
+                title="Latest archived",
+                archived=True,
+            ),
+        }
+        target_paths = {
+            old_target: self.add_thread(
+                old_target,
+                provider="ProviderB",
+                title="Stale matching-looking session",
+            ),
+            target_only: self.add_thread(
+                target_only,
+                provider="ProviderB",
+                title="Target only",
+            ),
+        }
+        self.add_thread(unrelated, provider="ProviderC", title="Leave untouched")
+        self.write_session_index(source_active, "Newest active name")
+        self.write_session_index(source_archived, "Newest archived name")
+        self.write_session_index(old_target, "Old target name")
+        source_bytes = {thread_id: path.read_bytes() for thread_id, path in source_paths.items()}
+
+        preview = self.transfer.preview_copy(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                False,
+                mirror_target=True,
+                preview_limit=1,
+            )
+        )
+
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertTrue(preview["mirror_target"])
+        self.assertEqual(preview["item_total"], 2)
+        self.assertEqual(preview["replaced_target_count"], 2)
+        self.assertEqual(len(preview["items"]), 1)
+        self.assertTrue(preview["has_more"])
+        self.assertEqual(preview["overwrite_ambiguity_count"], 0)
+
+        events: list[dict[str, object]] = []
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                False,
+                mirror_target=True,
+            ),
+            progress_callback=events.append,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["mirror_target"])
+        self.assertEqual(result["replaced_target_count"], 2)
+        self.assertEqual(result["deleted_target_rollout_count"], 2)
+        self.assertEqual(result["rollout_backup_count"], 4)
+        self.assertEqual(result["source_rollout_backup_count"], 2)
+        self.assertEqual(result["target_rollout_backup_count"], 2)
+        self.assertEqual(result["rebound_source_count"], 2)
+        self.assertTrue(Path(result["backup_directory"]).is_dir())
+        self.assertTrue((Path(result["backup_directory"]) / "backup-manifest.json").is_file())
+        for path in target_paths.values():
+            self.assertFalse(path.exists())
+        for thread_id, path in source_paths.items():
+            self.assertNotEqual(path.read_bytes(), source_bytes[thread_id])
+            self.assertIn(b'"model_provider":"ProviderB"', path.read_bytes())
+
+        backup_manifest = json.loads(
+            (Path(result["backup_directory"]) / "backup-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(set(backup_manifest["source_session_ids"]), set(source_paths))
+        backed_up_by_original = {
+            item["original_path"]: Path(item["backup_path"])
+            for item in backup_manifest["rollout_backups"]
+        }
+        for thread_id, path in source_paths.items():
+            self.assertEqual(backed_up_by_original[str(path)].read_bytes(), source_bytes[thread_id])
+
+        target_ids = {item["target_id"] for item in result["items"]}
+        self.assertEqual(target_ids, {source_active, source_archived})
+        self.assertTrue(
+            all(item["source_id"] == item["target_id"] for item in result["items"])
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            source_rows = conn.execute(
+                "SELECT id, title, archived FROM threads WHERE model_provider = 'ProviderA' ORDER BY title"
+            ).fetchall()
+            target_rows = conn.execute(
+                "SELECT id, title, archived FROM threads WHERE model_provider = 'ProviderB' ORDER BY title"
+            ).fetchall()
+            unrelated_count = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE id = ? AND model_provider = 'ProviderC'",
+                (unrelated,),
+            ).fetchone()[0]
+        self.assertEqual(source_rows, [])
+        self.assertEqual(
+            [(row[1], row[2]) for row in target_rows],
+            [("Latest active", 0), ("Latest archived", 1)],
+        )
+        self.assertEqual(unrelated_count, 1)
+
+        index_entries = self.transfer._load_session_index()
+        self.assertFalse({old_target, target_only}.intersection(index_entries))
+        self.assertTrue(target_ids.issubset(index_entries))
+        self.assertEqual(
+            {index_entries[thread_id]["thread_name"] for thread_id in target_ids},
+            {"Newest active name", "Newest archived name"},
+        )
+        phases = [event.get("phase") for event in events]
+        for phase in (
+            "backing_up",
+            "clearing",
+            "copying",
+            "indexing",
+            "verifying",
+            "committing",
+            "cleaning",
+            "done",
+        ):
+            self.assertIn(phase, phases)
+
+    def test_full_mirror_rewrites_every_persisted_provider_setting_and_identity(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        source_path = self.add_thread(
+            source_id,
+            provider="ProviderA",
+            title="Routing history",
+        )
+        records = [json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()]
+        records.extend(
+            [
+                {
+                    "item": {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "thread_settings_applied",
+                            "thread_settings": {
+                                "model": "gpt-test",
+                                "model_provider_id": "ProviderA",
+                                "cwd": str(self.codex_home / "work"),
+                            },
+                        },
+                    }
+                },
+                {
+                    "item": {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "session_configured",
+                            "session_id": source_id,
+                            "thread_id": source_id,
+                            "model_provider_id": "ProviderA",
+                            "rollout_path": str(source_path),
+                        },
+                    }
+                },
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "meta": {
+                            "id": source_id,
+                            "session_id": source_id,
+                            "model_provider": "ProviderA",
+                            "cwd": str(self.codex_home / "work"),
+                        },
+                        "git": None,
+                    },
+                },
+            ]
+        )
+        source_path.write_text(
+            "".join(compact_json(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                True,
+                mirror_target=True,
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        target_id = result["items"][0]["target_id"]
+        self.assertEqual(target_id, source_id)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            target_path = Path(
+                conn.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ?", (target_id,)
+                ).fetchone()[0]
+            )
+        copied = [json.loads(line) for line in target_path.read_text(encoding="utf-8").splitlines()]
+        session_meta_count = 0
+        settings_count = 0
+        configured_count = 0
+        for record in copied:
+            item = record.get("item") if isinstance(record.get("item"), dict) else record
+            item_type = item.get("type")
+            payload = item.get("payload")
+            if item_type == "session_meta":
+                session_meta_count += 1
+                metadata = payload.get("meta") if isinstance(payload.get("meta"), dict) else payload
+                self.assertEqual(metadata["id"], target_id)
+                if "session_id" in metadata:
+                    self.assertEqual(metadata["session_id"], target_id)
+                self.assertEqual(metadata["model_provider"], "ProviderB")
+            elif item_type == "event_msg" and payload.get("type") == "thread_settings_applied":
+                settings_count += 1
+                self.assertEqual(
+                    payload["thread_settings"]["model_provider_id"], "ProviderB"
+                )
+            elif item_type == "event_msg" and payload.get("type") == "session_configured":
+                configured_count += 1
+                self.assertEqual(payload["session_id"], target_id)
+                self.assertEqual(payload["thread_id"], target_id)
+                self.assertEqual(payload["model_provider_id"], "ProviderB")
+                self.assertEqual(payload["rollout_path"], str(target_path))
+        self.assertEqual(session_meta_count, 2)
+        self.assertEqual(settings_count, 1)
+        self.assertEqual(configured_count, 1)
+        self.assertEqual(target_path, source_path)
+        self.assertNotIn('"model_provider":"ProviderA"', source_path.read_text(encoding="utf-8"))
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM threads WHERE model_provider = 'ProviderA'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_full_mirror_remaps_paginated_history_base_id_and_byte_offset(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        child_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        parent_path = self.add_thread(parent_id, provider="A", title="History parent")
+        child_path = self.add_thread(
+            child_id,
+            provider="A",
+            title="History child",
+            parent_thread_id=parent_id,
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO thread_spawn_edges VALUES (?, ?, 'open')",
+                (parent_id, child_id),
+            )
+            conn.commit()
+        child_records = [
+            json.loads(line) for line in child_path.read_text(encoding="utf-8").splitlines()
+        ]
+        child_records[0]["item"]["payload"]["history_base"] = {
+            "thread_id": parent_id,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": parent_path.stat().st_size,
+        }
+        child_path.write_text(
+            "".join(compact_json(record) + "\n" for record in child_records),
+            encoding="utf-8",
+        )
+        original_parent_size = parent_path.stat().st_size
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "A",
+                "ProviderWithLongIdentifier",
+                [],
+                False,
+                True,
+                mirror_target=True,
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        id_map = {item["source_id"]: item["target_id"] for item in result["items"]}
+        self.assertEqual(id_map, {parent_id: parent_id, child_id: child_id})
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            copied_paths = {
+                row[0]: Path(row[1])
+                for row in conn.execute(
+                    "SELECT id, rollout_path FROM threads WHERE model_provider = ?",
+                    ("ProviderWithLongIdentifier",),
+                )
+            }
+        copied_child = json.loads(
+            copied_paths[id_map[child_id]].read_text(encoding="utf-8").splitlines()[0]
+        )["item"]["payload"]
+        history_base = copied_child["history_base"]
+        self.assertEqual(history_base["thread_id"], id_map[parent_id])
+        self.assertEqual(
+            history_base["end_byte_offset"],
+            copied_paths[id_map[parent_id]].stat().st_size,
+        )
+        self.assertNotEqual(history_base["end_byte_offset"], original_parent_size)
+
+    def test_full_mirror_copies_durable_sidecars_and_clears_runtime_projections(self) -> None:
+        source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        old_target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        self.add_thread(source_id, provider="ProviderA", title="Source")
+        self.add_thread(old_target, provider="ProviderB", title="Target")
+
+        sidecars = {
+            "goals_1.sqlite": """
+                CREATE TABLE thread_goals (
+                    thread_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL,
+                    objective TEXT NOT NULL
+                );
+                CREATE TABLE thread_goal_continuation_deferrals (
+                    thread_id TEXT PRIMARY KEY REFERENCES thread_goals(thread_id) ON DELETE CASCADE
+                );
+            """,
+            "memories_1.sqlite": """
+                CREATE TABLE stage1_outputs (
+                    thread_id TEXT PRIMARY KEY,
+                    raw_memory TEXT NOT NULL
+                );
+            """,
+            "thread_history_1.sqlite": """
+                CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, PRIMARY KEY(thread_id, turn_id));
+                CREATE TABLE thread_items (thread_id TEXT, item_id TEXT, PRIMARY KEY(thread_id, item_id));
+                CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER);
+            """,
+            "queue_1.sqlite": """
+                CREATE TABLE queued_items (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL);
+                CREATE TABLE queued_thread_revisions (revision INTEGER, thread_id TEXT UNIQUE);
+            """,
+            "logs_2.sqlite": """
+                CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT);
+            """,
+        }
+        for filename, schema in sidecars.items():
+            with closing(sqlite3.connect(self.sqlite_home / filename)) as conn:
+                conn.executescript(schema)
+                conn.commit()
+
+        with closing(sqlite3.connect(self.sqlite_home / "goals_1.sqlite")) as conn:
+            conn.execute("INSERT INTO thread_goals VALUES (?, 'goal-source', 'latest goal')", (source_id,))
+            conn.execute("INSERT INTO thread_goal_continuation_deferrals VALUES (?)", (source_id,))
+            conn.execute("INSERT INTO thread_goals VALUES (?, 'goal-target', 'old goal')", (old_target,))
+            conn.commit()
+        with closing(sqlite3.connect(self.sqlite_home / "memories_1.sqlite")) as conn:
+            conn.execute("INSERT INTO stage1_outputs VALUES (?, 'source memory')", (source_id,))
+            conn.execute("INSERT INTO stage1_outputs VALUES (?, 'target memory')", (old_target,))
+            conn.commit()
+        with closing(sqlite3.connect(self.sqlite_home / "thread_history_1.sqlite")) as conn:
+            for thread_id in (source_id, old_target):
+                conn.execute("INSERT INTO thread_turns VALUES (?, 'turn')", (thread_id,))
+                conn.execute("INSERT INTO thread_items VALUES (?, 'item')", (thread_id,))
+                conn.execute(
+                    "INSERT INTO thread_history_projection_state VALUES (?, 123)",
+                    (thread_id,),
+                )
+            conn.commit()
+        with closing(sqlite3.connect(self.sqlite_home / "queue_1.sqlite")) as conn:
+            conn.execute("INSERT INTO queued_items VALUES ('source-item', ?)", (source_id,))
+            conn.execute("INSERT INTO queued_items VALUES ('target-item', ?)", (old_target,))
+            conn.execute("INSERT INTO queued_thread_revisions VALUES (1, ?)", (source_id,))
+            conn.execute("INSERT INTO queued_thread_revisions VALUES (1, ?)", (old_target,))
+            conn.commit()
+        with closing(sqlite3.connect(self.sqlite_home / "logs_2.sqlite")) as conn:
+            conn.execute("INSERT INTO logs VALUES (1, ?)", (source_id,))
+            conn.execute("INSERT INTO logs VALUES (2, ?)", (old_target,))
+            conn.commit()
+
+        result = self.transfer.copy_threads(
+            CopyRequest(
+                "ProviderA",
+                "ProviderB",
+                [],
+                False,
+                True,
+                mirror_target=True,
+            )
+        )
+
+        self.assertTrue(result["ok"], result)
+        target_id = result["items"][0]["target_id"]
+        self.assertEqual(target_id, source_id)
+        self.assertEqual(set(result["database_backups"]), set(sidecars) | {"state_5.sqlite"})
+        with closing(sqlite3.connect(self.sqlite_home / "goals_1.sqlite")) as conn:
+            goals = conn.execute(
+                "SELECT thread_id, goal_id, objective FROM thread_goals ORDER BY thread_id"
+            ).fetchall()
+            deferrals = conn.execute(
+                "SELECT thread_id FROM thread_goal_continuation_deferrals ORDER BY thread_id"
+            ).fetchall()
+        self.assertEqual(goals, [(source_id, "goal-source", "latest goal")])
+        self.assertEqual(deferrals, [(source_id,)])
+        with closing(sqlite3.connect(self.sqlite_home / "memories_1.sqlite")) as conn:
+            memories = conn.execute(
+                "SELECT thread_id, raw_memory FROM stage1_outputs ORDER BY thread_id"
+            ).fetchall()
+        self.assertEqual(
+            set(memories),
+            {(source_id, "source memory")},
+        )
+        with closing(sqlite3.connect(self.sqlite_home / "thread_history_1.sqlite")) as conn:
+            for table in (
+                "thread_turns",
+                "thread_items",
+                "thread_history_projection_state",
+            ):
+                ids = {row[0] for row in conn.execute(f"SELECT thread_id FROM {table}")}
+                self.assertEqual(ids, set())
+        with closing(sqlite3.connect(self.sqlite_home / "queue_1.sqlite")) as conn:
+            self.assertEqual(
+                {row[0] for row in conn.execute("SELECT thread_id FROM queued_items")},
+                {source_id},
+            )
+            self.assertEqual(
+                {row[0] for row in conn.execute("SELECT thread_id FROM queued_thread_revisions")},
+                {source_id},
+            )
+        with closing(sqlite3.connect(self.sqlite_home / "logs_2.sqlite")) as conn:
+            self.assertEqual(
+                {row[0] for row in conn.execute("SELECT thread_id FROM logs")},
+                {source_id},
+            )
+
+    def test_full_mirror_writes_rollouts_concurrently(self) -> None:
+        source_ids = [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        ]
+        for index, source_id in enumerate(source_ids):
+            self.add_thread(source_id, provider="ProviderA", title=f"Concurrent {index}")
+        barrier = threading.Barrier(len(source_ids))
+        original_writer = self.transfer._write_rollout_copy
+
+        def synchronized_writer(*args, **kwargs):
+            barrier.wait(timeout=3)
+            return original_writer(*args, **kwargs)
+
+        with patch.object(
+            self.transfer,
+            "_write_rollout_copy",
+            side_effect=synchronized_writer,
+        ):
+            result = self.transfer.copy_threads(
+                CopyRequest(
+                    "ProviderA",
+                    "ProviderB",
+                    [],
+                    False,
+                    True,
+                    mirror_target=True,
+                )
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(result["items"]), len(source_ids))
+
+    def test_full_mirror_rolls_back_after_concurrent_writer_failure(self) -> None:
+        first_source = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        second_source = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        old_target = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        first_path = self.add_thread(first_source, provider="ProviderA", title="First")
+        second_path = self.add_thread(second_source, provider="ProviderA", title="Second")
+        target_path = self.add_thread(old_target, provider="ProviderB", title="Old target")
+        self.write_session_index(first_source, "First source")
+        self.write_session_index(old_target, "Old target")
+        original_index = self.transfer._snapshot_session_index()
+        original_first = first_path.read_bytes()
+        original_second = second_path.read_bytes()
+        original_target = target_path.read_bytes()
+        session_files_before = set((self.codex_home / "sessions").rglob("*.jsonl"))
+        original_writer = self.transfer._write_rollout_copy
+        first_finished = threading.Event()
+
+        def write_one_then_fail(source_path: Path, *args, **kwargs):
+            if source_path == second_path:
+                first_finished.wait(timeout=3)
+                raise OSError("simulated concurrent mirror failure")
+            result = original_writer(source_path, *args, **kwargs)
+            if source_path == first_path:
+                first_finished.set()
+            return result
+
+        with patch.object(
+            self.transfer,
+            "_write_rollout_copy",
+            side_effect=write_one_then_fail,
+        ):
+            result = self.transfer.copy_threads(
+                CopyRequest(
+                    "ProviderA",
+                    "ProviderB",
+                    [],
+                    False,
+                    True,
+                    mirror_target=True,
+                )
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rolled_back"])
+        self.assertIn("simulated concurrent mirror failure", result["errors"][0])
+        self.assertEqual(first_path.read_bytes(), original_first)
+        self.assertEqual(second_path.read_bytes(), original_second)
+        self.assertEqual(target_path.read_bytes(), original_target)
+        self.assertEqual(self.transfer._snapshot_session_index(), original_index)
+        self.assertEqual(
+            set((self.codex_home / "sessions").rglob("*.jsonl")),
+            session_files_before,
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            providers = dict(
+                conn.execute("SELECT id, model_provider FROM threads ORDER BY id").fetchall()
+            )
+        self.assertEqual(providers[first_source], "ProviderA")
+        self.assertEqual(providers[second_source], "ProviderA")
+        self.assertEqual(providers[old_target], "ProviderB")
+
     def test_local_copy_overwrite_replaces_matching_conversation_after_provider_switch(self) -> None:
         source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         destination_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -1382,6 +1920,7 @@ class SessionTransferTests(unittest.TestCase):
             {"name": "codex.exe", "pid": 101},
             {"name": "codex-plus-plus-manager.exe", "pid": 102},
             {"name": "python.exe", "pid": 103},
+            {"name": "ChatGPT.exe", "pid": 104},
         ]
         killed: list[int] = []
 
@@ -1400,8 +1939,8 @@ class SessionTransferTests(unittest.TestCase):
         result = transfer.kill_blocking_processes()
 
         self.assertTrue(result["ok"])
-        self.assertEqual(killed, [101, 102])
-        self.assertEqual(result["killed_count"], 2)
+        self.assertEqual(killed, [101, 102, 104])
+        self.assertEqual(result["killed_count"], 3)
         self.assertEqual(result["remaining_blocking_processes"], [])
         self.assertEqual(processes, [{"name": "python.exe", "pid": 103}])
 

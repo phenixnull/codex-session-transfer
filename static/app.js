@@ -35,12 +35,16 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const CUSTOM_TARGET = "__custom__";
 const SESSION_RENDER_PAGE_SIZE = 80;
-const PREVIEW_RENDER_PAGE_SIZE = 48;
+const PREVIEW_RENDER_PAGE_SIZE = 24;
 const PREVIEW_SCROLL_THRESHOLD = 180;
 const EXPORT_DIR_STORAGE_KEY = "codex-session-transfer.exportDir";
 
 function usingPackageSource() {
   return state.mode === "package" && Boolean(state.packageSource?.loaded);
+}
+
+function usingLocalMirror() {
+  return state.mode === "local" && !usingPackageSource();
 }
 
 function usingSkillPackageSource() {
@@ -144,13 +148,15 @@ function targetProviderValue() {
 }
 
 function copyRequest() {
+  const mirrorTarget = usingLocalMirror();
   const request = {
     source_provider: $("sourceProvider").value,
     target_provider: targetProviderValue(),
-    thread_ids: Array.from(state.selected),
-    include_descendants: $("includeDescendants").checked,
-    include_archived: $("includeArchived").checked,
-    overwrite: Boolean($("overwriteSessions")?.checked),
+    thread_ids: mirrorTarget ? [] : Array.from(state.selected),
+    include_descendants: mirrorTarget || $("includeDescendants").checked,
+    include_archived: mirrorTarget || $("includeArchived").checked,
+    overwrite: mirrorTarget ? false : Boolean($("overwriteSessions")?.checked),
+    mirror_target: mirrorTarget,
   };
   if (request.overwrite && Object.keys(state.overwriteSelections).length) {
     request.overwrite_selections = { ...state.overwriteSelections };
@@ -158,6 +164,21 @@ function copyRequest() {
   const workspaceMapping = packageWorkspaceMapping();
   if (workspaceMapping) request.workspace_mapping = workspaceMapping;
   return request;
+}
+
+function localMirrorSourceCount() {
+  if (!usingLocalMirror()) return state.selected.size;
+  const source = $("sourceProvider")?.value || "";
+  const provider = state.sessionProviders.find((item) => item.model_provider === source);
+  return Number(provider?.total ?? state.sourceThreads.length ?? 0);
+}
+
+function localMirrorTargetCount() {
+  if (!usingLocalMirror()) return 0;
+  const target = targetProviderValue();
+  const provider = state.sessionProviders.find((item) => item.model_provider === target);
+  const targetOption = state.targetProviders.find((item) => item.value === target);
+  return Number(provider?.total ?? targetOption?.session_total ?? state.targetThreads.length ?? 0);
 }
 
 function rebindRequest() {
@@ -393,9 +414,11 @@ function preferredSourceProvider(currentValue) {
 function preferredTargetProvider(currentValue, sourceValue) {
   const options = targetProviderOptions();
   const current = options.find((provider) => provider.value === currentValue);
-  if (current && (current.value !== sourceValue || current.current)) return current.value;
+  if (current && current.value !== sourceValue) return current.value;
 
-  const liveTarget = options.find((provider) => provider.current);
+  const liveTarget = options.find(
+    (provider) => provider.current && provider.value !== sourceValue,
+  );
   if (liveTarget) return liveTarget.value;
 
   const configuredTarget = options.find(
@@ -462,6 +485,18 @@ function renderModeChrome() {
   if (title) title.textContent = usingPackageSource() ? "Package Source Sessions" : "Source Sessions";
   const rebindButton = $("rebindButton");
   if (rebindButton) rebindButton.hidden = isPackageMode;
+  const copyButtonLabel = $("copyButton")?.querySelector("span");
+  if (copyButtonLabel) {
+    copyButtonLabel.textContent = usingLocalMirror()
+      ? "Mirror all"
+      : usingPackageSource()
+        ? "Import"
+        : "Copy";
+  }
+  const archivedLabel = $("includeArchivedLabel")?.querySelector("span");
+  if (archivedLabel) archivedLabel.textContent = usingLocalMirror() ? "Show archived" : "Archived";
+  const descendantsLabel = $("includeDescendantsLabel");
+  if (descendantsLabel) descendantsLabel.hidden = usingLocalMirror();
   const kind = $("sourceSetupKind");
   if (kind) kind.textContent = usingPackageSource() ? "Package" : "Provider";
   const label = $("sourceProviderLabel");
@@ -669,8 +704,8 @@ function updateKillBlockingButton(blocking) {
   button.disabled = count === 0;
   button.textContent = count ? `Kill blockers (${count})` : "Kill blockers";
   button.title = count
-    ? "Terminate the detected Codex/Codex++ blocking processes so copy can write safely."
-    : "No blocking Codex/Codex++ processes detected.";
+    ? "Terminate the detected ChatGPT/Codex/Codex++ blocking processes so session data can be updated safely."
+    : "No blocking ChatGPT/Codex/Codex++ processes detected.";
 }
 
 function updateRepairNamesButton(blocking) {
@@ -679,7 +714,7 @@ function updateRepairNamesButton(blocking) {
   const blocked = blocking.length > 0;
   button.disabled = blocked;
   button.title = blocked
-    ? "Close blocking Codex/Codex++ processes before repairing session_index names."
+    ? "Close blocking ChatGPT/Codex/Codex++ processes before repairing session_index names."
     : "Backfill copied session names from successful transfer manifests.";
 }
 
@@ -916,7 +951,19 @@ function renderOverwriteSessionsControl() {
   const checkbox = $("overwriteSessions");
   const label = $("overwriteSessionsLabel");
   if (!checkbox || !label) return;
+  const text = label.querySelector("span");
+  if (usingLocalMirror()) {
+    checkbox.checked = true;
+    checkbox.disabled = true;
+    checkbox.dataset.forcedMirror = "true";
+    if (text) text.textContent = "Back up and replace entire target";
+    label.title = "Every target-provider session is backed up, removed, and recreated from the source provider.";
+    return;
+  }
+  if (checkbox.dataset.forcedMirror === "true") checkbox.checked = false;
+  delete checkbox.dataset.forcedMirror;
   checkbox.disabled = false;
+  if (text) text.textContent = "Overwrite matching sessions";
   label.title = "Replace destination sessions matched by session ID or project and conversation identity.";
 }
 
@@ -1502,7 +1549,7 @@ async function previewCopy() {
   );
   setCopyResult(
     plan.can_execute
-      ? `Preview ready: ${loaded}${total !== loaded ? ` / ${total}` : ""} session(s) can be ${usingPackageSource() ? "imported" : "copied"}.`
+      ? `Preview ready: ${loaded}${total !== loaded ? ` / ${total}` : ""} session(s) can be ${usingLocalMirror() ? "mirrored" : usingPackageSource() ? "imported" : "copied"}.`
       : ambiguityCount
         ? `Choose or skip ${ambiguityCount} ambiguous overwrite match(es), then recheck the choices.`
         : "Preview is not executable. Fix the messages above.",
@@ -1763,9 +1810,14 @@ function updateCopyProgress(event = null) {
     checking: "Checking",
     planning: "Planning",
     ready: "Ready",
+    backing_up: "Backing up",
+    clearing: "Clearing target",
     copying: "Copying",
     rebinding: "Rebinding",
+    indexing: "Updating index",
+    verifying: "Verifying",
     committing: "Committing",
+    cleaning: "Cleaning up",
     blocked: "Blocked",
     error: "Stopped",
     done: "Complete",
@@ -1786,20 +1838,31 @@ async function executeCopy() {
   const blocked = (state.status && state.status.blocking_processes || []).length > 0;
   const reasons = copyDisabledReasons(blocked);
   if (reasons.length) return;
-  const count = state.selected.size;
+  const mirrorTarget = usingLocalMirror();
+  const count = mirrorTarget ? localMirrorSourceCount() : state.selected.size;
+  const source = $("sourceProvider").value;
   const target = targetProviderValue();
-  const action = usingPackageSource() ? "Import" : "Copy";
-  const overwriteNotice = $("overwriteSessions")?.checked
+  const targetCount = localMirrorTargetCount();
+  const action = mirrorTarget ? "Mirror" : usingPackageSource() ? "Import" : "Copy";
+  const overwriteNotice = !mirrorTarget && $("overwriteSessions")?.checked
     ? " Matching destination conversations will be overwritten."
     : "";
-  const descendantsNotice = $("includeDescendants")?.checked ? " Child sessions included." : "";
-  const confirmed = window.confirm(`${action} ${count} selected session(s) to ${target}?${descendantsNotice}${overwriteNotice}`);
+  const descendantsNotice = !mirrorTarget && $("includeDescendants")?.checked ? " Child sessions included." : "";
+  const confirmation = mirrorTarget
+    ? `Mirror all ${count} session(s) from ${source} to ${target}?\n\nAll ${targetCount} existing target-provider session(s), including archived sessions, will be backed up and replaced.`
+    : `${action} ${count} selected session(s) to ${target}?${descendantsNotice}${overwriteNotice}`;
+  const confirmed = window.confirm(confirmation);
   if (!confirmed) return;
 
   state.copyInProgress = true;
   updateCopyButton();
   updateCopyProgress({ phase: "checking", current: 0, total: count, message: `${action}ing sessions` });
-  setCopyResult(`${action}ing ${count} selected session(s)...`, "info");
+  setCopyResult(
+    mirrorTarget
+      ? `Mirroring all ${count} source session(s) to ${target}...`
+      : `${action}ing ${count} selected session(s)...`,
+    "info",
+  );
   const endpoint = usingPackageSource() ? "/api/copy-package-progress" : "/api/copy-progress";
   try {
     const result = await streamApi(
@@ -1817,9 +1880,16 @@ async function executeCopy() {
     const overwrittenCount = Number(
       result.overwritten_count ?? (result.items || []).filter((item) => item.overwritten).length,
     );
-    const resultText = result.ok
-      ? `${usingPackageSource() ? "Imported" : "Copied"} ${copiedCount} session(s).${result.overwrite ? ` Overwrote ${overwrittenCount} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`
-      : `Not ${usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
+    let resultText;
+    if (result.ok && (mirrorTarget || result.mirror_target)) {
+      const replacedTargetCount = Number(result.replaced_target_count ?? targetCount);
+      const backupText = result.backup_directory ? ` Backup: ${result.backup_directory}.` : "";
+      resultText = `Mirrored ${copiedCount} session(s) to ${target}. Replaced ${replacedTargetCount} previous target session(s).${backupText} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
+    } else if (result.ok) {
+      resultText = `${usingPackageSource() ? "Imported" : "Copied"} ${copiedCount} session(s).${result.overwrite ? ` Overwrote ${overwrittenCount} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
+    } else {
+      resultText = `Not ${mirrorTarget ? "mirrored" : usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
+    }
     await loadStatus();
     renderAllShell();
     state.lastCopiedTargetIds = new Set((result.items || []).map((item) => item.target_id));
@@ -1899,7 +1969,7 @@ async function killBlockingProcesses() {
     .map((process) => `${process.name || "process"} PID ${process.pid}`)
     .join("\n");
   const confirmed = window.confirm(
-    `Terminate these blocking process(es)?\n\n${processLines}\n\nIf this page is running inside Codex, Codex will close. Use an external browser for the final Copy step.`
+    `Terminate these blocking process(es)?\n\n${processLines}\n\nIf this page is running inside ChatGPT/Codex, that app will close. Use an external browser for the final mirror step.`
   );
   if (!confirmed) return;
 
@@ -2268,7 +2338,11 @@ function updateCopyButton() {
   const copyButton = $("copyButton");
   copyButton.disabled = reasons.length > 0;
   copyButton.title = reasons.join(" ");
-  $("copyDisabledReason").textContent = reasons.length ? reasons.join(" ") : "Ready to copy. Preview is optional.";
+  $("copyDisabledReason").textContent = reasons.length
+    ? reasons.join(" ")
+    : usingLocalMirror()
+      ? `Ready to mirror all ${localMirrorSourceCount()} source session(s). Preview is optional and loads on demand.`
+      : "Ready to copy. Preview is optional.";
 }
 
 function updateRebindButton() {
@@ -2314,22 +2388,33 @@ function rebindDisabledReasons() {
     reasons.push("A session operation is already running.");
   }
   if (blockingCount) {
-    reasons.push(`Close Codex/Codex++ before rebinding (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
+    reasons.push(`Close ChatGPT/Codex/Codex++ before rebinding (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
   }
   return reasons;
 }
 
 function copyDisabledReasons(blocked) {
   const reasons = [];
+  const mirrorTarget = usingLocalMirror();
   const selectedCount = state.selected.size;
+  const source = $("sourceProvider")?.value || "";
   const target = targetProviderValue();
   const blockingCount = (state.status && state.status.blocking_processes || []).length;
 
-  if (selectedCount === 0) {
+  if (!source) {
+    reasons.push("Choose a source provider.");
+  }
+  if (!mirrorTarget && selectedCount === 0) {
     reasons.push("Select at least one session.");
+  }
+  if (mirrorTarget && source && localMirrorSourceCount() === 0) {
+    reasons.push(`Source provider '${source}' has no sessions to mirror.`);
   }
   if (!target) {
     reasons.push("Choose a target provider.");
+  }
+  if (mirrorTarget && source && target && source === target) {
+    reasons.push("Source and target providers must be different.");
   }
   if (target && targetProviderIsConfigured({ value: target }) === false) {
     reasons.push(`Target provider '${target}' is not defined in config.toml.`);
@@ -2337,14 +2422,14 @@ function copyDisabledReasons(blocked) {
   const ambiguityCount = Number(
     state.preview?.overwrite_ambiguity_count ?? state.preview?.overwrite_ambiguities?.length ?? 0,
   );
-  if ($("overwriteSessions")?.checked && ambiguityCount) {
+  if (!mirrorTarget && $("overwriteSessions")?.checked && ambiguityCount) {
     reasons.push(`Resolve ${ambiguityCount} ambiguous overwrite match${ambiguityCount === 1 ? "" : "es"} first.`);
   }
   if (state.copyInProgress) {
     reasons.push("A session operation is already running.");
   }
   if (blocked) {
-    reasons.push(`Close Codex/Codex++ before copying (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
+    reasons.push(`Close ChatGPT/Codex/Codex++ before copying (${blockingCount} blocking process${blockingCount === 1 ? "" : "es"} detected).`);
   }
   return reasons;
 }

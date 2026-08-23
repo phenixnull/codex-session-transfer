@@ -13,6 +13,7 @@ import tempfile
 import tomllib
 import uuid
 import zipfile
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,7 +26,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 STATE_DB_FILENAME = "state_5.sqlite"
 SESSION_INDEX_FILENAME = "session_index.jsonl"
-BLOCKING_PROCESS_NAMES = {"codex", "codex-plus-plus", "codex-plus-plus-manager"}
+BLOCKING_PROCESS_NAMES = {"chatgpt", "codex", "codex-plus-plus", "codex-plus-plus-manager"}
+MAX_COPY_WORKERS = 8
 DEFAULT_THREAD_DETAIL_LIMIT = 80
 MAX_THREAD_DETAIL_LIMIT = 200
 DEFAULT_PREVIEW_PAGE_SIZE = 48
@@ -36,6 +38,33 @@ PACKAGE_VERSION = 1
 PACKAGE_MANIFEST_NAME = "manifest.json"
 PACKAGE_DB_PATH = f"sqlite/{STATE_DB_FILENAME}"
 PACKAGE_SCHEMA_TABLES = ("threads", "thread_spawn_edges", "thread_dynamic_tools")
+RUNTIME_DATABASE_FILENAMES = (
+    STATE_DB_FILENAME,
+    "logs_2.sqlite",
+    "goals_1.sqlite",
+    "memories_1.sqlite",
+    "queue_1.sqlite",
+    "thread_history_1.sqlite",
+)
+MIRROR_SIDECAR_ALIASES = {
+    "logs_2.sqlite": "mirror_logs",
+    "goals_1.sqlite": "mirror_goals",
+    "memories_1.sqlite": "mirror_memories",
+    "queue_1.sqlite": "mirror_queue",
+    "thread_history_1.sqlite": "mirror_history",
+}
+ROLLOUT_THREAD_ID_FIELDS = {
+    "child_thread_id",
+    "conversation_id",
+    "forked_from_id",
+    "id",
+    "parent_thread_id",
+    "session_id",
+    "source_thread_id",
+    "target_thread_id",
+    "thread_id",
+}
+ROLLOUT_THREAD_ID_LIST_FIELDS = {"thread_ids"}
 SKILL_PACKAGE_FORMAT = "codex-skill-transfer-package"
 SKILL_PACKAGE_VERSION = 1
 SKILL_PACKAGE_DIRNAME = "skills"
@@ -129,6 +158,7 @@ class CopyRequest:
     preview_offset: int = 0
     preview_limit: int = DEFAULT_PREVIEW_PAGE_SIZE
     overwrite_selections: dict[str, str | None] | None = None
+    mirror_target: bool = False
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "CopyRequest":
@@ -193,7 +223,21 @@ class CopyRequest:
             overwrite_selections=overwrite_selections,
             preview_offset=preview_offset,
             preview_limit=preview_limit,
+            mirror_target=bool(data.get("mirror_target", False)),
         )
+
+
+@dataclass(frozen=True)
+class RolloutWriteResult:
+    item: dict[str, Any]
+    destination_path: Path
+    offset_map: dict[int, int]
+
+
+@dataclass(frozen=True)
+class RolloutBackup:
+    original_path: Path
+    backup_path: Path
 
 
 @dataclass(frozen=True)
@@ -927,6 +971,8 @@ class CodexSessionTransfer:
         request: CopyRequest,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        if request.mirror_target:
+            return self._mirror_provider_threads(request, progress_callback)
         progress_total = max(len(request.thread_ids), 1)
         self._report_copy_progress(
             progress_callback,
@@ -1011,24 +1057,12 @@ class CodexSessionTransfer:
                             plan.get("_overwrite_session_index_ids", set())
                         ) | target_index_ids.intersection(plan["_id_map"].values())
                     total_items = len(plan["items"])
-                    for index, item in enumerate(plan["items"], start=1):
-                        self._write_rollout_copy(
-                            Path(item["source_rollout_path"]),
-                            Path(item["dest_rollout_path"]),
-                            item["source_id"],
-                            plan["_id_map"],
-                            plan["target_provider"],
-                            target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
-                            overwrite=Path(item["dest_rollout_path"]) in overwrite_paths,
-                        )
-                        copied_paths.append(Path(item["dest_rollout_path"]))
-                        self._report_copy_progress(
-                            progress_callback,
-                            phase="copying",
-                            current=index,
-                            total=total_items,
-                            item=item,
-                        )
+                    self._write_rollout_plan_concurrently(
+                        plan,
+                        overwrite_paths=overwrite_paths,
+                        copied_paths=copied_paths,
+                        progress_callback=progress_callback,
+                    )
 
                     self._insert_thread_rows(conn, plan, plan["target_provider"])
                     self._insert_spawn_edges(conn, plan)
@@ -1092,6 +1126,281 @@ class CodexSessionTransfer:
                 f"Copied {len(manifest_payload.get('items') or [])} session(s)"
                 if manifest_payload.get("ok")
                 else (manifest_payload.get("errors") or ["Copy failed"])[0]
+            ),
+        )
+        return manifest_payload
+
+    def _mirror_provider_threads(
+        self,
+        request: CopyRequest,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        self._report_copy_progress(
+            progress_callback,
+            phase="checking",
+            message="Checking the source, target, and running Codex applications",
+        )
+        blocking = self.blocking_processes()
+        if blocking:
+            self._report_copy_progress(
+                progress_callback,
+                phase="blocked",
+                message="Close ChatGPT, Codex, and provider switcher processes before mirroring",
+            )
+            payload = {
+                "ok": False,
+                "blocked": True,
+                "errors": [
+                    "Close ChatGPT, Codex, and provider switcher processes before mirroring."
+                ],
+                "blocking_processes": blocking,
+                "items": [],
+                "mirror_target": True,
+            }
+            manifest_path = self._write_manifest(payload, request, operation="mirror")
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        self._report_copy_progress(
+            progress_callback,
+            phase="planning",
+            message="Building the full provider mirror plan",
+        )
+        with closing(self._connect(read_only=True)) as conn:
+            preflight_plan = self._build_copy_plan(conn, request)
+        preflight = self._public_plan(preflight_plan, request=request)
+        if not preflight["can_execute"]:
+            self._report_copy_progress(
+                progress_callback,
+                phase="error",
+                message=(preflight.get("errors") or ["Mirror plan is not executable"])[0],
+            )
+            payload = {"ok": False, "blocked": False, **preflight}
+            manifest_path = self._write_manifest(payload, request, operation="mirror")
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        total_items = len(preflight_plan["items"])
+        source_ids_before_backup = set(preflight_plan.get("_ordered_ids", []))
+        target_ids_before_backup = set(preflight_plan.get("_target_ids", set()))
+        target_rollout_paths = self._mirror_target_rollout_paths(preflight_plan)
+        source_rollout_paths = [
+            Path(item["source_rollout_path"]) for item in preflight_plan["items"]
+        ]
+        backup_rollout_paths = list(
+            dict.fromkeys([*source_rollout_paths, *target_rollout_paths])
+        )
+        self._report_copy_progress(
+            progress_callback,
+            phase="ready",
+            total=total_items,
+            message=(
+                f"Ready to mirror {total_items} source session(s) over "
+                f"{len(target_ids_before_backup)} target session(s)"
+            ),
+        )
+
+        backup_dir = self._new_mirror_backup_directory()
+        database_backups: dict[str, str] = {}
+        rollout_backups: list[RolloutBackup] = []
+        session_index_backup: str | None = None
+        try:
+            self._report_copy_progress(
+                progress_callback,
+                phase="backing_up",
+                total=max(len(backup_rollout_paths), 1),
+                message="Backing up Codex databases and all source/target sessions",
+            )
+            database_backups = self._backup_runtime_databases(backup_dir)
+            session_index_backup = self._backup_session_index_for_mirror(backup_dir)
+            rollout_backups = self._backup_mirror_rollouts(
+                backup_rollout_paths,
+                backup_dir,
+                progress_callback=progress_callback,
+            )
+            self._write_mirror_backup_manifest(
+                backup_dir,
+                request,
+                database_backups=database_backups,
+                rollout_backups=rollout_backups,
+                session_index_backup=session_index_backup,
+                source_ids=source_ids_before_backup,
+                target_ids=target_ids_before_backup,
+            )
+        except Exception as exc:
+            self._report_copy_progress(
+                progress_callback,
+                phase="error",
+                total=max(len(backup_rollout_paths), 1),
+                message=f"Backup failed: {exc}",
+            )
+            payload = {
+                "ok": False,
+                "blocked": False,
+                "errors": [f"Backup failed before any target data was changed: {exc}"],
+                "items": [],
+                "mirror_target": True,
+                "backup_directory": str(backup_dir),
+            }
+            manifest_path = self._write_manifest(payload, request, operation="mirror")
+            payload["manifest_path"] = str(manifest_path)
+            return payload
+
+        rewritten_paths: list[Path] = []
+        session_index_snapshot: tuple[bool, str] | None = None
+        session_index_entries: list[dict[str, Any]] = []
+        manifest_payload: dict[str, Any] | None = None
+        committed = False
+        plan: dict[str, Any] | None = None
+        with closing(self._connect(read_only=False)) as conn:
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                attached = self._attach_mirror_sidecars(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                plan = self._build_copy_plan(conn, request)
+                if plan["errors"]:
+                    raise RuntimeError("; ".join(plan["errors"]))
+                if set(plan.get("_target_ids", set())) != target_ids_before_backup:
+                    raise RuntimeError(
+                        "Target sessions changed after backup; close all Codex applications and retry"
+                    )
+                if set(plan.get("_ordered_ids", [])) != source_ids_before_backup:
+                    raise RuntimeError(
+                        "Source sessions changed after backup; close all Codex applications and retry"
+                    )
+
+                self._report_copy_progress(
+                    progress_callback,
+                    phase="clearing",
+                    total=len(target_ids_before_backup),
+                    message="Removing the old target-provider database records",
+                )
+                self._clear_mirror_target_records(conn, plan, attached)
+                self._write_rollout_plan_concurrently(
+                    plan,
+                    overwrite_paths=set(source_rollout_paths),
+                    copied_paths=rewritten_paths,
+                    progress_callback=progress_callback,
+                )
+                updated = 0
+                for chunk in self._id_chunks(sorted(source_ids_before_backup)):
+                    placeholders = ",".join("?" for _ in chunk)
+                    updated += conn.execute(
+                        "UPDATE threads SET model_provider = ? "
+                        f"WHERE id IN ({placeholders}) AND model_provider = ?",
+                        [plan["target_provider"], *chunk, plan["source_provider"]],
+                    ).rowcount
+                if updated != total_items:
+                    raise RuntimeError(
+                        f"Expected to rebind {total_items} source session(s), but updated {updated}"
+                    )
+
+                self._report_copy_progress(
+                    progress_callback,
+                    phase="indexing",
+                    current=total_items,
+                    total=total_items,
+                    message="Replacing target session names and indexes",
+                )
+                session_index_snapshot = self._snapshot_session_index()
+                session_index_entries = self._replace_session_index_for_mirror(plan)
+
+                self._report_copy_progress(
+                    progress_callback,
+                    phase="verifying",
+                    current=total_items,
+                    total=total_items,
+                    message="Verifying provider routing, database rows, and copied files",
+                )
+                self._verify_mirror(conn, plan, attached)
+                self._report_copy_progress(
+                    progress_callback,
+                    phase="committing",
+                    current=total_items,
+                    total=total_items,
+                    message="Committing the provider mirror",
+                )
+                conn.commit()
+                committed = True
+                manifest_payload = {
+                    "ok": True,
+                    "blocked": False,
+                    **self._public_plan(plan),
+                    "backup_path": database_backups.get(STATE_DB_FILENAME),
+                    "backup_directory": str(backup_dir),
+                    "database_backups": database_backups,
+                    "rollout_backup_count": len(rollout_backups),
+                    "source_rollout_backup_count": len(source_rollout_paths),
+                    "target_rollout_backup_count": len(target_rollout_paths),
+                    "rebound_source_count": updated,
+                    "session_index_backup": session_index_backup,
+                    "session_index_path": str(self.session_index_path),
+                    "session_index_entries": len(session_index_entries),
+                    "history_projection_mode": "rebuild_on_resume",
+                }
+            except BaseException as exc:
+                restore_errors: list[str] = []
+                if not committed:
+                    conn.rollback()
+                    if session_index_snapshot is not None:
+                        self._restore_session_index(session_index_snapshot)
+                    restore_errors = self._restore_mirror_rollout_backups(rollout_backups)
+                manifest_payload = {
+                    "ok": False,
+                    "blocked": False,
+                    "errors": [str(exc)],
+                    "items": [],
+                    "mirror_target": True,
+                    "backup_path": database_backups.get(STATE_DB_FILENAME),
+                    "backup_directory": str(backup_dir),
+                    "database_backups": database_backups,
+                    "rollout_backup_count": len(rollout_backups),
+                    "rolled_back": not committed,
+                }
+                if restore_errors:
+                    manifest_payload["restore_errors"] = restore_errors
+
+        if manifest_payload is None:
+            manifest_payload = {
+                "ok": False,
+                "blocked": False,
+                "errors": ["Provider mirror ended without a result"],
+                "items": [],
+                "mirror_target": True,
+                "backup_directory": str(backup_dir),
+            }
+
+        if manifest_payload.get("ok") and plan is not None:
+            protected_paths = set(source_rollout_paths) | set(rewritten_paths)
+            cleanup_paths = [
+                path for path in target_rollout_paths if path not in protected_paths
+            ]
+            cleanup_errors = self._delete_mirrored_target_rollouts(
+                cleanup_paths,
+                progress_callback=progress_callback,
+            )
+            if cleanup_errors:
+                manifest_payload.setdefault("warnings", []).append(
+                    f"{len(cleanup_errors)} obsolete target rollout file(s) could not be removed; "
+                    "they are no longer referenced by the database."
+                )
+                manifest_payload["cleanup_errors"] = cleanup_errors
+            manifest_payload["deleted_target_rollout_count"] = (
+                len(cleanup_paths) - len(cleanup_errors)
+            )
+
+        manifest_path = self._write_manifest(manifest_payload, request, operation="mirror")
+        manifest_payload["manifest_path"] = str(manifest_path)
+        result_items = manifest_payload.get("items") or []
+        self._report_copy_progress(
+            progress_callback,
+            phase="done" if manifest_payload.get("ok") else "error",
+            current=len(result_items),
+            total=len(result_items) or max(total_items, 1),
+            message=(
+                f"Mirrored {len(result_items)} session(s)"
+                if manifest_payload.get("ok")
+                else (manifest_payload.get("errors") or ["Provider mirror failed"])[0]
             ),
         )
         return manifest_payload
@@ -1794,6 +2103,8 @@ class CodexSessionTransfer:
         self.manifest_dir.mkdir(parents=True, exist_ok=True)
         backup_path = self._backup_database()
         copied_paths: list[Path] = []
+        rollout_backups: list[tuple[Path, Path]] = []
+        overwrite_paths: set[Path] = set()
         session_index_snapshot: tuple[bool, str] | None = None
         session_index_entries: list[dict[str, Any]] = []
         manifest_payload: dict[str, Any] | None = None
@@ -1830,28 +2141,12 @@ class CodexSessionTransfer:
                                 plan.get("_overwrite_session_index_ids", set())
                             ) | target_index_ids.intersection(plan["_id_map"].values())
                         total_items = len(plan["items"])
-                        for index, item in enumerate(plan["items"], start=1):
-                            destination_path = Path(item["dest_rollout_path"])
-                            self._write_rollout_copy(
-                                Path(item["source_rollout_path"]),
-                                destination_path,
-                                item["source_id"],
-                                plan["_id_map"],
-                                plan["target_provider"],
-                                target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
-                                target_source=plan.get("_target_source_by_source_id", {}).get(
-                                    item["source_id"]
-                                ),
-                                overwrite=destination_path in overwrite_paths,
-                            )
-                            copied_paths.append(destination_path)
-                            self._report_copy_progress(
-                                progress_callback,
-                                phase="copying",
-                                current=index,
-                                total=total_items,
-                                item=item,
-                            )
+                        self._write_rollout_plan_concurrently(
+                            plan,
+                            overwrite_paths=overwrite_paths,
+                            copied_paths=copied_paths,
+                            progress_callback=progress_callback,
+                        )
 
                         self._insert_thread_rows(target_conn, plan, plan["target_provider"])
                         self._insert_spawn_edges_from_source(source_conn, target_conn, plan)
@@ -3363,6 +3658,7 @@ class CodexSessionTransfer:
         source_provider = request.source_provider.strip()
         target_provider = request.target_provider.strip()
         target_provider, target_provider_warning = self._resolve_target_provider(target_provider)
+        mirror_target = bool(request.mirror_target)
         ordered_ids = self._dedupe(request.thread_ids)
         cwd_map = dict(request.cwd_map or {})
 
@@ -3370,7 +3666,9 @@ class CodexSessionTransfer:
             errors.append("source_provider is required")
         if not target_provider:
             errors.append("target_provider is required")
-        if not ordered_ids:
+        if mirror_target and source_provider and target_provider and source_provider == target_provider:
+            errors.append("Source and target providers must be different for a full mirror")
+        if not mirror_target and not ordered_ids:
             errors.append("Select at least one thread")
         config_path = self.codex_home / "config.toml"
         configured_provider_ids = {
@@ -3388,7 +3686,19 @@ class CodexSessionTransfer:
         if target_provider_warning:
             warnings.append(target_provider_warning)
 
-        rows = self._threads_by_ids(conn, ordered_ids)
+        if mirror_target:
+            source_rows = conn.execute(
+                "SELECT * FROM threads WHERE model_provider = ? ORDER BY created_at, id",
+                (source_provider,),
+            ).fetchall()
+            rows = {str(row["id"]): dict(row) for row in source_rows}
+            ordered_ids = list(rows)
+            if not ordered_ids:
+                errors.append(
+                    f"Source provider '{source_provider}' has no sessions; refusing to clear the target"
+                )
+        else:
+            rows = self._threads_by_ids(conn, ordered_ids)
         for thread_id in ordered_ids:
             row = rows.get(thread_id)
             if row is None:
@@ -3396,11 +3706,11 @@ class CodexSessionTransfer:
                 continue
             if row["model_provider"] != source_provider:
                 errors.append(f"Thread {thread_id} is not in provider {source_provider}")
-            if int(row["archived"]) and not request.include_archived:
+            if not mirror_target and int(row["archived"]) and not request.include_archived:
                 errors.append(f"Thread {thread_id} is archived but include_archived is false")
 
         final_ids = [thread_id for thread_id in ordered_ids if thread_id in rows]
-        if request.include_descendants:
+        if request.include_descendants and not mirror_target:
             final_ids = self._append_descendants(conn, final_ids, source_provider, request, errors)
             rows = self._threads_by_ids(conn, final_ids)
 
@@ -3438,10 +3748,22 @@ class CodexSessionTransfer:
             }
 
         target_database = target_conn or conn
+        target_rows: dict[str, dict[str, Any]] = {}
+        if mirror_target:
+            target_rows = {
+                str(row["id"]): dict(row)
+                for row in target_database.execute(
+                    "SELECT * FROM threads WHERE model_provider = ? ORDER BY created_at, id",
+                    (target_provider,),
+                ).fetchall()
+            }
+            warnings.append(
+                f"All {len(target_rows)} existing target session(s) will be backed up and replaced."
+            )
         overwritten_ids: set[str] = set()
         overwrite_matches: dict[str, dict[str, Any]] = {}
         overwrite_ambiguities: list[dict[str, Any]] = []
-        if request.overwrite:
+        if request.overwrite and not mirror_target:
             (
                 overwrite_matches,
                 match_warnings,
@@ -3466,25 +3788,33 @@ class CodexSessionTransfer:
                 )
 
         id_map: dict[str, str] = {}
-        unmatched_ids: list[str] = []
-        for thread_id in final_ids:
-            target = overwrite_matches.get(thread_id)
-            if target:
-                id_map[thread_id] = target["id"]
-            else:
-                unmatched_ids.append(thread_id)
-        id_map.update(self._new_id_map(target_database, unmatched_ids))
+        if mirror_target:
+            # A provider mirror is a canonical takeover, not a duplicate import. Keeping the
+            # source ids makes every existing sidebar entry resume through the new provider.
+            id_map = {thread_id: thread_id for thread_id in final_ids}
+        else:
+            unmatched_ids: list[str] = []
+            for thread_id in final_ids:
+                target = overwrite_matches.get(thread_id)
+                if target:
+                    id_map[thread_id] = target["id"]
+                else:
+                    unmatched_ids.append(thread_id)
+            id_map.update(self._new_id_map(target_database, unmatched_ids))
         items = []
         for thread_id in final_ids:
             row = rows[thread_id]
             parent = self._parent_thread_id(conn, thread_id) or self._source_parent_id(row["source"])
             source_cwd = str(row["cwd"])
             target_cwd = cwd_by_source_id.get(thread_id, source_cwd)
-            dest_path = (
-                dest_path_resolver(row, id_map[thread_id])
-                if dest_path_resolver
-                else self._dest_rollout_path(Path(row["rollout_path"]), id_map[thread_id])
-            )
+            if mirror_target:
+                dest_path = Path(row["rollout_path"])
+            else:
+                dest_path = (
+                    dest_path_resolver(row, id_map[thread_id])
+                    if dest_path_resolver
+                    else self._dest_rollout_path(Path(row["rollout_path"]), id_map[thread_id])
+                )
             index_entry = session_index.get(thread_id) or {}
             thread_name = index_entry.get("thread_name") if isinstance(index_entry, dict) else None
             display_title = thread_name or row["title"] or row["preview"] or thread_id
@@ -3528,16 +3858,20 @@ class CodexSessionTransfer:
             "workspace_mappings": workspace_mappings,
             "source_provider": source_provider,
             "target_provider": target_provider,
-            "overwrite": bool(request.overwrite),
-            "include_descendants": request.include_descendants,
-            "include_archived": request.include_archived,
+            "overwrite": bool(request.overwrite and not mirror_target),
+            "mirror_target": mirror_target,
+            "replaced_target_count": len(target_rows),
+            "include_descendants": request.include_descendants or mirror_target,
+            "include_archived": request.include_archived or mirror_target,
             "_ordered_ids": final_ids,
             "_rows": rows,
+            "_target_rows": target_rows,
+            "_target_ids": set(target_rows),
             "_id_map": id_map,
             "_cwd_map": cwd_map,
             "_cwd_by_source_id": cwd_by_source_id,
             "_overwritten_ids": overwritten_ids,
-            "_overwrite_session_index_ids": set(overwritten_ids),
+            "_overwrite_session_index_ids": set(overwritten_ids) | set(target_rows),
             "_overwrite_ambiguities": overwrite_ambiguities,
         }
 
@@ -3553,10 +3887,14 @@ class CodexSessionTransfer:
             "source_provider": request.source_provider,
             "target_provider": request.target_provider,
             "overwrite": bool(request.overwrite),
+            "mirror_target": bool(request.mirror_target),
+            "replaced_target_count": 0,
             "include_descendants": request.include_descendants,
             "include_archived": request.include_archived,
             "_ordered_ids": [],
             "_rows": {},
+            "_target_rows": {},
+            "_target_ids": set(),
             "_id_map": {},
             "_cwd_map": dict(request.cwd_map or {}),
             "_cwd_by_source_id": {},
@@ -3927,30 +4265,396 @@ class CodexSessionTransfer:
         target_cwd: str | None = None,
         target_source: str | None = None,
         overwrite: bool = False,
-    ) -> None:
+        history_base_offsets: dict[tuple[str, int], int] | None = None,
+        tracked_offsets: set[int] | None = None,
+    ) -> dict[int, int]:
         if dest_path.exists() and not overwrite:
             raise FileExistsError(f"Destination rollout already exists: {dest_path}")
-        lines = source_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        if not lines:
-            raise ValueError(f"Rollout is empty: {source_path}")
-        first_line = json.loads(lines[0])
-        payload = self._session_meta_payload(first_line)
-        payload["id"] = id_map[source_id]
-        if "session_id" in payload:
-            payload["session_id"] = id_map[source_id]
-        payload["model_provider"] = target_provider
-        if target_cwd:
-            payload["cwd"] = target_cwd
-        self._remap_optional_meta_id(payload, "parent_thread_id", id_map)
-        self._remap_optional_meta_id(payload, "forked_from_id", id_map)
-        if target_source:
-            payload["source"] = target_source
-        elif "source" in payload:
-            payload["source"] = self._remap_source_value(payload["source"], id_map)
-
-        lines[0] = compact_json(first_line) + "\n"
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path.write_text("".join(lines), encoding="utf-8")
+        temp_path: Path | None = None
+        session_meta_count = 0
+        old_offset = 0
+        new_offset = 0
+        offsets_to_track = set(tracked_offsets or set()) | {0}
+        offset_map: dict[int, int] = {0: 0}
+        try:
+            with source_path.open("rb") as source, tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{dest_path.name}.",
+                suffix=".tmp",
+                dir=dest_path.parent,
+                delete=False,
+            ) as temp:
+                temp_path = Path(temp.name)
+                line_count = 0
+                for line_count, raw_line in enumerate(source, start=1):
+                    if not raw_line.strip():
+                        temp.write(raw_line)
+                        continue
+                    if raw_line.endswith(b"\r\n"):
+                        content = raw_line[:-2]
+                        line_ending = b"\r\n"
+                    elif raw_line.endswith(b"\n"):
+                        content = raw_line[:-1]
+                        line_ending = b"\n"
+                    else:
+                        content = raw_line
+                        line_ending = b""
+                    try:
+                        parsed = json.loads(content.decode("utf-8-sig"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"Invalid rollout JSON at {source_path}:{line_count}: {exc}"
+                        ) from exc
+                    if not isinstance(parsed, dict):
+                        raise ValueError(
+                            f"Rollout line is not an object at {source_path}:{line_count}"
+                        )
+                    changed, is_session_meta = self._rewrite_rollout_record(
+                        parsed,
+                        source_id=source_id,
+                        id_map=id_map,
+                        target_provider=target_provider,
+                        target_cwd=target_cwd,
+                        target_source=target_source,
+                        destination_path=dest_path,
+                        history_base_offsets=history_base_offsets or {},
+                    )
+                    session_meta_count += int(is_session_meta)
+                    if changed:
+                        output_line = compact_json(parsed).encode("utf-8") + line_ending
+                    else:
+                        output_line = raw_line
+                    temp.write(output_line)
+                    old_offset += len(raw_line)
+                    new_offset += len(output_line)
+                    if old_offset in offsets_to_track:
+                        offset_map[old_offset] = new_offset
+                if line_count == 0:
+                    raise ValueError(f"Rollout is empty: {source_path}")
+                if session_meta_count == 0:
+                    raise ValueError(f"Rollout has no session metadata: {source_path}")
+                temp.flush()
+                os.fsync(temp.fileno())
+            if dest_path.exists() and not overwrite:
+                raise FileExistsError(f"Destination rollout already exists: {dest_path}")
+            missing_offsets = offsets_to_track.difference(offset_map)
+            if missing_offsets:
+                missing = min(missing_offsets)
+                raise ValueError(
+                    f"History base offset {missing} is not a rollout line boundary in {source_path}"
+                )
+            os.replace(temp_path, dest_path)
+            temp_path = None
+            return offset_map
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _rewrite_rollout_record(
+        self,
+        record: dict[str, Any],
+        *,
+        source_id: str,
+        id_map: dict[str, str],
+        target_provider: str,
+        target_cwd: str | None,
+        target_source: str | None,
+        destination_path: Path,
+        history_base_offsets: dict[tuple[str, int], int],
+    ) -> tuple[bool, bool]:
+        item_type, payload = self._rollout_record_item(record)
+        if not isinstance(payload, dict):
+            return False, False
+
+        changed = False
+        is_session_meta = item_type == "session_meta"
+        if is_session_meta:
+            metadata = payload.get("meta") if isinstance(payload.get("meta"), dict) else payload
+            target_id = id_map.get(source_id)
+            if target_id:
+                changed |= self._set_json_value(metadata, "id", target_id)
+                if "session_id" in metadata:
+                    changed |= self._set_json_value(metadata, "session_id", target_id)
+            changed |= self._set_json_value(metadata, "model_provider", target_provider)
+            if target_cwd:
+                changed |= self._set_json_value(metadata, "cwd", target_cwd)
+            history_base = metadata.get("history_base")
+            if isinstance(history_base, dict):
+                base_thread_id = history_base.get("thread_id")
+                base_offset = history_base.get("end_byte_offset")
+                if (
+                    isinstance(base_thread_id, str)
+                    and base_thread_id in id_map
+                    and isinstance(base_offset, int)
+                ):
+                    key = (base_thread_id, base_offset)
+                    if key not in history_base_offsets:
+                        raise ValueError(
+                            f"Missing rewritten history offset for {base_thread_id} at {base_offset}"
+                        )
+                    changed |= self._set_json_value(
+                        history_base,
+                        "end_byte_offset",
+                        history_base_offsets[key],
+                    )
+            changed |= self._remap_thread_identity_values(metadata, id_map)
+            if target_source:
+                changed |= self._set_json_value(metadata, "source", target_source)
+            elif "source" in metadata:
+                remapped_source = self._remap_source_value(metadata["source"], id_map)
+                changed |= self._set_json_value(metadata, "source", remapped_source)
+            return changed, True
+
+        if item_type != "event_msg":
+            return False, False
+
+        event_type = str(payload.get("type") or "")
+        if event_type == "thread_settings_applied":
+            settings = payload.get("thread_settings")
+            if isinstance(settings, dict):
+                changed |= self._set_json_value(
+                    settings,
+                    "model_provider_id",
+                    target_provider,
+                )
+                if target_cwd:
+                    changed |= self._set_json_value(settings, "cwd", target_cwd)
+                changed |= self._remap_thread_identity_values(settings, id_map)
+        elif event_type == "session_configured":
+            changed |= self._set_json_value(payload, "model_provider_id", target_provider)
+            if target_cwd:
+                changed |= self._set_json_value(payload, "cwd", target_cwd)
+            if payload.get("rollout_path") is not None:
+                changed |= self._set_json_value(
+                    payload,
+                    "rollout_path",
+                    str(destination_path),
+                )
+            changed |= self._remap_thread_identity_values(payload, id_map)
+        return changed, False
+
+    def _write_rollout_plan_concurrently(
+        self,
+        plan: dict[str, Any],
+        *,
+        overwrite_paths: set[Path],
+        copied_paths: list[Path],
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+        phase: str = "copying",
+    ) -> None:
+        items = list(plan.get("items") or [])
+        if not items:
+            return
+
+        target_sources = plan.get("_target_source_by_source_id", {})
+        items_by_id = {str(item["source_id"]): item for item in items}
+        dependencies = self._rollout_history_dependencies(items)
+        required_offsets: dict[str, set[int]] = {}
+        for source_id, dependency in dependencies.items():
+            if dependency is None:
+                continue
+            base_id, base_offset = dependency
+            if base_id not in plan["_id_map"]:
+                continue
+            if base_id not in items_by_id:
+                raise ValueError(
+                    f"History base {base_id} for {source_id} is not included in the copy plan"
+                )
+            required_offsets.setdefault(base_id, set()).add(base_offset)
+
+        rewritten_history_offsets: dict[tuple[str, int], int] = {}
+
+        def write_one(
+            item: dict[str, Any],
+            history_offsets: dict[tuple[str, int], int],
+        ) -> RolloutWriteResult:
+            destination_path = Path(item["dest_rollout_path"])
+            offset_map = self._write_rollout_copy(
+                Path(item["source_rollout_path"]),
+                destination_path,
+                item["source_id"],
+                plan["_id_map"],
+                plan["target_provider"],
+                target_cwd=item.get("target_cwd") if item.get("cwd_rewritten") else None,
+                target_source=target_sources.get(item["source_id"]),
+                overwrite=destination_path in overwrite_paths,
+                history_base_offsets=history_offsets,
+                tracked_offsets=required_offsets.get(str(item["source_id"]), set()),
+            )
+            return RolloutWriteResult(
+                item=item,
+                destination_path=destination_path,
+                offset_map=offset_map,
+            )
+
+        pending_ids = set(items_by_id)
+        finished_ids: set[str] = set()
+        completed = 0
+        while pending_ids:
+            ready_ids = [
+                source_id
+                for source_id in items_by_id
+                if source_id in pending_ids
+                and (
+                    dependencies.get(source_id) is None
+                    or dependencies[source_id][0] not in plan["_id_map"]
+                    or dependencies[source_id][0] in finished_ids
+                )
+            ]
+            if not ready_ids:
+                raise ValueError(
+                    "Rollout history dependencies contain a cycle: "
+                    + ", ".join(sorted(pending_ids))
+                )
+
+            history_offsets = dict(rewritten_history_offsets)
+            futures: dict[Future[RolloutWriteResult], dict[str, Any]] = {}
+            failure: BaseException | None = None
+            level_results: list[RolloutWriteResult] = []
+            with ThreadPoolExecutor(
+                max_workers=min(MAX_COPY_WORKERS, len(ready_ids)),
+                thread_name_prefix="session-copy",
+            ) as executor:
+                for source_id in ready_ids:
+                    item = items_by_id[source_id]
+                    futures[executor.submit(write_one, item, history_offsets)] = item
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                    except BaseException as exc:
+                        failure = exc
+                        for waiting in futures:
+                            if waiting is not future:
+                                waiting.cancel()
+                        break
+                    level_results.append(result)
+                    completed += 1
+                    if result.destination_path not in copied_paths:
+                        copied_paths.append(result.destination_path)
+                    self._report_copy_progress(
+                        progress_callback,
+                        phase=phase,
+                        current=completed,
+                        total=len(items),
+                        item=result.item,
+                    )
+
+            # Executor shutdown waits for already-running writers. Collect every successful
+            # destination so rollback removes files that finished after a peer failed.
+            known_results = {result.item["source_id"] for result in level_results}
+            for future in futures:
+                if future.cancelled() or not future.done() or future.exception() is not None:
+                    continue
+                result = future.result()
+                if result.item["source_id"] not in known_results:
+                    level_results.append(result)
+                if result.destination_path not in copied_paths:
+                    copied_paths.append(result.destination_path)
+            if failure is not None:
+                raise failure
+
+            for result in level_results:
+                source_id = str(result.item["source_id"])
+                for old_offset, new_offset in result.offset_map.items():
+                    rewritten_history_offsets[(source_id, old_offset)] = new_offset
+                finished_ids.add(source_id)
+                pending_ids.discard(source_id)
+
+    def _rollout_history_dependencies(
+        self,
+        items: list[dict[str, Any]],
+    ) -> dict[str, tuple[str, int] | None]:
+        def read_one(item: dict[str, Any]) -> tuple[str, tuple[str, int] | None]:
+            source_id = str(item["source_id"])
+            dependency = self._rollout_history_dependency(
+                Path(item["source_rollout_path"])
+            )
+            return source_id, dependency
+
+        dependencies: dict[str, tuple[str, int] | None] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_COPY_WORKERS, len(items)),
+            thread_name_prefix="session-plan",
+        ) as executor:
+            futures = [executor.submit(read_one, item) for item in items]
+            for future in as_completed(futures):
+                source_id, dependency = future.result()
+                dependencies[source_id] = dependency
+        return dependencies
+
+    def _rollout_history_dependency(
+        self,
+        rollout_path: Path,
+    ) -> tuple[str, int] | None:
+        with rollout_path.open("rb") as source:
+            for line_number, raw_line in enumerate(source, start=1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    parsed = json.loads(raw_line.decode("utf-8-sig"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"Invalid rollout JSON at {rollout_path}:{line_number}: {exc}"
+                    ) from exc
+                if not isinstance(parsed, dict):
+                    continue
+                item_type, _ = self._rollout_record_item(parsed)
+                if item_type != "session_meta":
+                    continue
+                metadata = self._session_meta_payload(parsed)
+                history_base = metadata.get("history_base")
+                if not isinstance(history_base, dict):
+                    return None
+                base_id = history_base.get("thread_id")
+                base_offset = history_base.get("end_byte_offset")
+                if not isinstance(base_id, str) or not isinstance(base_offset, int):
+                    raise ValueError(
+                        f"Invalid history_base metadata in rollout: {rollout_path}"
+                    )
+                return base_id, base_offset
+        return None
+
+    @staticmethod
+    def _rollout_record_item(record: dict[str, Any]) -> tuple[str, Any]:
+        item = record.get("item")
+        if isinstance(item, dict):
+            return str(item.get("type") or ""), item.get("payload")
+        return str(record.get("type") or ""), record.get("payload")
+
+    @staticmethod
+    def _set_json_value(target: dict[str, Any], key: str, value: Any) -> bool:
+        if target.get(key) == value and key in target:
+            return False
+        target[key] = value
+        return True
+
+    def _remap_thread_identity_values(
+        self,
+        value: Any,
+        id_map: dict[str, str],
+    ) -> bool:
+        changed = False
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in ROLLOUT_THREAD_ID_FIELDS and isinstance(child, str) and child in id_map:
+                    value[key] = id_map[child]
+                    changed = True
+                    continue
+                if key in ROLLOUT_THREAD_ID_LIST_FIELDS and isinstance(child, list):
+                    replacement = [id_map.get(item, item) if isinstance(item, str) else item for item in child]
+                    if replacement != child:
+                        value[key] = replacement
+                        changed = True
+                    continue
+                changed |= self._remap_thread_identity_values(child, id_map)
+        elif isinstance(value, list):
+            for child in value:
+                changed |= self._remap_thread_identity_values(child, id_map)
+        return changed
 
     def _validate_rebind_rollout(
         self,
@@ -4021,57 +4725,20 @@ class CodexSessionTransfer:
         return backups
 
     def _write_rollout_provider(self, rollout_path: Path, target_provider: str) -> None:
-        temp_path: Path | None = None
-        try:
-            with rollout_path.open("rb") as source:
-                first_line = source.readline()
-                if not first_line:
-                    raise ValueError(f"Rollout is empty: {rollout_path}")
-                line_text = first_line.decode("utf-8-sig")
-                parsed = json.loads(line_text)
-                if not isinstance(parsed, dict):
-                    raise ValueError(f"First rollout line is not an object: {rollout_path}")
-                payload = self._session_meta_payload(parsed)
-                payload["model_provider"] = target_provider
-                if first_line.endswith(b"\r\n"):
-                    line_ending = b"\r\n"
-                elif first_line.endswith(b"\n"):
-                    line_ending = b"\n"
-                else:
-                    line_ending = b""
-                replacement = compact_json(parsed).encode("utf-8") + line_ending
-
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    prefix=f".{rollout_path.name}.",
-                    suffix=".tmp",
-                    dir=rollout_path.parent,
-                    delete=False,
-                ) as temp:
-                    temp_path = Path(temp.name)
-                    temp.write(replacement)
-                    shutil.copyfileobj(source, temp)
-                    temp.flush()
-                    os.fsync(temp.fileno())
-            os.replace(temp_path, rollout_path)
-            temp_path = None
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
+        self._write_rollout_copy(
+            rollout_path,
+            rollout_path,
+            "",
+            {},
+            target_provider,
+            overwrite=True,
+        )
 
     def _session_meta_payload(self, rollout_line: dict[str, Any]) -> dict[str, Any]:
-        item = rollout_line.get("item")
-        if isinstance(item, dict) and item.get("type") == "session_meta":
-            payload = item.get("payload")
-            if isinstance(payload, dict):
-                return payload
-        if rollout_line.get("type") == "session_meta" and isinstance(
-            rollout_line.get("payload"), dict
-        ):
-            return rollout_line["payload"]
+        item_type, payload = self._rollout_record_item(rollout_line)
+        if item_type == "session_meta" and isinstance(payload, dict):
+            metadata = payload.get("meta")
+            return metadata if isinstance(metadata, dict) else payload
         raise ValueError("First rollout line is not session_meta")
 
     def _remap_optional_meta_id(
@@ -4329,6 +4996,658 @@ class CodexSessionTransfer:
         if updated_at:
             return datetime.fromtimestamp(int(updated_at), UTC).isoformat().replace("+00:00", "Z")
         return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    def _mirror_target_rollout_paths(self, plan: dict[str, Any]) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        safe_roots = [
+            (self.codex_home / "sessions").resolve(),
+            (self.codex_home / "archived_sessions").resolve(),
+        ]
+        for row in plan.get("_target_rows", {}).values():
+            path = Path(str(row.get("rollout_path") or ""))
+            if not path.exists():
+                continue
+            resolved = path.resolve()
+            if not any(self._path_is_within(resolved, root) for root in safe_roots):
+                raise ValueError(
+                    f"Refusing to replace target rollout outside the Codex session folders: {path}"
+                )
+            plain_name = resolved.name[:-4] if resolved.name.endswith(".zst") else resolved.name
+            if not ROLLOUT_NAME_RE.match(plain_name):
+                raise ValueError(f"Unsupported target rollout file name: {path}")
+            if resolved not in seen:
+                seen.add(resolved)
+                paths.append(resolved)
+        return paths
+
+    @staticmethod
+    def _path_is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _new_mirror_backup_directory(self) -> Path:
+        root = self.codex_home / "session-transfer" / "backups"
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        path = root / f"provider-mirror-{timestamp}"
+        counter = 1
+        while path.exists():
+            path = root / f"provider-mirror-{timestamp}-{counter}"
+            counter += 1
+        path.mkdir(parents=True, exist_ok=False)
+        return path
+
+    def _backup_runtime_databases(self, backup_dir: Path) -> dict[str, str]:
+        database_dir = backup_dir / "databases"
+        database_dir.mkdir(parents=True, exist_ok=True)
+        backups: dict[str, str] = {}
+        for filename in RUNTIME_DATABASE_FILENAMES:
+            source_path = self.sqlite_home / filename
+            if not source_path.exists():
+                continue
+            destination_path = database_dir / filename
+            self._backup_sqlite_file(source_path, destination_path)
+            backups[filename] = str(destination_path)
+        if STATE_DB_FILENAME not in backups:
+            raise FileNotFoundError(f"Codex state database is missing: {self.db_path}")
+        return backups
+
+    @staticmethod
+    def _backup_sqlite_file(source_path: Path, destination_path: Path) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(source_path)
+        try:
+            destination = sqlite3.connect(destination_path)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+        finally:
+            source.close()
+
+    def _backup_session_index_for_mirror(self, backup_dir: Path) -> str | None:
+        if not self.session_index_path.exists():
+            return None
+        destination = backup_dir / SESSION_INDEX_FILENAME
+        shutil.copy2(self.session_index_path, destination)
+        return str(destination)
+
+    def _backup_mirror_rollouts(
+        self,
+        rollout_paths: list[Path],
+        backup_dir: Path,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> list[RolloutBackup]:
+        if not rollout_paths:
+            self._report_copy_progress(
+                progress_callback,
+                phase="backing_up",
+                current=0,
+                total=1,
+                message="Target provider has no rollout files to back up",
+            )
+            return []
+
+        backup_root = backup_dir / "rollouts"
+        codex_root = self.codex_home.resolve()
+
+        def backup_one(index: int, original_path: Path) -> RolloutBackup:
+            try:
+                relative = original_path.resolve().relative_to(codex_root)
+            except ValueError:
+                relative = Path("external") / f"{index:06d}-{original_path.name}"
+            backup_path = backup_root / relative
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(original_path, backup_path)
+            except OSError:
+                shutil.copy2(original_path, backup_path)
+            return RolloutBackup(original_path=original_path, backup_path=backup_path)
+
+        futures: dict[Future[RolloutBackup], Path] = {}
+        backups: list[RolloutBackup] = []
+        failure: BaseException | None = None
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_COPY_WORKERS, len(rollout_paths)),
+            thread_name_prefix="session-backup",
+        ) as executor:
+            for index, path in enumerate(rollout_paths, start=1):
+                futures[executor.submit(backup_one, index, path)] = path
+            for future in as_completed(futures):
+                try:
+                    backup = future.result()
+                except BaseException as exc:
+                    failure = exc
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+                    break
+                backups.append(backup)
+                self._report_copy_progress(
+                    progress_callback,
+                    phase="backing_up",
+                    current=len(backups),
+                    total=len(rollout_paths),
+                    message=backup.original_path.name,
+                )
+        if failure is not None:
+            raise failure
+        return backups
+
+    def _write_mirror_backup_manifest(
+        self,
+        backup_dir: Path,
+        request: CopyRequest,
+        *,
+        database_backups: dict[str, str],
+        rollout_backups: list[RolloutBackup],
+        session_index_backup: str | None,
+        source_ids: set[str],
+        target_ids: set[str],
+    ) -> None:
+        payload = {
+            "created_at": datetime.now(UTC).isoformat(),
+            "source_provider": request.source_provider,
+            "target_provider": request.target_provider,
+            "source_session_ids": sorted(source_ids),
+            "target_session_ids": sorted(target_ids),
+            "database_backups": database_backups,
+            "session_index_backup": session_index_backup,
+            "rollout_backups": [
+                {
+                    "original_path": str(item.original_path),
+                    "backup_path": str(item.backup_path),
+                }
+                for item in rollout_backups
+            ],
+        }
+        (backup_dir / "backup-manifest.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _attach_mirror_sidecars(self, conn: sqlite3.Connection) -> dict[str, str]:
+        attached: dict[str, str] = {}
+        for filename, alias in MIRROR_SIDECAR_ALIASES.items():
+            path = self.sqlite_home / filename
+            if not path.exists():
+                continue
+            conn.execute(f"ATTACH DATABASE ? AS {alias}", (str(path),))
+            attached[filename] = alias
+        return attached
+
+    @staticmethod
+    def _checked_identifier(value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError(f"Unsafe SQLite identifier: {value}")
+        return value
+
+    def _qualified_table(self, schema: str, table: str) -> str:
+        return f"{self._checked_identifier(schema)}.{self._checked_identifier(table)}"
+
+    def _schema_table_exists(
+        self,
+        conn: sqlite3.Connection,
+        schema: str,
+        table: str,
+    ) -> bool:
+        schema = self._checked_identifier(schema)
+        row = conn.execute(
+            f"SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def _schema_table_columns(
+        self,
+        conn: sqlite3.Connection,
+        schema: str,
+        table: str,
+    ) -> list[str]:
+        schema = self._checked_identifier(schema)
+        table = self._checked_identifier(table)
+        rows = conn.execute(f"PRAGMA {schema}.table_info({table})").fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def _thread_scoped_tables(
+        self,
+        conn: sqlite3.Connection,
+        schema: str,
+    ) -> list[str]:
+        schema = self._checked_identifier(schema)
+        names = [
+            str(row["name"])
+            for row in conn.execute(
+                f"SELECT name FROM {schema}.sqlite_master "
+                "WHERE type = 'table' AND name LIKE 'thread_%' ORDER BY name"
+            ).fetchall()
+        ]
+        candidates = [
+            name
+            for name in names
+            if name not in {"threads", "thread_spawn_edges"}
+            and "thread_id" in self._schema_table_columns(conn, schema, name)
+        ]
+        dependencies: dict[str, set[str]] = {name: set() for name in candidates}
+        for name in candidates:
+            foreign_keys = conn.execute(
+                f"PRAGMA {schema}.foreign_key_list({self._checked_identifier(name)})"
+            ).fetchall()
+            for foreign_key in foreign_keys:
+                dependency = str(foreign_key["table"])
+                if dependency in dependencies:
+                    dependencies[name].add(dependency)
+
+        ordered: list[str] = []
+        pending = set(candidates)
+        while pending:
+            ready = sorted(
+                name for name in pending if not (dependencies[name] & pending)
+            )
+            if not ready:
+                ordered.extend(sorted(pending))
+                break
+            ordered.extend(ready)
+            pending.difference_update(ready)
+        return ordered
+
+    @staticmethod
+    def _id_chunks(values: list[str], size: int = 400) -> list[list[str]]:
+        return [values[index : index + size] for index in range(0, len(values), size)]
+
+    def _delete_thread_keyed_rows(
+        self,
+        conn: sqlite3.Connection,
+        schema: str,
+        table: str,
+        column: str,
+        thread_ids: set[str],
+    ) -> int:
+        if not thread_ids or not self._schema_table_exists(conn, schema, table):
+            return 0
+        qualified = self._qualified_table(schema, table)
+        column = self._checked_identifier(column)
+        deleted = 0
+        for chunk in self._id_chunks(sorted(thread_ids)):
+            placeholders = ",".join("?" for _ in chunk)
+            deleted += conn.execute(
+                f"DELETE FROM {qualified} WHERE {column} IN ({placeholders})",
+                chunk,
+            ).rowcount
+        return deleted
+
+    def _clear_mirror_target_records(
+        self,
+        conn: sqlite3.Connection,
+        plan: dict[str, Any],
+        attached: dict[str, str],
+    ) -> None:
+        target_ids = set(plan.get("_target_ids", set()))
+        source_ids = set(plan.get("_ordered_ids", []))
+
+        logs = attached.get("logs_2.sqlite")
+        if logs and target_ids:
+            self._delete_thread_keyed_rows(conn, logs, "logs", "thread_id", target_ids)
+
+        queue = attached.get("queue_1.sqlite")
+        if queue and target_ids:
+            self._delete_thread_keyed_rows(
+                conn, queue, "queued_items", "thread_id", target_ids
+            )
+            self._delete_thread_keyed_rows(
+                conn, queue, "queued_thread_revisions", "thread_id", target_ids
+            )
+
+        history = attached.get("thread_history_1.sqlite")
+        if history:
+            for table in reversed(self._thread_scoped_tables(conn, history)):
+                self._delete_thread_keyed_rows(
+                    conn, history, table, "thread_id", target_ids | source_ids
+                )
+
+        goals = attached.get("goals_1.sqlite")
+        if goals and target_ids:
+            for table in reversed(self._thread_scoped_tables(conn, goals)):
+                self._delete_thread_keyed_rows(
+                    conn, goals, table, "thread_id", target_ids
+                )
+
+        memories = attached.get("memories_1.sqlite")
+        if memories and target_ids:
+            self._delete_thread_keyed_rows(
+                conn, memories, "stage1_outputs", "thread_id", target_ids
+            )
+
+        if target_ids:
+            for table in reversed(self._thread_scoped_tables(conn, "main")):
+                self._delete_thread_keyed_rows(
+                    conn, "main", table, "thread_id", target_ids
+                )
+        self._delete_thread_keyed_rows(
+            conn, "main", "thread_spawn_edges", "parent_thread_id", target_ids
+        )
+        self._delete_thread_keyed_rows(
+            conn, "main", "thread_spawn_edges", "child_thread_id", target_ids
+        )
+        self._delete_thread_keyed_rows(conn, "main", "threads", "id", target_ids)
+
+    def _copy_thread_keyed_rows(
+        self,
+        conn: sqlite3.Connection,
+        schema: str,
+        table: str,
+        plan: dict[str, Any],
+    ) -> int:
+        if not self._schema_table_exists(conn, schema, table):
+            return 0
+        columns = self._schema_table_columns(conn, schema, table)
+        if "thread_id" not in columns:
+            return 0
+        qualified = self._qualified_table(schema, table)
+        column_sql = ",".join(self._checked_identifier(column) for column in columns)
+        placeholders = ",".join("?" for _ in columns)
+        copied = 0
+        for chunk in self._id_chunks(list(plan["_ordered_ids"])):
+            select_placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT * FROM {qualified} WHERE thread_id IN ({select_placeholders})",
+                chunk,
+            ).fetchall()
+            for source_row in rows:
+                row = dict(source_row)
+                row["thread_id"] = plan["_id_map"][str(row["thread_id"])]
+                conn.execute(
+                    f"INSERT INTO {qualified} ({column_sql}) VALUES ({placeholders})",
+                    [row.get(column) for column in columns],
+                )
+                copied += 1
+        return copied
+
+    def _copy_mirror_state_records(
+        self,
+        conn: sqlite3.Connection,
+        plan: dict[str, Any],
+    ) -> None:
+        for table in self._thread_scoped_tables(conn, "main"):
+            self._copy_thread_keyed_rows(conn, "main", table, plan)
+
+    def _copy_mirror_sidecar_records(
+        self,
+        conn: sqlite3.Connection,
+        plan: dict[str, Any],
+        attached: dict[str, str],
+    ) -> None:
+        goals = attached.get("goals_1.sqlite")
+        if goals:
+            for table in self._thread_scoped_tables(conn, goals):
+                self._copy_thread_keyed_rows(conn, goals, table, plan)
+        memories = attached.get("memories_1.sqlite")
+        if memories:
+            self._copy_thread_keyed_rows(conn, memories, "stage1_outputs", plan)
+
+    def _replace_session_index_for_mirror(
+        self,
+        plan: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        source_entries = self._load_session_index()
+        remove_ids = set(plan.get("_target_ids", set())) | set(plan["_id_map"].values())
+        preserved_lines: list[str] = []
+        if self.session_index_path.exists():
+            for line in self.session_index_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    parsed = None
+                thread_id = str(parsed.get("id")) if isinstance(parsed, dict) and parsed.get("id") else ""
+                if thread_id in remove_ids:
+                    continue
+                preserved_lines.append(line)
+
+        entries: list[dict[str, Any]] = []
+        for source_id in plan["_ordered_ids"]:
+            row = plan["_rows"][source_id]
+            source_entry = source_entries.get(source_id) or {}
+            thread_name = source_entry.get("thread_name") if isinstance(source_entry, dict) else None
+            updated_at = source_entry.get("updated_at") if isinstance(source_entry, dict) else None
+            entries.append(
+                {
+                    "id": plan["_id_map"][source_id],
+                    "thread_name": thread_name
+                    or row.get("title")
+                    or row.get("preview")
+                    or plan["_id_map"][source_id],
+                    "updated_at": updated_at or self._thread_row_updated_at_iso(row),
+                }
+            )
+        lines = preserved_lines + [compact_json(entry) for entry in entries]
+        self._atomic_write_text(
+            self.session_index_path,
+            "\n".join(lines) + ("\n" if lines else ""),
+        )
+        return entries
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as temp:
+                temp_path = Path(temp.name)
+                temp.write(text)
+                temp.flush()
+                os.fsync(temp.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _count_thread_keyed_rows(
+        self,
+        conn: sqlite3.Connection,
+        schema: str,
+        table: str,
+        column: str,
+        thread_ids: set[str],
+    ) -> int:
+        if not thread_ids or not self._schema_table_exists(conn, schema, table):
+            return 0
+        qualified = self._qualified_table(schema, table)
+        column = self._checked_identifier(column)
+        total = 0
+        for chunk in self._id_chunks(sorted(thread_ids)):
+            placeholders = ",".join("?" for _ in chunk)
+            total += int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {qualified} WHERE {column} IN ({placeholders})",
+                    chunk,
+                ).fetchone()[0]
+            )
+        return total
+
+    def _verify_mirror(
+        self,
+        conn: sqlite3.Connection,
+        plan: dict[str, Any],
+        attached: dict[str, str],
+    ) -> None:
+        source_ids = set(plan["_ordered_ids"])
+        target_ids = set(plan["_id_map"].values())
+        old_target_ids = set(plan.get("_target_ids", set()))
+        source_count = self._count_thread_keyed_rows(
+            conn, "main", "threads", "id", source_ids
+        )
+        target_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = ?",
+                (plan["target_provider"],),
+            ).fetchone()[0]
+        )
+        stale_source_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = ?",
+                (plan["source_provider"],),
+            ).fetchone()[0]
+        )
+        if source_count != len(source_ids) or target_count != len(source_ids):
+            raise RuntimeError(
+                f"Mirror verification expected {len(source_ids)} source and target sessions, "
+                f"found {source_count} source and {target_count} target"
+            )
+        if stale_source_count:
+            raise RuntimeError(
+                f"Mirror verification found {stale_source_count} session(s) still routed through "
+                f"source provider {plan['source_provider']}"
+            )
+        if self._count_thread_keyed_rows(
+            conn, "main", "threads", "id", old_target_ids
+        ):
+            raise RuntimeError("Old target session rows remain after replacement")
+        if self._count_thread_keyed_rows(
+            conn, "main", "threads", "id", target_ids
+        ) != len(target_ids):
+            raise RuntimeError("One or more mirrored target session rows are missing")
+        missing_rollouts = [
+            item["dest_rollout_path"]
+            for item in plan["items"]
+            if not Path(item["dest_rollout_path"]).is_file()
+        ]
+        if missing_rollouts:
+            raise RuntimeError(f"Mirrored rollout is missing: {missing_rollouts[0]}")
+
+        for table in self._thread_scoped_tables(conn, "main"):
+            source_rows = self._count_thread_keyed_rows(
+                conn, "main", table, "thread_id", source_ids
+            )
+            target_rows = self._count_thread_keyed_rows(
+                conn, "main", table, "thread_id", target_ids
+            )
+            if source_rows != target_rows:
+                raise RuntimeError(
+                    f"State table {table} copied {target_rows} row(s); expected {source_rows}"
+                )
+
+        for filename, table_names in (
+            ("goals_1.sqlite", None),
+            ("memories_1.sqlite", ["stage1_outputs"]),
+        ):
+            schema = attached.get(filename)
+            if not schema:
+                continue
+            tables = table_names or self._thread_scoped_tables(conn, schema)
+            for table in tables:
+                source_rows = self._count_thread_keyed_rows(
+                    conn, schema, table, "thread_id", source_ids
+                )
+                target_rows = self._count_thread_keyed_rows(
+                    conn, schema, table, "thread_id", target_ids
+                )
+                if source_rows != target_rows:
+                    raise RuntimeError(
+                        f"Runtime table {filename}:{table} copied {target_rows} row(s); "
+                        f"expected {source_rows}"
+                    )
+
+        history = attached.get("thread_history_1.sqlite")
+        if history:
+            for table in self._thread_scoped_tables(conn, history):
+                if self._count_thread_keyed_rows(
+                    conn, history, table, "thread_id", old_target_ids | target_ids
+                ):
+                    raise RuntimeError(
+                        f"History projection table {table} was not cleared for rebuild"
+                    )
+
+        foreign_key_errors = conn.execute("PRAGMA main.foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise RuntimeError(f"Foreign key verification failed: {foreign_key_errors[0]}")
+
+        index_entries = self._load_session_index()
+        if old_target_ids.intersection(index_entries):
+            raise RuntimeError("Old target session names remain in session_index.jsonl")
+        if not target_ids.issubset(index_entries):
+            raise RuntimeError("Mirrored session names are missing from session_index.jsonl")
+
+    @staticmethod
+    def _remove_written_rollouts(paths: list[Path]) -> None:
+        for path in set(paths):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _restore_mirror_rollout_backups(backups: list[RolloutBackup]) -> list[str]:
+        errors: list[str] = []
+        for backup in backups:
+            temp_path = backup.original_path.with_name(
+                f".{backup.original_path.name}.{uuid.uuid4().hex}.restore"
+            )
+            try:
+                backup.original_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup.backup_path, temp_path)
+                os.replace(temp_path, backup.original_path)
+            except OSError as exc:
+                errors.append(f"{backup.original_path}: {exc}")
+            finally:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+        return errors
+
+    def _delete_mirrored_target_rollouts(
+        self,
+        rollout_paths: list[Path],
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> list[str]:
+        if not rollout_paths:
+            return []
+
+        def delete_one(path: Path) -> None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        errors: list[str] = []
+        completed = 0
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_COPY_WORKERS, len(rollout_paths)),
+            thread_name_prefix="session-cleanup",
+        ) as executor:
+            futures = {executor.submit(delete_one, path): path for path in rollout_paths}
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    future.result()
+                except OSError as exc:
+                    errors.append(f"{path}: {exc}")
+                completed += 1
+                self._report_copy_progress(
+                    progress_callback,
+                    phase="cleaning",
+                    current=completed,
+                    total=len(rollout_paths),
+                    message=path.name,
+                )
+        return errors
 
     def _backup_database(self, *, operation: str = "copy") -> Path:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

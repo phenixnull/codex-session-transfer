@@ -22,7 +22,11 @@ for (const id of [
 }
 
 assert.match(app, /request\.workspace_mapping\s*=/);
-assert.match(app, /overwrite:\s*Boolean\(\$\("overwriteSessions"\)\?\.checked\)/);
+assert.match(app, /function usingLocalMirror\(\)/);
+assert.match(app, /mirror_target:\s*mirrorTarget/);
+assert.match(app, /thread_ids:\s*mirrorTarget\s*\?\s*\[\]\s*:/);
+assert.match(app, /include_archived:\s*mirrorTarget\s*\|\|/);
+assert.match(app, /overwrite:\s*mirrorTarget\s*\?\s*false\s*:/);
 assert.match(app, /overwrite_selections/);
 assert.match(app, /overwrite_ambiguities/);
 assert.match(app, /renderOverwriteResolution\(/);
@@ -30,6 +34,8 @@ assert.match(app, /Resolve .*ambiguous overwrite match/);
 assert.match(app, /\/api\/copy-package-progress/);
 assert.match(app, /streamApi\(/);
 assert.doesNotMatch(app, /reasons\.push\(["']Run Preview first\./);
+assert.match(app, /Preview is optional and loads on demand/);
+assert.match(app, /Back up and replace entire target/);
 assert.match(app, /PREVIEW_RENDER_PAGE_SIZE/);
 assert.match(app, /preview_offset/);
 assert.match(app, /next_preview_offset/);

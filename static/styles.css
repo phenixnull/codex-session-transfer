@@ -1544,9 +1544,31 @@ td p {
   overflow: auto;
 }
 
+.preview-content {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+
 .preview-pane .preview-items {
   flex: 1 1 auto;
-  min-height: 80px;
+  min-height: 0;
+}
+
+.preview-footer {
+  display: grid;
+  flex: 1 1 0;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .overwrite-resolution {
@@ -1709,13 +1731,17 @@ td p {
 
 .copy-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-top: auto;
 }
 
 .preview-pane .copy-actions {
   margin-top: 0;
+}
+
+.preview-pane .copy-actions button {
+  min-width: 0;
 }
 
 .copy-progress {
