@@ -85,6 +85,25 @@ SECRET_PATTERNS = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
 )
+PROVIDER_CONFIG_SAFE_KEYS = (
+    "name",
+    "base_url",
+    "wire_api",
+    "env_key",
+    "requires_openai_auth",
+    "request_max_retries",
+    "stream_idle_timeout_ms",
+    "supports_websockets",
+)
+PROVIDER_CONFIG_STRING_KEYS = {"name", "base_url", "wire_api", "env_key"}
+PROVIDER_CONFIG_BOOL_KEYS = {
+    "requires_openai_auth",
+    "supports_websockets",
+}
+PROVIDER_CONFIG_INT_KEYS = {
+    "request_max_retries",
+    "stream_idle_timeout_ms",
+}
 PREVIEW_ITEM_FIELDS = (
     "source_id",
     "target_id",
@@ -297,6 +316,13 @@ class LoadedTransferPackage:
     db_path: Path
     session_index_path: Path
     manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    path: Path
+    existed: bool
+    backup_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -611,6 +637,143 @@ class CodexSessionTransfer:
                 "model": data.get("model"),
             }
         return details
+
+    @staticmethod
+    def _safe_provider_config(value: Any) -> dict[str, Any]:
+        """Keep only provider settings that cannot carry authentication material."""
+        if not isinstance(value, dict):
+            return {}
+
+        safe: dict[str, Any] = {}
+        for key in PROVIDER_CONFIG_SAFE_KEYS:
+            item = value.get(key)
+            if key in PROVIDER_CONFIG_STRING_KEYS:
+                if not isinstance(item, str):
+                    continue
+                item = item.strip()
+                if not item or any(pattern.search(item) for pattern in SECRET_PATTERNS):
+                    continue
+                if key == "base_url":
+                    try:
+                        parsed = urlparse(item)
+                        if parsed.username or parsed.password or parsed.fragment or parsed.query:
+                            continue
+                    except ValueError:
+                        continue
+                safe[key] = item
+            elif key in PROVIDER_CONFIG_BOOL_KEYS:
+                if isinstance(item, bool):
+                    safe[key] = item
+            elif key in PROVIDER_CONFIG_INT_KEYS:
+                if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 10_000_000:
+                    safe[key] = item
+        return safe
+
+    def _configured_provider_configs(self) -> dict[str, dict[str, Any]]:
+        config_path = self.codex_home / "config.toml"
+        if not config_path.exists():
+            return {}
+        try:
+            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return {}
+        providers = data.get("model_providers") or {}
+        if not isinstance(providers, dict):
+            return {}
+        return {
+            str(provider_id): safe_config
+            for provider_id, provider_info in providers.items()
+            if (safe_config := self._safe_provider_config(provider_info))
+        }
+
+    def _preset_provider_configs(self) -> dict[str, dict[str, Any]]:
+        path = self.provider_switch_home / "preset-overrides.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        presets: list[dict[str, Any]] = []
+        custom_presets = data.get("customPresets", [])
+        if isinstance(custom_presets, list):
+            presets.extend(item for item in custom_presets if isinstance(item, dict))
+        overrides = data.get("overrides", {})
+        if isinstance(overrides, dict):
+            for preset_id, override in overrides.items():
+                if isinstance(override, dict):
+                    presets.append({"id": preset_id, **override})
+
+        configs: dict[str, dict[str, Any]] = {}
+        for preset in presets:
+            config_text = preset.get("configText")
+            if not isinstance(config_text, str) or not config_text.strip():
+                continue
+            try:
+                parsed = tomllib.loads(config_text)
+            except tomllib.TOMLDecodeError:
+                continue
+            providers = parsed.get("model_providers") or {}
+            if not isinstance(providers, dict):
+                continue
+            selected_provider = str(parsed.get("model_provider") or "").strip()
+            for raw_provider_id, provider_info in providers.items():
+                safe_config = self._safe_provider_config(provider_info)
+                if not safe_config:
+                    continue
+                provider_ids = [str(raw_provider_id)]
+                # A switcher preset may contain one physical section (often a
+                # generic id) while its top-level model_provider is the id
+                # written into the active config. Preserve both identities so
+                # either form can be selected on a later migration.
+                if selected_provider and len(providers) == 1 and selected_provider not in provider_ids:
+                    provider_ids.append(selected_provider)
+                for provider_id in provider_ids:
+                    existing = configs.setdefault(provider_id, {})
+                    existing.update(safe_config)
+        return configs
+
+    def _package_provider_configs(
+        self,
+        manifest: dict[str, Any],
+        *,
+        provider_ids: set[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        raw_configs = manifest.get("provider_configs")
+        if not isinstance(raw_configs, dict):
+            return {}
+        return {
+            str(provider_id): safe_config
+            for provider_id, provider_info in raw_configs.items()
+            if provider_ids is None or str(provider_id) in provider_ids
+            if (safe_config := self._safe_provider_config(provider_info))
+        }
+
+    def _provider_configs_for_plan(
+        self,
+        plan: dict[str, Any],
+        *,
+        include_all: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        configured = self._configured_provider_configs()
+        for provider_id, preset_config in self._preset_provider_configs().items():
+            configured.setdefault(provider_id, {}).update(
+                {
+                    key: value
+                    for key, value in preset_config.items()
+                    if key not in configured.get(provider_id, {})
+                }
+            )
+        provider_ids = set(configured) if include_all else {
+            str((plan.get("_rows") or {}).get(thread_id, {}).get("model_provider") or "")
+            for thread_id in plan.get("_ordered_ids") or []
+        }
+        return {
+            provider_id: configured[provider_id]
+            for provider_id in sorted(provider_ids)
+            if provider_id in configured
+        }
 
     def list_target_providers(self) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}
@@ -1905,7 +2068,11 @@ class CodexSessionTransfer:
             request.include_archived,
         )
         with closing(self._connect(read_only=True)) as conn:
-            plan = self._build_copy_plan(conn, copy_request)
+            plan = self._build_copy_plan(
+                conn,
+                copy_request,
+                validate_target_provider=False,
+            )
             if plan["errors"]:
                 return {
                     "ok": False,
@@ -1975,6 +2142,11 @@ class CodexSessionTransfer:
             if not db_path.exists():
                 raise ValueError(f"Package is missing {PACKAGE_DB_PATH}")
             self._materialize_package_rollout_paths(db_path, extract_dir)
+            # Keep the complete sanitized provider catalog so a package can be
+            # imported from provider A to a different provider B that was
+            # configured on the source machine. The selected target still wins
+            # whenever the destination already has its own definition.
+            manifest["provider_configs"] = self._package_provider_configs(manifest)
             self.loaded_package = LoadedTransferPackage(
                 package_path=path,
                 extract_dir=extract_dir,
@@ -2084,6 +2256,7 @@ class CodexSessionTransfer:
                     target_conn=target_conn,
                     source_index=self._load_session_index_from_path(package.session_index_path),
                     dest_path_resolver=self._dest_rollout_path_for_import,
+                    available_provider_configs=self._package_provider_configs(package.manifest),
                 )
         return self._public_plan(plan, request=request)
 
@@ -2156,6 +2329,9 @@ class CodexSessionTransfer:
         session_index_entries: list[dict[str, Any]] = []
         manifest_payload: dict[str, Any] | None = None
         source_index = self._load_session_index_from_path(package.session_index_path)
+        provider_configs = self._package_provider_configs(package.manifest)
+        config_snapshot: ConfigSnapshot | None = None
+        plan: dict[str, Any] = {}
 
         with closing(self._connect_path(package.db_path, read_only=True)) as source_conn:
             with closing(self._connect(read_only=False)) as target_conn:
@@ -2168,6 +2344,7 @@ class CodexSessionTransfer:
                         target_conn=target_conn,
                         source_index=source_index,
                         dest_path_resolver=self._dest_rollout_path_for_import,
+                        available_provider_configs=self._package_provider_configs(package.manifest),
                     )
                     self._prepare_import_visibility_plan(plan)
                     if plan["errors"]:
@@ -2180,6 +2357,13 @@ class CodexSessionTransfer:
                             "package_path": str(package.package_path),
                         }
                     else:
+                        config_snapshot = self._snapshot_config_for_import(plan)
+                        if config_snapshot is not None:
+                            plan["_provider_config_snapshot"] = config_snapshot
+                        plan["provider_sync"] = self._merge_package_provider_config(
+                            plan,
+                            provider_configs,
+                        )
                         rollout_backups = self._prepare_import_overwrite(target_conn, plan)
                         overwrite_paths = {path for path, _ in rollout_backups}
                         if request.overwrite:
@@ -2243,13 +2427,22 @@ class CodexSessionTransfer:
                             backup.unlink()
                         except FileNotFoundError:
                             pass
+                    config_restore_errors: list[str] = []
+                    if config_snapshot is not None:
+                        try:
+                            self._restore_config_snapshot(config_snapshot)
+                        except Exception as restore_exc:
+                            config_restore_errors.append(
+                                f"Config restore failed: {restore_exc}"
+                            )
                     manifest_payload = {
                         "ok": False,
                         "blocked": False,
-                        "errors": [str(exc)],
+                        "errors": [str(exc), *config_restore_errors],
                         "items": [],
                         "backup_path": str(backup_path),
                         "package_path": str(package.package_path),
+                        "provider_sync": plan.get("provider_sync"),
                     }
 
         manifest_path = self._write_manifest(manifest_payload, request)
@@ -2739,6 +2932,7 @@ class CodexSessionTransfer:
             "include_archived": request.include_archived,
             "thread_count": len(plan["_ordered_ids"]),
             "providers": providers,
+            "provider_configs": self._provider_configs_for_plan(plan, include_all=True),
             "projects": sorted(
                 projects.values(),
                 key=lambda item: (str(item["label"]).lower(), str(item["normalized_cwd"]).lower()),
@@ -2810,6 +3004,10 @@ class CodexSessionTransfer:
             raise ValueError("Unsupported package format")
         if int(manifest.get("version") or 0) > PACKAGE_VERSION:
             raise ValueError("Package version is newer than this app supports")
+        if "provider_configs" in manifest and not isinstance(manifest["provider_configs"], dict):
+            raise ValueError("Package provider_configs is not an object")
+        # Normalize untrusted package metadata before it is exposed or used for config writes.
+        manifest["provider_configs"] = self._package_provider_configs(manifest)
         return manifest
 
     def _safe_extract_zip(self, package: zipfile.ZipFile, extract_dir: Path) -> None:
@@ -3702,6 +3900,8 @@ class CodexSessionTransfer:
         target_conn: sqlite3.Connection | None = None,
         source_index: dict[str, dict[str, Any]] | None = None,
         dest_path_resolver: Callable[[dict[str, Any], str], Path] | None = None,
+        validate_target_provider: bool = True,
+        available_provider_configs: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         errors: list[str] = []
         warnings: list[str] = []
@@ -3727,11 +3927,28 @@ class CodexSessionTransfer:
             for value in self.current_config().get("configured_provider_ids", [])
             if str(value).strip()
         }
-        if target_provider and config_path.exists() and target_provider not in configured_provider_ids:
-            errors.append(
-                f"Target provider '{target_provider}' is not defined in {config_path}. "
-                f"Add [model_providers.{target_provider}] or choose a configured provider."
-            )
+        package_provider_config = (
+            self._safe_provider_config((available_provider_configs or {}).get(target_provider))
+            if target_provider
+            else {}
+        )
+        provider_sync: dict[str, Any] | None = None
+        if target_provider and target_provider not in configured_provider_ids:
+            if package_provider_config:
+                provider_sync = {
+                    "action": "add",
+                    "provider_id": target_provider,
+                    "field_count": len(package_provider_config),
+                }
+                warnings.append(
+                    f"Provider '{target_provider}' is present in the package and will be added "
+                    f"to {config_path} during import; authentication credentials are not copied."
+                )
+            elif validate_target_provider and config_path.exists():
+                errors.append(
+                    f"Target provider '{target_provider}' is not defined in {config_path}. "
+                    f"Add [model_providers.{target_provider}] or choose a configured provider."
+                )
         if errors:
             return self._empty_plan(request, errors, warnings)
         if target_provider_warning:
@@ -3914,6 +4131,7 @@ class CodexSessionTransfer:
             "replaced_target_count": len(target_rows),
             "include_descendants": request.include_descendants or mirror_target,
             "include_archived": request.include_archived or mirror_target,
+            "provider_sync": provider_sync,
             "_ordered_ids": final_ids,
             "_rows": rows,
             "_target_rows": target_rows,
@@ -3942,6 +4160,7 @@ class CodexSessionTransfer:
             "replaced_target_count": 0,
             "include_descendants": request.include_descendants,
             "include_archived": request.include_archived,
+            "provider_sync": None,
             "_ordered_ids": [],
             "_rows": {},
             "_target_rows": {},
@@ -6016,6 +6235,129 @@ class CodexSessionTransfer:
         finally:
             source.close()
         return backup_path
+
+    def _snapshot_config_for_import(self, plan: dict[str, Any]) -> ConfigSnapshot | None:
+        provider_sync = plan.get("provider_sync")
+        if not isinstance(provider_sync, dict) or provider_sync.get("action") != "add":
+            return None
+
+        config_path = self.codex_home / "config.toml"
+        if not config_path.exists():
+            return ConfigSnapshot(path=config_path, existed=False, backup_path=None)
+
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = self.manifest_dir / f"config.toml.before-package-import-{timestamp}.bak"
+        counter = 1
+        while backup_path.exists():
+            backup_path = self.manifest_dir / (
+                f"config.toml.before-package-import-{timestamp}-{counter}.bak"
+            )
+            counter += 1
+        shutil.copy2(config_path, backup_path)
+        return ConfigSnapshot(path=config_path, existed=True, backup_path=backup_path)
+
+    @staticmethod
+    def _toml_scalar(value: Any) -> str:
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        raise ValueError("Provider configuration contains an unsupported value")
+
+    def _provider_config_toml(self, provider_id: str, provider_config: dict[str, Any]) -> str:
+        if not provider_id or "\r" in provider_id or "\n" in provider_id:
+            raise ValueError("Provider id cannot contain line breaks")
+        lines = [
+            f"[model_providers.{json.dumps(provider_id, ensure_ascii=False)}]"
+        ]
+        for key in PROVIDER_CONFIG_SAFE_KEYS:
+            if key in provider_config:
+                lines.append(f"{key} = {self._toml_scalar(provider_config[key])}")
+        if len(lines) == 1:
+            raise ValueError(f"Provider '{provider_id}' has no portable configuration")
+        return "\n".join(lines)
+
+    def _merge_package_provider_config(
+        self,
+        plan: dict[str, Any],
+        provider_configs: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        provider_sync = plan.get("provider_sync")
+        if not isinstance(provider_sync, dict) or provider_sync.get("action") != "add":
+            return provider_sync if isinstance(provider_sync, dict) else {"action": "none"}
+
+        provider_id = str(plan.get("target_provider") or "")
+        provider_config = self._safe_provider_config(provider_configs.get(provider_id))
+        if not provider_config:
+            raise ValueError(f"Package has no portable configuration for provider '{provider_id}'")
+
+        config_path = self.codex_home / "config.toml"
+        existing_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        existing_data = tomllib.loads(existing_text) if existing_text.strip() else {}
+        existing_providers = existing_data.get("model_providers")
+        if existing_providers is not None and not isinstance(existing_providers, dict):
+            raise ValueError(f"{config_path} has a non-table model_providers value")
+        if isinstance(existing_providers, dict) and provider_id in existing_providers:
+            return {
+                "action": "kept",
+                "provider_id": provider_id,
+                "field_count": len(provider_config),
+            }
+
+        provider_section = self._provider_config_toml(provider_id, provider_config)
+        if existing_text.strip():
+            merged_text = existing_text.rstrip("\r\n") + "\n\n" + provider_section + "\n"
+        else:
+            merged_text = provider_section + "\n"
+        self._atomic_write_text(config_path, merged_text)
+
+        snapshot = plan.get("_provider_config_snapshot")
+        backup_path = snapshot.backup_path if isinstance(snapshot, ConfigSnapshot) else None
+        return {
+            "action": "added",
+            "provider_id": provider_id,
+            "field_count": len(provider_config),
+            "backup_path": str(backup_path) if backup_path else None,
+        }
+
+    @staticmethod
+    def _restore_file_from_backup(path: Path, backup_path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with backup_path.open("rb") as source, tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{path.name}.",
+                suffix=".restore",
+                dir=path.parent,
+                delete=False,
+            ) as temp:
+                temp_path = Path(temp.name)
+                shutil.copyfileobj(source, temp)
+                temp.flush()
+                os.fsync(temp.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _restore_config_snapshot(self, snapshot: ConfigSnapshot) -> None:
+        if snapshot.existed:
+            if snapshot.backup_path is None:
+                raise RuntimeError("Config backup is missing")
+            self._restore_file_from_backup(snapshot.path, snapshot.backup_path)
+            return
+        try:
+            snapshot.path.unlink()
+        except FileNotFoundError:
+            pass
 
     def _write_manifest(
         self,

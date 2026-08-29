@@ -554,10 +554,20 @@ function renderPackagePanel() {
   const packagePath = state.packageSource.package_path || "";
   const projectCount = manifest.projects?.length ?? 0;
   const threadCount = manifest.thread_count ?? 0;
+  const providerConfigCount = Object.keys(manifest.provider_configs || {}).length;
   line.append(
     statusPill("Package", packagePath ? shortPath(packagePath) : "Loaded", true),
     statusPill("Contents", `${threadCount} sessions / ${projectCount} projects`, true),
   );
+  if (providerConfigCount) {
+    line.append(
+      statusPill("Provider settings", `${providerConfigCount} sync on import`, true),
+      message(
+        "info",
+        "Provider definitions are added during import; authentication credentials stay on the target machine.",
+      ),
+    );
+  }
 }
 
 function renderWorkspaceMappingList() {
@@ -808,6 +818,20 @@ function providerMetadata(value) {
   return state.targetProviders.find((provider) => provider.value === value) || null;
 }
 
+function packageProviderConfig(value) {
+  if (!usingPackageSource()) return null;
+  const configs = state.packageSource?.manifest?.provider_configs;
+  if (!configs || typeof configs !== "object" || !Object.prototype.hasOwnProperty.call(configs, value)) {
+    return null;
+  }
+  const config = configs[value];
+  return config && typeof config === "object" ? config : null;
+}
+
+function providerWillSync(value) {
+  return Boolean(packageProviderConfig(value));
+}
+
 function providerDisplayName(value, fallbackProvider = null) {
   const provider = fallbackProvider || providerMetadata(value);
   const configuredName = String(provider?.provider_name || "").trim();
@@ -822,10 +846,15 @@ function visibleProviderCount(provider) {
 }
 
 function targetProviderIsConfigured(provider) {
+  if (providerWillSync(provider.value)) return true;
+  return targetProviderConfiguredInCurrentConfig(provider.value);
+}
+
+function targetProviderConfiguredInCurrentConfig(value) {
   const current = state.status?.current_config || {};
   if (!current.exists) return null;
   if (!Array.isArray(current.configured_provider_ids)) return null;
-  return (current.configured_provider_ids || []).includes(provider.value);
+  return (current.configured_provider_ids || []).includes(value);
 }
 
 function providerConfigurationSuffix(value) {
@@ -870,16 +899,40 @@ function targetProviderOptions() {
   const providers = state.targetProviders.map((provider) => ({ ...provider }));
   if (!usingPackageSource()) return providers;
 
-  for (const source of currentSourceProviders()) {
-    const value = source.model_provider;
-    if (!value || providers.some((provider) => provider.value === value)) continue;
+  const addPackageProvider = (value, rawConfig = {}) => {
+    if (!value) return;
+    const config = rawConfig && typeof rawConfig === "object" ? rawConfig : {};
+    const existing = providers.find((provider) => provider.value === value);
+    if (existing) {
+      if (config.name && !existing.provider_name) existing.provider_name = config.name;
+      if (config.base_url && !existing.base_url) existing.base_url = config.base_url;
+      if (config.wire_api && !existing.wire_api) existing.wire_api = config.wire_api;
+      if (Object.keys(config).length) {
+        existing.package_config = true;
+        if (!existing.sources?.includes("package_source")) {
+          existing.sources = [...(existing.sources || []), "package_source"];
+        }
+      }
+      return;
+    }
     providers.push({
       value,
-      label: value,
+      label: config.name || value,
+      provider_name: config.name || value,
+      base_url: config.base_url,
+      wire_api: config.wire_api,
       sources: ["package_source"],
       session_total: 0,
       current: false,
+      package_config: Boolean(Object.keys(config).length),
     });
+  };
+
+  for (const [value, config] of Object.entries(state.packageSource?.manifest?.provider_configs || {})) {
+    addPackageProvider(value, config);
+  }
+  for (const source of currentSourceProviders()) {
+    addPackageProvider(source.model_provider, packageProviderConfig(source.model_provider) || {});
   }
   return providers;
 }
@@ -893,7 +946,9 @@ function targetProviderLabel(provider) {
       : Number(provider.session_active ?? provider.session_total ?? 0);
     bits.push(`${count} ${includeArchivedChecked() ? "total" : "active"}`);
   }
-  if (targetProviderIsConfigured(provider) === false) bits.push("not configured");
+  const configured = targetProviderConfiguredInCurrentConfig(provider.value);
+  if (providerWillSync(provider.value) && configured !== true) bits.push("sync on import");
+  else if (configured === false) bits.push("not configured");
   return bits.join(" / ");
 }
 
@@ -905,7 +960,10 @@ function targetProviderTooltip(provider) {
   if (provider.base_url) details.push(`Base URL: ${provider.base_url}`);
   if (provider.wire_api) details.push(`Wire API: ${provider.wire_api}`);
   if (provider.current) details.push("Current live config");
-  if (targetProviderIsConfigured(provider) === false) {
+  const configured = targetProviderConfiguredInCurrentConfig(provider.value);
+  if (providerWillSync(provider.value) && configured !== true) {
+    details.push("Provider definition will be added during import; authentication credentials are not copied");
+  } else if (configured === false) {
     details.push("Not defined in config.toml; copy is disabled until it is configured");
   }
   if (provider.sources?.includes("session_db")) details.push("Present in session DB");
@@ -1891,7 +1949,10 @@ async function executeCopy() {
         : "";
       resultText = `Mirrored ${copiedCount} session(s) to ${target}. Replaced ${replacedTargetCount} previous target session(s).${cleanupText}${backupText} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
     } else if (result.ok) {
-      resultText = `${usingPackageSource() ? "Imported" : "Copied"} ${copiedCount} session(s).${result.overwrite ? ` Overwrote ${overwrittenCount} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
+      const providerSync = result.provider_sync?.action === "added"
+        ? ` Added provider '${result.provider_sync.provider_id}' to config.toml.${result.provider_sync.backup_path ? ` Config backup: ${result.provider_sync.backup_path}.` : ""}`
+        : "";
+      resultText = `${usingPackageSource() ? "Imported" : "Copied"} ${copiedCount} session(s).${providerSync}${result.overwrite ? ` Overwrote ${overwrittenCount} matching session(s).` : ""} Session index entries: ${result.session_index_entries || 0}. Manifest: ${result.manifest_path}`;
     } else {
       resultText = `Not ${mirrorTarget ? "mirrored" : usingPackageSource() ? "imported" : "copied"}. ${(result.errors || []).join("; ")}`;
     }

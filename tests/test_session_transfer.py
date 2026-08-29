@@ -2973,6 +2973,334 @@ wire_api = "responses"
         self.assertTrue(any(name.startswith("sessions/") and first_id in name for name in names))
         self.assertTrue(any(name.startswith("sessions/") and second_id in name for name in names))
 
+    def test_export_package_succeeds_when_config_exists_without_virtual_target_provider(self) -> None:
+        source_id = "11111111-1111-4111-8111-111111111111"
+        self.add_thread(source_id, provider="ProviderA", title="Configured source")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "ProviderA"
+
+[model_providers.ProviderA]
+name = "Provider A"
+base_url = "https://example.test/v1"
+wire_api = "responses"
+""",
+            encoding="utf-8",
+        )
+
+        result = self.transfer.export_package(
+            ExportPackageRequest("ProviderA", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(Path(result["package_path"]).exists())
+
+    def test_imported_package_syncs_missing_provider_definition_only_on_execute(self) -> None:
+        source_id = "22222222-2222-4222-8222-222222222222"
+        self.add_thread(source_id, provider="WeCoding", title="Portable provider")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "WeCoding"
+model = "gpt-test"
+
+[model_providers.WeCoding]
+name = "WeCoding"
+base_url = "https://wecoding.example/v1"
+wire_api = "responses"
+env_key = "WECODING_API_KEY"
+requires_openai_auth = false
+request_max_retries = 5
+""",
+            encoding="utf-8",
+        )
+        export = self.transfer.export_package(
+            ExportPackageRequest("WeCoding", [source_id], False, True)
+        )
+        self.assertTrue(export["ok"], export)
+
+        target_codex_home = Path(self.temp.name) / "provider-target" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        target_db = target_sqlite_home / "state_5.sqlite"
+        create_schema(target_db)
+        target_codex_home.mkdir(parents=True, exist_ok=True)
+        target_config = target_codex_home / "config.toml"
+        target_config.write_text(
+            """
+model_provider = "Existing"
+model = "gpt-target"
+
+[model_providers.Existing]
+name = "Existing"
+base_url = "https://existing.example/v1"
+wire_api = "responses"
+""",
+            encoding="utf-8",
+        )
+        original_config = target_config.read_text(encoding="utf-8")
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+
+        self.assertTrue(target.load_transfer_package(Path(export["package_path"]))["ok"])
+        self.assertEqual(target_config.read_text(encoding="utf-8"), original_config)
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest("WeCoding", "WeCoding", [source_id], False, True)
+        )
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["provider_sync"]["action"], "add")
+
+        result = target.copy_imported_package_threads(
+            CopyRequest("WeCoding", "WeCoding", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["provider_sync"]["action"], "added")
+        self.assertTrue(Path(result["provider_sync"]["backup_path"]).exists())
+        self.assertEqual(target.current_config()["model_provider"], "Existing")
+        self.assertEqual(target.current_config()["provider_name"], "Existing")
+        self.assertEqual(target.current_config()["configured_provider_ids"], ["Existing", "WeCoding"])
+        with closing(sqlite3.connect(target_db)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT model_provider FROM threads").fetchone()[0],
+                "WeCoding",
+            )
+
+    def test_imported_package_supports_a_different_sanitized_target_provider(self) -> None:
+        source_provider = "source-vendor"
+        target_provider = "target-vendor"
+        source_id = "66666666-6666-4666-8666-666666666666"
+        self.add_thread(source_id, provider=source_provider, title="Cross-vendor migration")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            f'''\nmodel_provider = "{source_provider}"\n\n[model_providers.{source_provider}]\nname = "Source Vendor"\nbase_url = "https://source.example/v1"\nwire_api = "responses"\n\n[model_providers.{target_provider}]\nname = "Target Vendor"\nbase_url = "https://target.example/v1"\nwire_api = "responses"\nenv_key = "TARGET_VENDOR_API_KEY"\n''',
+            encoding="utf-8",
+        )
+
+        export = self.transfer.export_package(
+            ExportPackageRequest(source_provider, [source_id], False, True)
+        )
+        self.assertTrue(export["ok"], export)
+        with zipfile.ZipFile(export["package_path"]) as package:
+            manifest = json.loads(package.read("manifest.json").decode("utf-8"))
+        self.assertEqual(manifest["provider_configs"][target_provider]["base_url"], "https://target.example/v1")
+
+        target_codex_home = Path(self.temp.name) / "different-provider-target" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        target_db = target_sqlite_home / "state_5.sqlite"
+        create_schema(target_db)
+        target_codex_home.mkdir(parents=True, exist_ok=True)
+        target_config = target_codex_home / "config.toml"
+        target_config.write_text(
+            '''\nmodel_provider = "existing-vendor"\n\n[model_providers.existing-vendor]\nname = "Existing Vendor"\nbase_url = "https://existing.example/v1"\n''',
+            encoding="utf-8",
+        )
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        self.assertTrue(target.load_transfer_package(Path(export["package_path"]))["ok"])
+
+        preview = target.preview_imported_package_copy(
+            CopyRequest(source_provider, target_provider, [source_id], False, True)
+        )
+        self.assertTrue(preview["can_execute"], preview)
+        self.assertEqual(preview["provider_sync"]["provider_id"], target_provider)
+
+        result = target.copy_imported_package_threads(
+            CopyRequest(source_provider, target_provider, [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["provider_sync"]["action"], "added")
+        self.assertEqual(target.current_config()["model_provider"], "existing-vendor")
+        self.assertEqual(
+            target.current_config()["configured_provider_ids"],
+            ["existing-vendor", target_provider],
+        )
+        with closing(sqlite3.connect(target_db)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT model_provider FROM threads").fetchone()[0],
+                target_provider,
+            )
+
+    def test_export_package_uses_safe_provider_definition_from_switcher_preset(self) -> None:
+        source_id = "55555555-5555-4555-8555-555555555555"
+        self.add_thread(source_id, provider="WeCoding", title="Preset provider")
+        self.switch_home.mkdir(parents=True, exist_ok=True)
+        (self.switch_home / "preset-overrides.json").write_text(
+            json.dumps(
+                {
+                    "customPresets": [
+                        {
+                            "id": "wecoding",
+                            "name": "WeCoding preset",
+                            "configText": (
+                                'model_provider = "WeCoding"\n'
+                                'model = "gpt-test"\n\n'
+                                '[model_providers.WeCoding]\n'
+                                'name = "WeCoding"\n'
+                                'base_url = "https://wecoding.example/v1"\n'
+                                'wire_api = "responses"\n'
+                                'env_key = "WECODING_API_KEY"\n'
+                            ),
+                            "authText": "authText-preset-secret",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.transfer.export_package(
+            ExportPackageRequest("WeCoding", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        with zipfile.ZipFile(result["package_path"]) as package:
+            manifest_text = package.read("manifest.json").decode("utf-8")
+        manifest = json.loads(manifest_text)
+        self.assertEqual(
+            manifest["provider_configs"]["WeCoding"],
+            {
+                "name": "WeCoding",
+                "base_url": "https://wecoding.example/v1",
+                "wire_api": "responses",
+                "env_key": "WECODING_API_KEY",
+            },
+        )
+        self.assertNotIn("authText-preset-secret", manifest_text)
+
+    def test_export_package_manifest_excludes_provider_credentials_and_auth_files(self) -> None:
+        source_id = "33333333-3333-4333-8333-333333333333"
+        self.add_thread(source_id, provider="WeCoding", title="Credential check")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "auth.json").write_text(
+            '{"access_token":"sk-source-auth-file-secret"}',
+            encoding="utf-8",
+        )
+        self.switch_home.mkdir(parents=True, exist_ok=True)
+        (self.switch_home / "preset-overrides.json").write_text(
+            json.dumps(
+                {
+                    "customPresets": [
+                        {
+                            "id": "wecoding",
+                            "configText": (
+                                'model_provider = "WeCoding"\n'
+                                '[model_providers.WeCoding]\n'
+                                'name = "WeCoding"\n'
+                                'base_url = "https://wecoding.example/v1"\n'
+                            ),
+                            "authText": "authText-preset-secret",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "WeCoding"
+
+[model_providers.WeCoding]
+name = "WeCoding"
+base_url = "https://wecoding.example/v1"
+wire_api = "responses"
+env_key = "WECODING_API_KEY"
+requires_openai_auth = false
+api_key = "sk-source-config-secret"
+authText = "authText-source-secret"
+headers = { Authorization = "Bearer sk-source-header-secret" }
+""",
+            encoding="utf-8",
+        )
+
+        result = self.transfer.export_package(
+            ExportPackageRequest("WeCoding", [source_id], False, True)
+        )
+
+        self.assertTrue(result["ok"], result)
+        with zipfile.ZipFile(result["package_path"]) as package:
+            manifest_text = package.read("manifest.json").decode("utf-8")
+            names = set(package.namelist())
+        manifest = json.loads(manifest_text)
+        provider_config = manifest["provider_configs"]["WeCoding"]
+        self.assertEqual(provider_config["base_url"], "https://wecoding.example/v1")
+        self.assertEqual(provider_config["env_key"], "WECODING_API_KEY")
+        self.assertNotIn("api_key", provider_config)
+        self.assertNotIn("authText", provider_config)
+        self.assertNotIn("headers", provider_config)
+        self.assertNotIn("sk-source-config-secret", manifest_text)
+        self.assertNotIn("authText-source-secret", manifest_text)
+        self.assertNotIn("authText-preset-secret", manifest_text)
+        self.assertNotIn("auth.json", names)
+
+    def test_import_provider_config_failure_restores_original_config(self) -> None:
+        source_id = "44444444-4444-4444-8444-444444444444"
+        self.add_thread(source_id, provider="WeCoding", title="Rollback provider")
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            """
+model_provider = "WeCoding"
+
+[model_providers.WeCoding]
+name = "WeCoding"
+base_url = "https://wecoding.example/v1"
+wire_api = "responses"
+""",
+            encoding="utf-8",
+        )
+        export = self.transfer.export_package(
+            ExportPackageRequest("WeCoding", [source_id], False, True)
+        )
+        self.assertTrue(export["ok"], export)
+
+        target_codex_home = Path(self.temp.name) / "provider-rollback-target" / ".codex"
+        target_sqlite_home = target_codex_home / "sqlite"
+        target_db = target_sqlite_home / "state_5.sqlite"
+        create_schema(target_db)
+        target_codex_home.mkdir(parents=True, exist_ok=True)
+        target_config = target_codex_home / "config.toml"
+        original_config = (
+            'model_provider = "Existing"\n\n'
+            '[model_providers.Existing]\n'
+            'name = "Existing"\n'
+        )
+        target_config.write_text(original_config, encoding="utf-8")
+        target = CodexSessionTransfer(
+            codex_home=target_codex_home,
+            sqlite_home=target_sqlite_home,
+            provider_switch_home=self.switch_home,
+            process_checker=lambda: [],
+        )
+        self.assertTrue(target.load_transfer_package(Path(export["package_path"]))["ok"])
+
+        merge_provider_config = target._merge_package_provider_config
+
+        def merge_then_fail(*args, **kwargs):
+            result = merge_provider_config(*args, **kwargs)
+            raise RuntimeError("forced provider config failure")
+
+        with patch.object(target, "_merge_package_provider_config", side_effect=merge_then_fail):
+            result = target.copy_imported_package_threads(
+                CopyRequest("WeCoding", "WeCoding", [source_id], False, True)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("forced provider config failure", " ".join(result["errors"]))
+        self.assertEqual(target_config.read_text(encoding="utf-8"), original_config)
+        self.assertEqual(target.current_config()["configured_provider_ids"], ["Existing"])
+        with closing(sqlite3.connect(target_db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 0)
+
     def test_export_package_defaults_to_selected_project_exported_directory(self) -> None:
         thread_id = "11111111-1111-4111-8111-111111111111"
         project = Path(self.temp.name) / "paper-project"

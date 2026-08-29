@@ -1,12 +1,12 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.4.10",
+  "version": "0.4.11",
   "private": true,
   "description": "Local Codex provider session transfer workbench.",
   "main": "electron/main.js",
   "scripts": {
     "test": "npm run test:js",
-    "test:js": "node tests/test_workspace_mapping.js && node tests/workspace_mapping_ui_check.js && node tests/responsive_layout_check.js && node tests/window_constraints_check.js && node tests/server_runtime_check.js && node tests/installer_upgrade_check.js && node tests/release_workflow_check.js",
+    "test:js": "node tests/test_workspace_mapping.js && node tests/workspace_mapping_ui_check.js && node tests/responsive_layout_check.js && node tests/window_constraints_check.js && node tests/server_runtime_check.js && node tests/python_runtime_check.js && node tests/installer_upgrade_check.js && node tests/release_workflow_check.js",
     "server": "python server.py --host 127.0.0.1 --port 8765",
     "electron": "electron .",
     "dev": "electron .",

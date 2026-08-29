@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml"><img alt="Release Build" src="https://github.com/phenixnull/codex-session-transfer/actions/workflows/release-build.yml/badge.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.10-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.11-blue">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-39-47848f">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12%2B-3776ab">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-24292f">
@@ -21,6 +21,7 @@ Codex Session Transfer gives you a focused UI for inspecting local Codex provide
 - **One-click provider takeover** - back up the complete source and target state, remove every old target session, and move the full source history to the target provider while preserving session IDs and rollout paths.
 - **Stable provider identity** - provider labels show the configured display name together with the real session-database id, so aliases such as `xixiapi (id: custom)` stay unambiguous.
 - **Cross-machine transfer packages** - export selected sessions into a zip package, load it on another machine, and map sessions into existing custom Codex workspaces before import.
+- **Portable provider definitions** - packages carry a sanitized provider catalog so sessions can move from any source provider to any selected destination provider; missing destination sections are added atomically during import while `auth.json`, `authText`, API keys, and existing target settings stay out of the package.
 - **Responsive compact layout** - scroll the main workbench on short desktop displays and use bounded session lists on narrow screens.
 - **Skills migration** - export, load, preview, and import Codex skills with overwrite control.
 - **Optional copy plans** - mirror directly with live backup, cleanup, rewrite, verification, and commit progress, or inspect a plan first without rendering thousands of rows at once.
